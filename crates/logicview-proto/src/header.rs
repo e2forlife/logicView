@@ -78,6 +78,22 @@ pub fn actual_payload_bytes(actual_samples: u64, enabled_channels: u64) -> u64 {
     atoms.saturating_mul(enabled_channels).saturating_mul(8)
 }
 
+/// Status text when the header says the pod stored fewer samples than requested.
+///
+/// RLE uses the shortfall wording. Any other early end says how many samples
+/// were kept. A full capture returns `None`.
+pub fn capture_length_warning(rle: bool, requested: u64, remaining: u64) -> Option<String> {
+    let actual = actual_sample_count(requested, remaining);
+    if remaining == 0 || actual >= requested {
+        return None;
+    }
+    Some(if rle {
+        format!("RLE shortfall: captured {actual} of {requested} samples")
+    } else {
+        format!("capture kept {actual} of {requested} samples")
+    })
+}
+
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, ProtoError> {
     let slice = bytes.get(at..at + 4).ok_or(ProtoError::Truncated)?;
     let mut buf = [0u8; 4];
@@ -119,6 +135,19 @@ mod tests {
         assert_eq!(header.trigger_position, 0);
         assert_eq!(header.remaining, 0);
         assert_eq!(header.status, 1);
+    }
+
+    #[test]
+    fn length_warning_names_an_rle_shortfall() {
+        assert_eq!(
+            capture_length_warning(true, 1_000, 100).as_deref(),
+            Some("RLE shortfall: captured 896 of 1000 samples")
+        );
+        assert_eq!(
+            capture_length_warning(false, 1_000, 100).as_deref(),
+            Some("capture kept 896 of 1000 samples")
+        );
+        assert_eq!(capture_length_warning(true, 1_000, 0), None);
     }
 
     #[test]

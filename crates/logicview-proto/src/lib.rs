@@ -18,8 +18,8 @@ pub use dsl::{write_dsl_header, DslHeader, DslProbe};
 pub use envelope::{decode_envelope_header, encode_envelope_header};
 pub use error::ProtoError;
 pub use header::{
-    actual_payload_bytes, actual_sample_count, encode_logic_header, parse_logic_header,
-    LogicHeader, LOGIC_CHECK_WORD, LOGIC_HEADER_LEN, LOGIC_HEADER_TRANSFER,
+    actual_payload_bytes, actual_sample_count, capture_length_warning, encode_logic_header,
+    parse_logic_header, LogicHeader, LOGIC_CHECK_WORD, LOGIC_HEADER_LEN, LOGIC_HEADER_TRANSFER,
 };
 pub use mode::{logic_divider, DepthMode, ModeFlags};
 pub use samples::{

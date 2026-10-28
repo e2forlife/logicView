@@ -503,7 +503,7 @@ impl Engine {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
         };
-        let (generation, stop, image, enabled, samples, threshold, stream, run, interval, discard) = {
+        let (generation, stop, image, enabled, samples, threshold, stream, run, interval, discard, continuous, header_wait) = {
             let mut state = self.shared.state.lock().await;
             let config = state.slot(&id)?.session.config.clone();
             let mask = if config.channel_enable == 0 {
@@ -546,6 +546,13 @@ impl Engine {
                 config.run,
                 Duration::from_millis(config.repeat_interval_ms),
                 config.discard_on_stop,
+                config.run == RunPolicy::Loop,
+                if config.depth == DepthMode::Stream {
+                    Duration::from_secs(3)
+                } else {
+                    let secs = samples / config.sample_rate_hz.max(1) + 3;
+                    Duration::from_secs(secs.min(120))
+                },
             )
         };
         let shared = Arc::clone(&self.shared);
@@ -564,6 +571,8 @@ impl Engine {
                 run,
                 interval,
                 discard,
+                continuous,
+                header_wait,
             )
             .await;
         });

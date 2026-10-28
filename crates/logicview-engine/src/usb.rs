@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use logicview_capture::{Phase, RunPolicy};
-use logicview_hal::{run_capture, CaptureEvent, CaptureJob, HalError};
-use logicview_proto::actual_sample_count;
+use logicview_hal::{run_capture, CaptureEvent, CaptureJob, HalError, OnStop};
+use logicview_proto::capture_length_warning;
 use tokio::sync::mpsc;
 
 use super::{EngineEvent, Shared};
@@ -29,6 +29,8 @@ pub(crate) async fn drive(
     run: RunPolicy,
     interval: Duration,
     discard: bool,
+    continuous: bool,
+    header_wait: Duration,
 ) {
     let mut pass = 0u32;
     loop {
@@ -44,8 +46,12 @@ pub(crate) async fn drive(
             requested_samples: samples,
             threshold,
             stream,
+            continuous,
             stop: Arc::clone(&stop),
+            on_stop: if discard { OnStop::Discard } else { OnStop::Upload },
             abort_after_header: false,
+            header_wait,
+            sample_limit: None,
         };
         let tx_thread = tx.clone();
         let worker = std::thread::spawn(move || {
@@ -81,23 +87,23 @@ pub(crate) async fn drive(
                     if report.overflow {
                         warn(&shared, &id, generation, "sample memory overflowed".into()).await;
                     }
-                    let actual = actual_sample_count(samples, report.header.remaining);
-                    if report.header.remaining > 0 && actual < samples {
-                        let rle = {
-                            let state = shared.lock().await;
-                            state
-                                .slots
-                                .iter()
-                                .find(|slot| slot.id == id)
-                                .map(|slot| slot.session.config.rle)
-                                .unwrap_or(false)
-                        };
-                        let text = if rle {
-                            format!("RLE shortfall: captured {actual} of {samples} samples")
-                        } else {
-                            format!("capture kept {actual} of {samples} samples")
-                        };
-                        warn(&shared, &id, generation, text).await;
+                    if !stream && !report.discarded {
+                        if let Some(header) = report.header {
+                            let rle = {
+                                let state = shared.lock().await;
+                                state
+                                    .slots
+                                    .iter()
+                                    .find(|slot| slot.id == id)
+                                    .map(|slot| slot.session.config.rle)
+                                    .unwrap_or(false)
+                            };
+                            if let Some(text) =
+                                capture_length_warning(rle, samples, header.remaining)
+                            {
+                                warn(&shared, &id, generation, text).await;
+                            }
+                        }
                     }
                 }
                 Note::End(Err(err)) => {

@@ -38,6 +38,9 @@ const BIT_WORDWIDE: u8 = 1;
 
 const HDL_ADDR: u16 = 0x04;
 const VTH_ADDR: u16 = 0x78;
+const CTR0_ADDR: u16 = 0x70;
+const FORCE_RDY: u8 = 1 << 1;
+const FORCE_STOP: u8 = 1 << 2;
 
 pub struct Pod {
     interface: nusb::Interface,
@@ -124,6 +127,24 @@ impl Pod {
 
     pub fn set_threshold(&self, code: u8) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, VTH_ADDR, &[code])
+    }
+
+    /// One byte from the I2C register window. The buffer can be stale past the
+    /// byte this command writes, so the caller asks for a single byte.
+    pub fn read_register(&self, offset: u16) -> Result<u8, HalError> {
+        let bytes = self.read(DEST_REG_READ, offset, 1)?;
+        bytes
+            .first()
+            .copied()
+            .ok_or_else(|| HalError::Usb("register read was empty".into()))
+    }
+
+    pub(crate) fn force_ready(&self) -> Result<(), HalError> {
+        self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_RDY])
+    }
+
+    pub(crate) fn force_stop(&self) -> Result<(), HalError> {
+        self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_STOP])
     }
 
     pub(crate) fn arm_image(&self, image: &[u8]) -> Result<(), HalError> {

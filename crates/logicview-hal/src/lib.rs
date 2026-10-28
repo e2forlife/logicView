@@ -8,7 +8,7 @@ mod capture;
 mod device;
 mod profile;
 
-pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport};
+pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
 pub use device::{list_plus, Pod};
 pub use profile::{
     plan_clock, threshold_code, ClockPlan, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
