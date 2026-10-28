@@ -117,6 +117,94 @@ pub fn measure_pulse(bytes: &[u8], len: u64, sample: u64, rate_hz: u64) -> Optio
     })
 }
 
+/// Next or previous place where `pattern` matches.
+///
+/// `None` in the pattern ignores that sample. Search starts strictly after
+/// `from` when moving forward and strictly before it when moving backward.
+pub fn find_pattern(
+    bytes: &[u8],
+    len: u64,
+    from: u64,
+    pattern: &[Option<bool>],
+    forward: bool,
+) -> Option<u64> {
+    if pattern.is_empty() || len < pattern.len() as u64 {
+        return None;
+    }
+    let last = len - pattern.len() as u64;
+    if forward {
+        let start = from.saturating_add(1);
+        let mut i = start;
+        while i <= last {
+            if pattern_at(bytes, i, pattern) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    } else {
+        let mut i = from.min(last + 1);
+        while i > 0 {
+            i -= 1;
+            if i <= last && pattern_at(bytes, i, pattern) {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+fn pattern_at(bytes: &[u8], at: u64, pattern: &[Option<bool>]) -> bool {
+    pattern.iter().enumerate().all(|(offset, want)| match want {
+        None => true,
+        Some(level) => bit_at(bytes, at + offset as u64) == *level,
+    })
+}
+
+/// Rising and falling edges in `[start, end)`.
+pub fn count_edges(bytes: &[u8], len: u64, start: u64, end: u64) -> u64 {
+    let end = end.min(len);
+    if end <= start.saturating_add(1) {
+        return 0;
+    }
+    let mut edges = 0u64;
+    let mut prev = bit_at(bytes, start);
+    let mut i = start + 1;
+    while i < end {
+        let level = bit_at(bytes, i);
+        if level != prev {
+            edges += 1;
+        }
+        prev = level;
+        i += 1;
+    }
+    edges
+}
+
+/// Distance between two cursors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorSpan {
+    pub samples: u64,
+    pub seconds: f64,
+    pub edges: u64,
+}
+
+pub fn cursor_span(bytes: &[u8], len: u64, a: u64, b: u64, rate_hz: u64) -> CursorSpan {
+    let start = a.min(b).min(len);
+    let end = a.max(b).min(len);
+    let samples = end.saturating_sub(start);
+    let seconds = if rate_hz == 0 {
+        0.0
+    } else {
+        samples as f64 / rate_hz as f64
+    };
+    CursorSpan {
+        samples,
+        seconds,
+        edges: count_edges(bytes, len, start, end),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +251,19 @@ mod tests {
         let leading = measure_pulse(&bytes, 10_000, 10, 1_000_000).unwrap();
         assert_eq!(leading.pulse_width_samples, 50);
         assert_eq!(leading.period_samples, None);
+    }
+
+    #[test]
+    fn pattern_search_and_cursor_span_match_the_clock() {
+        let bytes = clock_bytes(1_000);
+        let high_low = [Some(true), Some(false)];
+        assert_eq!(find_pattern(&bytes, 1_000, 0, &high_low, true), Some(99));
+        assert_eq!(find_pattern(&bytes, 1_000, 99, &high_low, true), Some(199));
+        assert_eq!(find_pattern(&bytes, 1_000, 199, &high_low, false), Some(99));
+        let span = cursor_span(&bytes, 1_000, 50, 150, 1_000_000);
+        assert_eq!(span.samples, 100);
+        assert_eq!(span.seconds, 0.0001);
+        assert_eq!(span.edges, 1);
+        assert_eq!(count_edges(&bytes, 1_000, 0, 200), 3);
     }
 }

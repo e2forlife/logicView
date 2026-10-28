@@ -14,8 +14,10 @@ pub use demo::{
     DEMO_CHANNELS,
 };
 pub use error::CaptureError;
+pub use logicview_proto::DepthMode;
 pub use session::{
-    planned_samples, Phase, Session, SessionConfig, StartMode, DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
+    planned_samples, HostClock, Phase, RunPolicy, Session, SessionConfig, StartMode, TriggerKind,
+    DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
 };
 pub use store::{AnalogColumn, AnalogStore, Column, LogicStore};
 

@@ -9,9 +9,11 @@ description = "In-process capture engine shared by the UI"
 [dependencies]
 logicview-analysis = { path = "../logicview-analysis" }
 logicview-capture = { path = "../logicview-capture" }
+logicview-hal = { path = "../logicview-hal" }
 logicview-proto = { path = "../logicview-proto" }
 logicview-store = { path = "../logicview-store" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

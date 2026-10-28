@@ -53,6 +53,35 @@ pub enum StartMode {
     Instant,
 }
 
+/// What happens after one arm finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RunPolicy {
+    #[default]
+    Single,
+    /// Arm again after `repeat_interval_ms`, keeping the latest record.
+    Repeat,
+    /// Arm again immediately and keep the last duration of samples.
+    Loop,
+}
+
+/// Simple trigger on one channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TriggerKind {
+    #[default]
+    Rising,
+    Falling,
+    High,
+    Low,
+}
+
+/// Clock the arm divider is computed from.
+#[derive(Clone, Copy, Debug)]
+pub struct HostClock {
+    pub hw_max_hz: u64,
+    pub half_rate_hz: Option<u64>,
+    pub quarter_rate_hz: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub sample_rate_hz: u64,
@@ -60,6 +89,19 @@ pub struct SessionConfig {
     pub realtime: bool,
     pub trigger_enabled: bool,
     pub trigger_percent: f64,
+    pub depth: DepthMode,
+    pub run: RunPolicy,
+    pub repeat_interval_ms: u64,
+    pub rle: bool,
+    pub threshold_volts: f64,
+    pub one_sample_filter: bool,
+    pub external_clock: bool,
+    pub clock_falling: bool,
+    pub discard_on_stop: bool,
+    /// Bit per channel. Zero means the first `channel_count` channels.
+    pub channel_enable: u32,
+    pub trigger_channel: u8,
+    pub trigger_kind: TriggerKind,
 }
 
 impl Default for SessionConfig {
@@ -70,6 +112,18 @@ impl Default for SessionConfig {
             realtime: false,
             trigger_enabled: false,
             trigger_percent: 10.0,
+            depth: DepthMode::Buffer,
+            run: RunPolicy::Single,
+            repeat_interval_ms: 0,
+            rle: false,
+            threshold_volts: 1.6,
+            one_sample_filter: false,
+            external_clock: false,
+            clock_falling: false,
+            discard_on_stop: false,
+            channel_enable: 0,
+            trigger_channel: 0,
+            trigger_kind: TriggerKind::Rising,
         }
     }
 }
@@ -83,6 +137,7 @@ pub struct Session {
     pub trigger_sample: Option<u64>,
     pub instant: bool,
     pub error: Option<String>,
+    pub warnings: Vec<String>,
     pub total_samples: u64,
     generation: u64,
 }
@@ -98,6 +153,7 @@ impl Session {
             trigger_sample: None,
             instant: false,
             error: None,
+            warnings: Vec::new(),
             total_samples: 0,
             generation: 0,
         }
@@ -112,39 +168,48 @@ impl Session {
         config: SessionConfig,
         mode: StartMode,
     ) -> Result<DemoSource, CaptureError> {
+        let total = self.prepare(
+            config,
+            mode,
+            DEMO_CHANNELS,
+            HostClock {
+                hw_max_hz: DEMO_HW_MAX_RATE,
+                half_rate_hz: None,
+                quarter_rate_hz: None,
+            },
+        )?;
+        Ok(DemoSource::new(&self.config, total, self.instant))
+    }
+
+    /// Build the arm record and an empty store. `channels` is the width used
+    /// when `channel_enable` is zero.
+    pub fn prepare(
+        &mut self,
+        config: SessionConfig,
+        mode: StartMode,
+        channels: usize,
+        clock: HostClock,
+    ) -> Result<u64, CaptureError> {
         if self.phase.is_active() {
             return Err(CaptureError::Busy);
         }
         self.generation = self.generation.wrapping_add(1);
-        if config.sample_rate_hz == 0 {
-            return Err(CaptureError::BadRate);
-        }
-        if config.duration_ms == 0 {
-            return Err(CaptureError::BadDuration);
-        }
-        let mut total = config.sample_rate_hz.saturating_mul(config.duration_ms) / 1000;
-        total -= total % 64;
-        if total == 0 {
-            return Err(CaptureError::BadDuration);
-        }
-        if total > MAX_SAMPLES {
-            return Err(CaptureError::TooLarge {
-                requested: total,
-                ceiling: MAX_SAMPLES,
-            });
-        }
+        let total = planned_samples(&config)?;
         let instant = mode == StartMode::Instant;
-        let arm = build_arm(&config, total, instant)?;
+        let enable = enabled_mask(config.channel_enable, channels);
+        let width = enable.count_ones() as usize;
+        let arm = build_arm(&config, total, instant, enable, &clock)?;
         self.config = config;
-        self.store = LogicStore::new(DEMO_CHANNELS);
+        self.store = LogicStore::new(width);
         self.analog = AnalogStore::default();
         self.arm = arm;
         self.trigger_sample = None;
         self.instant = instant;
         self.error = None;
+        self.warnings.clear();
         self.total_samples = total;
         self.phase = Phase::Arming;
-        Ok(DemoSource::new(&self.config, total, instant))
+        Ok(total)
     }
 
     pub fn on_header(&mut self, header: LogicHeader) {
@@ -163,7 +228,7 @@ impl Session {
         analog: &[f32],
         samples: u64,
     ) -> Result<(), CaptureError> {
-        let split = unpack_logic_atoms(atoms, DEMO_CHANNELS)
+        let split = unpack_logic_atoms(atoms, self.store.channel_count())
             .map_err(|err| CaptureError::Proto(err.to_string()))?;
         for (index, bytes) in split.iter().enumerate() {
             self.store.append_channel(index, bytes, samples)?;
@@ -192,6 +257,10 @@ impl Session {
         self.error = Some(message.into());
         self.phase = Phase::Error;
     }
+
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
 }
 
 impl Default for Session {
@@ -200,7 +269,24 @@ impl Default for Session {
     }
 }
 
-fn build_arm(config: &SessionConfig, total: u64, instant: bool) -> Result<Vec<u8>, CaptureError> {
+fn enabled_mask(mask: u32, channels: usize) -> u32 {
+    if mask != 0 {
+        return mask;
+    }
+    if channels >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << channels) - 1
+    }
+}
+
+fn build_arm(
+    config: &SessionConfig,
+    total: u64,
+    instant: bool,
+    enable: u32,
+    clock: &HostClock,
+) -> Result<Vec<u8>, CaptureError> {
     let mut mode = ModeFlags::default();
     if config.trigger_enabled && !instant {
         mode.insert(ModeFlags::TRIGGER_ENABLE);
@@ -208,18 +294,49 @@ fn build_arm(config: &SessionConfig, total: u64, instant: bool) -> Result<Vec<u8
     if instant {
         mode.insert(ModeFlags::INSTANT);
     }
-    let divider = logicview_proto::logic_divider(DEMO_HW_MAX_RATE, config.sample_rate_hz, 1);
+    if config.depth == DepthMode::Stream {
+        mode.insert(ModeFlags::STREAM);
+    }
+    if config.run == RunPolicy::Loop {
+        mode.insert(ModeFlags::ANALOG_OR_LOOP);
+    }
+    if config.rle {
+        mode.insert(ModeFlags::RLE);
+    }
+    if config.one_sample_filter {
+        mode.insert(ModeFlags::ONE_SAMPLE_FILTER);
+    }
+    if config.external_clock {
+        mode.insert(ModeFlags::EXTERNAL_CLOCK);
+    }
+    if config.clock_falling {
+        mode.insert(ModeFlags::CLOCK_FALLING);
+    }
+    if clock.half_rate_hz == Some(config.sample_rate_hz) {
+        mode.insert(ModeFlags::HALF_RATE);
+    }
+    if clock.quarter_rate_hz == Some(config.sample_rate_hz) {
+        mode.insert(ModeFlags::QUARTER_RATE);
+    }
+    let divider = logicview_proto::logic_divider(clock.hw_max_hz, config.sample_rate_hz, 1);
     let trigger_position = if config.trigger_enabled && !instant {
-        align_trigger_position(total, config.trigger_percent, DepthMode::Buffer)
+        align_trigger_position(total, config.trigger_percent, config.depth)
     } else {
         0
     };
     let mut stages = [Stage::default(); 16];
     let stage_count = if config.trigger_enabled && !instant {
+        let bit = 1u32 << config.trigger_channel.min(31);
+        let (value, edge) = match config.trigger_kind {
+            TriggerKind::Rising => (bit, bit),
+            TriggerKind::Falling => (0, bit),
+            TriggerKind::High => (bit, 0),
+            TriggerKind::Low => (0, 0),
+        };
         stages[0] = Stage {
-            mask: 1,
-            value: 1,
-            edge: 1,
+            mask: bit,
+            value,
+            edge,
             invert: false,
             logic_or: false,
             count: 1,
@@ -233,10 +350,10 @@ fn build_arm(config: &SessionConfig, total: u64, instant: bool) -> Result<Vec<u8
         divider,
         sample_count: total,
         trigger_position,
-        channel_count: DEMO_CHANNELS as u8,
+        channel_count: enable.count_ones() as u8,
         stage_count,
         scope_count: 0,
-        channel_enable: (1u32 << DEMO_CHANNELS) - 1,
+        channel_enable: enable,
         fine_gain: 0,
         stages,
         upper: None,

@@ -1,8 +1,10 @@
 # LogicView
 
-Clean-room Rust logic analyzer. This branch is phases 0–2: the capture
-contract, a demo engine, and an Axum waveform shell. No USB, firmware, or FPGA
-code is included.
+Clean-room Rust logic analyzer. Phases 0–2 are the capture contract, the demo
+engine, and the Axum waveform shell. Phases 3–4 add buffer and stream capture
+for one high-speed DSLogic Plus (`0x2A0E:0x0020`). Firmware and the FPGA
+bitstream are not in this repo. Set `LOGICVIEW_FIRMWARE_DIR` to the folder
+that contains `DSLogicPlus.bin` when the pod's FPGA is not already configured.
 
 ```
 cargo test --workspace
@@ -19,6 +21,7 @@ width and period. The `+` button opens another session tab.
 | Crate | Phase | Role |
 | --- | --- | --- |
 | `logicview-proto` | 0 | Arm record, logic header, sample atoms, `.dsl` header text |
+| `logicview-hal` | 3 | DSLogic Plus USB, FPGA sequencing, buffer capture |
 | `logicview-analysis` | 1 | Edge search and pulse measurements |
 | `logicview-capture` | 1 | Demo source, session phases, logic mipmap |
 | `logicview-store` | 1 | `.lvcap` directory or zip |
@@ -26,6 +29,7 @@ width and period. The `+` button opens another session tab.
 | `logicview-ui` | 2 | Axum routes, WebSocket tile frames, waveform shell |
 | `logicview-app` | 2 | `logicview` binary |
 
-Device I/O, decoders, and MCP are later phases. See `CONTRIBUTING.md` for the
-clean-room rule. The arm record's sample-count shift is locked at 4 until a
-real pod is measured.
+Decoders and MCP are later phases. See `CONTRIBUTING.md` for the clean-room
+rule. The arm record's sample-count shift is 4, measured on the Plus pod:
+packed counts `0x10`, `0x40`, and `0x80` kept 32, 128, and 256 bytes on one
+channel.

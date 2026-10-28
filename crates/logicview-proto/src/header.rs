@@ -3,33 +3,39 @@ use crate::error::ProtoError;
 /// First bulk-IN word of a logic capture. A mismatch means the capture is bad.
 pub const LOGIC_CHECK_WORD: u32 = 0x5555_5555;
 
-/// Packed logic header length: check, trigger position, RAM start, remaining, status.
-pub const LOGIC_HEADER_LEN: usize = 20;
+/// Logical logic header: check, trigger position, RAM start, remaining low,
+/// remaining high, status. The USB transfer that carries it is 512 bytes on
+/// this high-speed pod; only these 24 bytes are the record.
+pub const LOGIC_HEADER_LEN: usize = 24;
+
+/// Bulk-IN size of the header transfer on the high-speed Plus profile.
+pub const LOGIC_HEADER_TRANSFER: usize = 512;
 
 /// Host-side view of the logic trigger header.
 ///
-/// Layout, little-endian:
+/// Layout, little-endian, measured on `0x2A0E:0x0020`:
 /// - `0x00` check word (`0x55555555`)
 /// - `0x04` trigger position in samples
 /// - `0x08` RAM start address
-/// - `0x0C` remaining sample count (`low` in bits 0..15, `high` in bits 16..31)
-/// - `0x10` status word
+/// - `0x0C` remaining count, low 32 bits
+/// - `0x10` remaining count, high 32 bits
+/// - `0x14` status word
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicHeader {
     pub check_word: u32,
     pub trigger_position: u32,
     pub ram_start: u32,
-    pub remaining: u32,
+    pub remaining: u64,
     pub status: u32,
 }
 
 impl LogicHeader {
-    pub fn remaining_low(self) -> u16 {
-        self.remaining as u16
+    pub fn remaining_low(self) -> u32 {
+        self.remaining as u32
     }
 
-    pub fn remaining_high(self) -> u16 {
-        (self.remaining >> 16) as u16
+    pub fn remaining_high(self) -> u32 {
+        (self.remaining >> 32) as u32
     }
 }
 
@@ -38,8 +44,9 @@ pub fn encode_logic_header(header: &LogicHeader) -> [u8; LOGIC_HEADER_LEN] {
     out[0..4].copy_from_slice(&header.check_word.to_le_bytes());
     out[4..8].copy_from_slice(&header.trigger_position.to_le_bytes());
     out[8..12].copy_from_slice(&header.ram_start.to_le_bytes());
-    out[12..16].copy_from_slice(&header.remaining.to_le_bytes());
-    out[16..20].copy_from_slice(&header.status.to_le_bytes());
+    out[12..16].copy_from_slice(&(header.remaining as u32).to_le_bytes());
+    out[16..20].copy_from_slice(&((header.remaining >> 32) as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&header.status.to_le_bytes());
     out
 }
 
@@ -51,8 +58,8 @@ pub fn parse_logic_header(bytes: &[u8]) -> Result<LogicHeader, ProtoError> {
         check_word: read_u32(bytes, 0)?,
         trigger_position: read_u32(bytes, 4)?,
         ram_start: read_u32(bytes, 8)?,
-        remaining: read_u32(bytes, 12)?,
-        status: read_u32(bytes, 16)?,
+        remaining: u64::from(read_u32(bytes, 12)?) | (u64::from(read_u32(bytes, 16)?) << 32),
+        status: read_u32(bytes, 20)?,
     };
     if header.check_word != LOGIC_CHECK_WORD {
         return Err(ProtoError::BadCheckWord(header.check_word));
@@ -71,6 +78,22 @@ pub fn actual_payload_bytes(actual_samples: u64, enabled_channels: u64) -> u64 {
     atoms.saturating_mul(enabled_channels).saturating_mul(8)
 }
 
+/// Status text when the header says the pod stored fewer samples than requested.
+///
+/// RLE uses the shortfall wording. Any other early end says how many samples
+/// were kept. A full capture returns `None`.
+pub fn capture_length_warning(rle: bool, requested: u64, remaining: u64) -> Option<String> {
+    let actual = actual_sample_count(requested, remaining);
+    if remaining == 0 || actual >= requested {
+        return None;
+    }
+    Some(if rle {
+        format!("RLE shortfall: captured {actual} of {requested} samples")
+    } else {
+        format!("capture kept {actual} of {requested} samples")
+    })
+}
+
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, ProtoError> {
     let slice = bytes.get(at..at + 4).ok_or(ProtoError::Truncated)?;
     let mut buf = [0u8; 4];
@@ -86,7 +109,7 @@ mod tests {
     fn header_vector_round_trips() {
         // Hand-written little-endian image:
         // check 0x55555555, trigger 384, ram 0, remaining 64, status 1.
-        let hex = "5555555580010000000000004000000001000000";
+        let hex = "555555558001000000000000400000000000000001000000";
         let bytes = decode_hex(hex);
         assert_eq!(bytes.len(), LOGIC_HEADER_LEN);
         let parsed = parse_logic_header(&bytes).unwrap();
@@ -97,6 +120,34 @@ mod tests {
         assert_eq!(parsed.remaining_high(), 0);
         assert_eq!(parsed.status, 1);
         assert_eq!(encode_logic_header(&parsed).to_vec(), bytes);
+    }
+
+    #[test]
+    fn measured_plus_header_parses() {
+        // First 24 bytes of the 512-byte header transfer on 0x2A0E:0x0020
+        // after an instant arm. Status word is 1 at offset 20.
+        let bytes = [
+            0x55, 0x55, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let header = parse_logic_header(&bytes).unwrap();
+        assert_eq!(header.check_word, LOGIC_CHECK_WORD);
+        assert_eq!(header.trigger_position, 0);
+        assert_eq!(header.remaining, 0);
+        assert_eq!(header.status, 1);
+    }
+
+    #[test]
+    fn length_warning_names_an_rle_shortfall() {
+        assert_eq!(
+            capture_length_warning(true, 1_000, 100).as_deref(),
+            Some("RLE shortfall: captured 896 of 1000 samples")
+        );
+        assert_eq!(
+            capture_length_warning(false, 1_000, 100).as_deref(),
+            Some("capture kept 896 of 1000 samples")
+        );
+        assert_eq!(capture_length_warning(true, 1_000, 0), None);
     }
 
     #[test]

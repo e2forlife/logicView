@@ -30,5 +30,7 @@ cite a public document. Do not paste the missing piece from another codebase.
 cargo test --workspace
 ```
 
-Phase 3 (real USB pods, firmware upload, FPGA programming) is out of scope
-until a person runs that work on hardware they have.
+The Plus USB path is in `logicview-hal`. It loads `DSLogicPlus.bin` from
+`LOGICVIEW_FIRMWARE_DIR` only when the FPGA done bit is clear. Do not commit
+that file. Hardware tests are ignored unless a pod is plugged in:
+`cargo test -p logicview-hal -- --ignored`.
