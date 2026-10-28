@@ -461,6 +461,7 @@ name = "logicview-app"
 version = "0.1.0"
 dependencies = [
  "logicview-engine",
+ "logicview-mcp",
  "logicview-ui",
  "tokio",
  "tracing",
@@ -477,11 +478,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "logicview-decode"
+version = "0.1.0"
+dependencies = [
+ "logicview-analysis",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "logicview-engine"
 version = "0.1.0"
 dependencies = [
  "logicview-analysis",
  "logicview-capture",
+ "logicview-decode",
  "logicview-hal",
  "logicview-proto",
  "logicview-store",
@@ -499,6 +510,18 @@ dependencies = [
  "logicview-proto",
  "nusb",
  "thiserror",
+]
+
+[[package]]
+name = "logicview-mcp"
+version = "0.1.0"
+dependencies = [
+ "logicview-capture",
+ "logicview-engine",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

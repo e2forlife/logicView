@@ -10,7 +10,7 @@ use logicview_proto::{
 };
 
 use crate::error::CaptureError;
-use crate::session::SessionConfig;
+use crate::session::{active_edge_steps, SessionConfig};
 
 pub const DEMO_CHANNELS: usize = 4;
 pub const CLOCK_PERIOD: u64 = 100;
@@ -26,10 +26,19 @@ pub struct DemoSource {
     finished: bool,
     trigger_enabled: bool,
     instant: bool,
+    /// Rising/falling steps are found in the stored samples, so the header
+    /// does not invent a position. A level trigger still reports the clock edge.
+    edge_sequence: bool,
+    waves: Vec<fn(u64) -> bool>,
 }
 
 impl DemoSource {
-    pub fn new(config: &SessionConfig, total_samples: u64, instant: bool) -> Self {
+    pub fn new(
+        config: &SessionConfig,
+        total_samples: u64,
+        instant: bool,
+        waves: Vec<fn(u64) -> bool>,
+    ) -> Self {
         Self {
             total: total_samples,
             rate: config.sample_rate_hz,
@@ -39,6 +48,8 @@ impl DemoSource {
             finished: false,
             trigger_enabled: config.trigger_enabled,
             instant,
+            edge_sequence: config.trigger_enabled && !active_edge_steps(config).is_empty(),
+            waves,
         }
     }
 
@@ -48,7 +59,7 @@ impl DemoSource {
         }
         if !self.header_sent {
             self.header_sent = true;
-            let trigger_position = if self.trigger_enabled && !self.instant {
+            let trigger_position = if self.trigger_enabled && !self.instant && !self.edge_sequence {
                 CLOCK_HIGH_AT as u32
             } else {
                 0
@@ -75,8 +86,10 @@ impl DemoSource {
             self.finished = true;
             return Ok(Feed::End);
         }
-        let channels: Vec<Vec<u8>> = (0..DEMO_CHANNELS)
-            .map(|channel| pack_bits(self.produced, n, channel_fn(channel)))
+        let waves = self.waves.clone();
+        let channels: Vec<Vec<u8>> = waves
+            .iter()
+            .map(|wave| pack_bits(self.produced, n, *wave))
             .collect();
         let atoms =
             pack_logic_atoms(&channels).map_err(|err| CaptureError::Proto(err.to_string()))?;
@@ -127,32 +140,209 @@ pub fn uart_high(sample: u64) -> bool {
     }
 }
 
+/// 7-bit address used by the demo EEPROM transaction.
+pub const I2C_ADDR: u8 = 0x50;
+/// Word address written, then read back.
+pub const I2C_OFFSET: u8 = 0x10;
+/// Data byte on the demo EEPROM write and the following random read.
+pub const I2C_DATA: u8 = 0x5A;
+/// Mode-0 SPI word on the second demo pod. MOSI then MISO.
+pub const SPI_MOSI: u8 = 0xA5;
+pub const SPI_MISO: u8 = 0x3C;
+
 pub fn i2c_scl_high(sample: u64) -> bool {
-    let p = sample % 400;
-    if !(40..360).contains(&p) {
-        return true;
-    }
-    let t = p - 40;
-    (t % 20) < 10
+    let frame = i2c_frame();
+    frame[(sample as usize) % frame.len()].1
 }
 
 pub fn i2c_sda_high(sample: u64) -> bool {
-    let p = sample % 400;
-    if p < 20 {
-        return true;
+    let frame = i2c_frame();
+    frame[(sample as usize) % frame.len()].0
+}
+
+pub fn spi_sck_high(sample: u64) -> bool {
+    spi_frame()[(sample as usize) % spi_frame().len()][0]
+}
+
+pub fn spi_mosi_high(sample: u64) -> bool {
+    spi_frame()[(sample as usize) % spi_frame().len()][1]
+}
+
+pub fn spi_miso_high(sample: u64) -> bool {
+    spi_frame()[(sample as usize) % spi_frame().len()][2]
+}
+
+pub fn spi_cs_high(sample: u64) -> bool {
+    spi_frame()[(sample as usize) % spi_frame().len()][3]
+}
+
+fn i2c_frame() -> &'static [(bool, bool)] {
+    use std::sync::OnceLock;
+    static FRAME: OnceLock<Vec<(bool, bool)>> = OnceLock::new();
+    FRAME.get_or_init(build_i2c_frame)
+}
+
+fn spi_frame() -> &'static [[bool; 4]] {
+    use std::sync::OnceLock;
+    static FRAME: OnceLock<Vec<[bool; 4]>> = OnceLock::new();
+    FRAME.get_or_init(build_spi_frame)
+}
+
+/// Byte write of [`I2C_DATA`] at [`I2C_OFFSET`], then a 24xx random read.
+///
+/// Each bit is eight samples of SCL low followed by eight of SCL high. Data
+/// changes while SCL is low and is stable on the rising edge. A start is SDA
+/// falling while SCL stays high.
+fn build_i2c_frame() -> Vec<(bool, bool)> {
+    fn push(out: &mut Vec<(bool, bool)>, n: usize, sda: bool, scl: bool) {
+        for _ in 0..n {
+            out.push((sda, scl));
+        }
     }
-    if p < 40 {
-        return false;
+    fn push_bit(out: &mut Vec<(bool, bool)>, bit: bool) {
+        push(out, 8, bit, false);
+        push(out, 8, bit, true);
     }
-    if p >= 360 {
-        return true;
+    fn push_byte(out: &mut Vec<(bool, bool)>, byte: u8, ack: bool) {
+        for shift in (0..8).rev() {
+            push_bit(out, (byte >> shift) & 1 == 1);
+        }
+        push_bit(out, !ack);
     }
-    let clock_index = (p - 40) / 20;
-    if clock_index >= 8 {
-        return false;
+    let mut out = Vec::new();
+    push(&mut out, 16, true, true);
+    push(&mut out, 16, false, true);
+    push_byte(&mut out, 0xA0, true);
+    push_byte(&mut out, I2C_OFFSET, true);
+    push_byte(&mut out, I2C_DATA, true);
+    push(&mut out, 8, false, false);
+    push(&mut out, 8, false, true);
+    push(&mut out, 16, true, true);
+    push(&mut out, 16, false, true);
+    push_byte(&mut out, 0xA0, true);
+    push_byte(&mut out, I2C_OFFSET, true);
+    push(&mut out, 8, false, false);
+    push(&mut out, 8, true, false);
+    push(&mut out, 8, true, true);
+    push(&mut out, 8, false, true);
+    push_byte(&mut out, 0xA1, true);
+    push_byte(&mut out, I2C_DATA, false);
+    push(&mut out, 8, false, false);
+    push(&mut out, 8, false, true);
+    push(&mut out, 16, true, true);
+    out
+}
+
+/// One mode-0 word, chip select active low, MSB first.
+fn build_spi_frame() -> Vec<[bool; 4]> {
+    fn push_bit(out: &mut Vec<[bool; 4]>, mosi: bool, miso: bool) {
+        for _ in 0..4 {
+            out.push([false, mosi, miso, false]);
+        }
+        for _ in 0..4 {
+            out.push([true, mosi, miso, false]);
+        }
     }
-    const BYTE: u8 = 0xA5;
-    ((BYTE >> clock_index) & 1) == 1
+    let mut out = Vec::new();
+    for _ in 0..24 {
+        out.push([false, false, false, true]);
+    }
+    for _ in 0..4 {
+        out.push([false, false, false, false]);
+    }
+    for shift in (0..8).rev() {
+        push_bit(
+            &mut out,
+            (SPI_MOSI >> shift) & 1 == 1,
+            (SPI_MISO >> shift) & 1 == 1,
+        );
+    }
+    for _ in 0..8 {
+        out.push([false, false, false, false]);
+    }
+    for _ in 0..16 {
+        out.push([false, false, false, true]);
+    }
+    out
+}
+
+/// One synthetic logic pod. Two of these can be stacked into one waveform.
+#[derive(Clone, Copy)]
+pub struct DemoChannel {
+    pub name: &'static str,
+    pub color: &'static str,
+    pub level: fn(u64) -> bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct DemoPod {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub channels: &'static [DemoChannel],
+}
+
+pub fn demo_pods() -> &'static [DemoPod] {
+    const LOGIC: &[DemoChannel] = &[
+        DemoChannel {
+            name: "CLK",
+            color: "#e2b340",
+            level: clock_high,
+        },
+        DemoChannel {
+            name: "UART",
+            color: "#3dcc8e",
+            level: uart_high,
+        },
+        DemoChannel {
+            name: "SDA",
+            color: "#5aa2ff",
+            level: i2c_sda_high,
+        },
+        DemoChannel {
+            name: "SCL",
+            color: "#c58bff",
+            level: i2c_scl_high,
+        },
+    ];
+    const SPI: &[DemoChannel] = &[
+        DemoChannel {
+            name: "SCK",
+            color: "#f2d38a",
+            level: spi_sck_high,
+        },
+        DemoChannel {
+            name: "MOSI",
+            color: "#ff6b8a",
+            level: spi_mosi_high,
+        },
+        DemoChannel {
+            name: "MISO",
+            color: "#7dcea0",
+            level: spi_miso_high,
+        },
+        DemoChannel {
+            name: "CS",
+            color: "#f0c14d",
+            level: spi_cs_high,
+        },
+    ];
+    const PODS: &[DemoPod] = &[
+        DemoPod {
+            id: "demo",
+            name: "Demo",
+            channels: LOGIC,
+        },
+        DemoPod {
+            id: "demo:spi",
+            name: "Demo SPI",
+            channels: SPI,
+        },
+    ];
+    PODS
+}
+
+pub fn demo_pod(id: &str) -> Option<&'static DemoPod> {
+    demo_pods().iter().find(|pod| pod.id == id)
 }
 
 pub fn analog_sample(sample: u64, rate: u64) -> f32 {
@@ -160,15 +350,6 @@ pub fn analog_sample(sample: u64, rate: u64) -> f32 {
     let t = sample as f32 / rate;
     let sine = (2.0 * std::f32::consts::PI * 1_000.0 * t).sin();
     sine + noise(sample) * 0.05
-}
-
-fn channel_fn(channel: usize) -> fn(u64) -> bool {
-    match channel {
-        0 => clock_high,
-        1 => uart_high,
-        2 => i2c_sda_high,
-        _ => i2c_scl_high,
-    }
 }
 
 fn pack_bits(start: u64, samples: u64, f: fn(u64) -> bool) -> Vec<u8> {

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 logicview-engine = { path = "../logicview-engine" }
+logicview-mcp = { path = "../logicview-mcp" }
 logicview-ui = { path = "../logicview-ui" }
 tokio.workspace = true
 tracing.workspace = true

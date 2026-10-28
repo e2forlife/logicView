@@ -1,20 +1,33 @@
 # LogicView
 
-Clean-room Rust logic analyzer. Phases 0–2 are the capture contract, the demo
-engine, and the Axum waveform shell. Phases 3–4 add buffer and stream capture
-for one high-speed DSLogic Plus (`0x2A0E:0x0020`). Firmware and the FPGA
-bitstream are not in this repo. Set `LOGICVIEW_FIRMWARE_DIR` to the folder
-that contains `DSLogicPlus.bin` when the pod's FPGA is not already configured.
+Clean-room Rust logic analyzer. Phases 0–4 are the capture contract, the demo
+engine, the Axum waveform shell, and buffer/stream capture for one high-speed
+DSLogic Plus (`0x2A0E:0x0020`). This tree adds protocol decode (UART, I2C, SPI,
+and a 24xx-style EEPROM stack), the data table, and a stdio MCP server.
+A session can stack the Demo and Demo SPI pods onto one waveform. Other logic
+product ids are listed with their channel counts and are not opened: they have
+not been tested on hardware. Oscilloscope and data acquisition are not in this
+build. Firmware and the FPGA bitstream are not in this repo. Set
+`LOGICVIEW_FIRMWARE_DIR` to the folder that contains `DSLogicPlus.bin` when the
+Plus pod's FPGA is not already configured.
 
 ```
 cargo test --workspace
 cargo run -p logicview-app
+cargo run -p logicview-app -- mcp
 ```
 
-The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`). Press Start.
-The demo source streams a clock, a UART-shaped line, an I2C-shaped pair, and a
-noisy 1 kHz sine. Drag to pan, scroll to zoom, and hover a trace for pulse
-width and period. The `+` button opens another session tab.
+The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`) and listens
+for an MCP client on `/tmp/logicview.sock` (override with `LOGICVIEW_SOCKET`).
+`logicview mcp` attaches to that socket when the UI is already running, and
+otherwise starts its own demo engine. Press Start. Stack **Demo SPI** from the
+device drawer to see both pods. Hover a trace for width, period, frequency,
+and duty; the measure drawer keeps those readings. Add I2C or SPI from the
+analyzers drawer and read the rows in the bottom table. The trigger drawer
+takes an ordered list of edges (channel 1 rising, then channel 3 rising,
+fires on channel 3). Each step is one stage in the arm record. The demo
+source finds that sequence in the captured samples. The same stages are
+written for a pod and have not been run on hardware.
 
 ## Crates
 
@@ -23,13 +36,16 @@ width and period. The `+` button opens another session tab.
 | `logicview-proto` | 0 | Arm record, logic header, sample atoms, `.dsl` header text |
 | `logicview-hal` | 3 | DSLogic Plus USB, FPGA sequencing, buffer capture |
 | `logicview-analysis` | 1 | Edge search and pulse measurements |
+| `logicview-decode` | 5 | UART, I2C, SPI, and a 24xx EEPROM stack |
 | `logicview-capture` | 1 | Demo source, session phases, logic mipmap |
 | `logicview-store` | 1 | `.lvcap` directory or zip |
-| `logicview-engine` | 1 | Command facade and live events |
+| `logicview-engine` | 1 | Command facade, multi-pod channel list, live events |
+| `logicview-mcp` | 6 | stdio MCP and the UI attach socket |
 | `logicview-ui` | 2 | Axum routes, WebSocket tile frames, waveform shell |
 | `logicview-app` | 2 | `logicview` binary |
 
-Decoders and MCP are later phases. See `CONTRIBUTING.md` for the clean-room
-rule. The arm record's sample-count shift is 4, measured on the Plus pod:
+See `CONTRIBUTING.md` for the clean-room rule. Decoders follow the published
+I2C, SPI, UART, and 24C02 sequences, not another project's scripts. The arm
+record's sample-count shift is 4, measured on the Plus pod:
 packed counts `0x10`, `0x40`, and `0x80` kept 32, 128, and 256 bytes on one
 channel.

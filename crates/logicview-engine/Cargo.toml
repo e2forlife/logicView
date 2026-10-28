@@ -9,6 +9,7 @@ description = "In-process capture engine shared by the UI"
 [dependencies]
 logicview-analysis = { path = "../logicview-analysis" }
 logicview-capture = { path = "../logicview-capture" }
+logicview-decode = { path = "../logicview-decode" }
 logicview-hal = { path = "../logicview-hal" }
 logicview-proto = { path = "../logicview-proto" }
 logicview-store = { path = "../logicview-store" }

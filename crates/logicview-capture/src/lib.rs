@@ -10,14 +10,16 @@ mod session;
 mod store;
 
 pub use demo::{
-    analog_sample, clock_high, uart_high, DemoSource, Feed, CLOCK_HIGH_AT, CLOCK_PERIOD,
-    DEMO_CHANNELS,
+    analog_sample, clock_high, demo_pod, demo_pods, i2c_scl_high, i2c_sda_high, spi_cs_high,
+    spi_miso_high, spi_mosi_high, spi_sck_high, uart_high, DemoChannel, DemoPod, DemoSource, Feed,
+    CLOCK_HIGH_AT, CLOCK_PERIOD, DEMO_CHANNELS, I2C_ADDR, I2C_DATA, I2C_OFFSET, SPI_MISO, SPI_MOSI,
 };
 pub use error::CaptureError;
 pub use logicview_proto::DepthMode;
 pub use session::{
-    planned_samples, HostClock, Phase, RunPolicy, Session, SessionConfig, StartMode, TriggerKind,
-    DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
+    active_edge_steps, check_trigger, planned_samples, HostClock, Phase, RunPolicy, Session,
+    SessionConfig, StartMode, TriggerKind, TriggerStep, DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
+    MAX_TRIGGER_STEPS,
 };
 pub use store::{AnalogColumn, AnalogStore, Column, LogicStore};
 

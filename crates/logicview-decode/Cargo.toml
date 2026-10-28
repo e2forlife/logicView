@@ -1,0 +1,15 @@
+[package]
+name = "logicview-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Protocol decoders written from published bus specifications"
+
+[dependencies]
+logicview-analysis = { path = "../logicview-analysis" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

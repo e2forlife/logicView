@@ -161,8 +161,49 @@ button { cursor: pointer; }
 }
 
 .ch .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.ch-label { display: flex; flex-direction: column; min-width: 0; }
 .ch .name { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
+.ch .dev { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ch input { accent-color: var(--accent); }
+
+#table-panel {
+  height: 168px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+  background: #161922;
+}
+.table-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.table-tab, #table-export {
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.table-tab.active { background: #2a3142; color: white; }
+#table-search {
+  flex: 1;
+  min-width: 0;
+  background: #12141a;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+#table-body { flex: 1; overflow: auto; }
+table.ann { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.ann td { padding: 4px 8px; border-bottom: 1px solid #262b36; white-space: nowrap; }
+table.ann tr { cursor: pointer; }
+table.ann tr:hover { background: #222733; }
+.table-empty { color: var(--muted); padding: 10px 12px; font-size: 12px; }
 
 .canvas-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
@@ -243,6 +284,20 @@ button { cursor: pointer; }
 }
 .drawer .check { flex-direction: row; align-items: center; gap: 8px; }
 .drawer .hint { font-size: 11px; color: #6f7684; line-height: 1.4; }
+.drawer .step {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.drawer .step input,
+.drawer .step select { flex: 1; min-width: 0; margin: 0; }
+.drawer .step button {
+  background: #2a3142;
+  border: 1px solid #44506a;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
 .drawer button.block {
   width: 100%;
   margin-top: 8px;
@@ -292,4 +347,5 @@ button { cursor: pointer; }
     border-left: 0;
     border-top: 1px solid var(--line);
   }
+  #table-panel { height: 120px; }
 }

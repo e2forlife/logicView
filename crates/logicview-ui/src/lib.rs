@@ -5,6 +5,7 @@
 //! or the `LVT1` binary frame (WebSocket). The server refuses a non-loopback
 //! bind.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -98,7 +99,7 @@ async fn health() -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "logicview",
-        "phases": ["0", "1", "2", "3", "4"],
+        "phases": ["0", "1", "2", "3", "4", "5", "6"],
         "device": "demo"
     }))
 }
@@ -264,7 +265,14 @@ async fn reply_socket(
 async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
     match cmd {
         Command::ListDevices => Ok(json!(engine.list_devices().await)),
+        Command::ListProfiles => Ok(json!(engine.list_profiles().await)),
         Command::Connect { id } => Ok(json!(engine.connect(&id).await?)),
+        Command::AttachDevice { session, id } => {
+            Ok(json!(engine.attach_device(session.as_deref(), &id).await?))
+        }
+        Command::DetachDevice { session, id } => {
+            Ok(json!(engine.detach_device(session.as_deref(), &id).await?))
+        }
         Command::ListSessions => {
             let (sessions, active) = engine.list_sessions().await;
             Ok(json!({"sessions": sessions, "active": active}))
@@ -293,6 +301,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             channel_enable,
             trigger_channel,
             trigger_kind,
+            trigger_steps,
         } => {
             engine
                 .configure(
@@ -328,6 +337,13 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                             "low" => TriggerKind::Low,
                             _ => TriggerKind::Rising,
                         },
+                        trigger_steps: trigger_steps
+                            .into_iter()
+                            .map(|step| logicview_capture::TriggerStep {
+                                channel: step.channel,
+                                rising: step.rising,
+                            })
+                            .collect(),
                     },
                 )
                 .await?;
@@ -403,6 +419,64 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
         Command::ListMeasurements { session } => {
             Ok(json!(engine.measurements(session.as_deref()).await?))
         }
+        Command::DecoderCatalog => Ok(json!(engine.decoder_catalog().await)),
+        Command::ListDecoders { session } => {
+            Ok(json!(engine.list_decoders(session.as_deref()).await?))
+        }
+        Command::AddDecoder {
+            session,
+            protocol,
+            channels,
+            options,
+            stack_on,
+            region_start,
+            region_end,
+        } => {
+            let region = match (region_start, region_end) {
+                (Some(start), Some(end)) => Some((start, end)),
+                _ => None,
+            };
+            Ok(json!(engine
+                .add_decoder(
+                    session.as_deref(),
+                    &protocol,
+                    &channels,
+                    &options,
+                    region,
+                    stack_on.as_deref(),
+                )
+                .await?))
+        }
+        Command::RemoveDecoder { session, id } => {
+            engine.remove_decoder(session.as_deref(), &id).await?;
+            Ok(json!({"removed": id}))
+        }
+        Command::ReadAnnotations {
+            session,
+            decoder,
+            query,
+            start,
+            end,
+            offset,
+            limit,
+        } => Ok(json!(engine
+            .read_annotations(
+                session.as_deref(),
+                decoder.as_deref(),
+                query.as_deref(),
+                start,
+                end,
+                offset.unwrap_or(0),
+                limit.unwrap_or(300),
+            )
+            .await?)),
+        Command::ExportAnnotations {
+            session,
+            format,
+            query,
+        } => Ok(json!(engine
+            .export_annotations(session.as_deref(), &format, query.as_deref())
+            .await?)),
         Command::Tile {
             session,
             channel,
@@ -615,10 +689,26 @@ impl IntoResponse for ApiError {
 }
 
 #[derive(Deserialize)]
+struct TriggerStepCmd {
+    channel: u8,
+    #[serde(default = "default_true")]
+    rising: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Command {
     ListDevices,
+    ListProfiles,
     Connect { id: String },
+    AttachDevice {
+        session: Option<String>,
+        id: String,
+    },
+    DetachDevice {
+        session: Option<String>,
+        id: String,
+    },
     ListSessions,
     CreateSession {
         name: Option<String>,
@@ -660,6 +750,8 @@ enum Command {
         trigger_channel: u8,
         #[serde(default)]
         trigger_kind: String,
+        #[serde(default)]
+        trigger_steps: Vec<TriggerStepCmd>,
     },
     SearchPattern {
         session: Option<String>,
@@ -685,6 +777,50 @@ enum Command {
     },
     ListMeasurements {
         session: Option<String>,
+    },
+    DecoderCatalog,
+    ListDecoders {
+        session: Option<String>,
+    },
+    AddDecoder {
+        session: Option<String>,
+        protocol: String,
+        #[serde(default)]
+        channels: BTreeMap<String, String>,
+        #[serde(default)]
+        options: BTreeMap<String, String>,
+        #[serde(default)]
+        stack_on: Option<String>,
+        #[serde(default)]
+        region_start: Option<u64>,
+        #[serde(default)]
+        region_end: Option<u64>,
+    },
+    RemoveDecoder {
+        session: Option<String>,
+        id: String,
+    },
+    ReadAnnotations {
+        session: Option<String>,
+        #[serde(default)]
+        decoder: Option<String>,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        start: Option<u64>,
+        #[serde(default)]
+        end: Option<u64>,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ExportAnnotations {
+        session: Option<String>,
+        #[serde(default = "default_csv")]
+        format: String,
+        #[serde(default)]
+        query: Option<String>,
     },
     Start {
         session: Option<String>,
@@ -732,6 +868,10 @@ fn default_threshold() -> f64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_csv() -> String {
+    "csv".into()
 }
 
 fn parse_pattern(text: &str) -> Vec<Option<bool>> {
@@ -922,6 +1062,87 @@ mod tests {
         assert!(export.status().is_success());
         let bytes = export.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..2], b"PK");
+    }
+
+    #[tokio::test]
+    async fn stacked_channels_decode_over_the_command_api() {
+        let app = router(Engine::new());
+        let status = post(&app, json!({"cmd": "attach_device", "id": "demo:spi"})).await;
+        assert_eq!(status["channels"].as_array().unwrap().len(), 8);
+        assert_eq!(status["channels"][0]["device_id"], "demo");
+        assert_eq!(status["channels"][0]["name"], "CLK");
+        assert_eq!(status["channels"][4]["device_id"], "demo:spi");
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 10
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut stopped = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = post(&app, json!({"cmd": "status"})).await;
+            if stopped["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(stopped["phase"], "stopped");
+        post(
+            &app,
+            json!({
+                "cmd": "add_decoder",
+                "protocol": "spi",
+                "channels": {
+                    "sck": "demo:spi/SCK",
+                    "mosi": "demo:spi/MOSI",
+                    "miso": "demo:spi/MISO",
+                    "cs": "demo:spi/CS"
+                }
+            }),
+        )
+        .await;
+        let rows = post(
+            &app,
+            json!({"cmd": "read_annotations", "query": "MOSI 0xA5", "limit": 5}),
+        )
+        .await;
+        let rows = rows.as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows[0]["text"].as_str().unwrap().contains("MISO 0x3C"));
+    }
+
+    #[tokio::test]
+    async fn sequential_trigger_reports_sample_40() {
+        let app = router(Engine::new());
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 10,
+                "trigger_enabled": true,
+                "trigger_steps": [
+                    {"channel": 1, "rising": true},
+                    {"channel": 3, "rising": true}
+                ]
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut stopped = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stopped = post(&app, json!({"cmd": "status"})).await;
+            if stopped["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(stopped["phase"], "stopped");
+        assert_eq!(stopped["trigger_sample"], 40);
     }
 
     #[tokio::test]

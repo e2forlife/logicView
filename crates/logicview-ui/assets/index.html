@@ -39,6 +39,15 @@
           </div>
         </div>
         <canvas id="overview"></canvas>
+        <div id="table-panel">
+          <div class="table-bar">
+            <button type="button" class="table-tab active" data-tab="decoded">Decoded</button>
+            <button type="button" class="table-tab" data-tab="edges">Edges</button>
+            <input id="table-search" type="search" placeholder="Search or A0-10-5A" aria-label="Search annotations">
+            <button id="table-export" type="button">Export</button>
+          </div>
+          <div id="table-body"></div>
+        </div>
         <div id="status" class="status">idle</div>
       </div>
       <aside class="rail" id="rail">

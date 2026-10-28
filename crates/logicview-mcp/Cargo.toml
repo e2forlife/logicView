@@ -1,0 +1,18 @@
+[package]
+name = "logicview-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "stdio MCP server for the LogicView engine"
+
+[dependencies]
+logicview-engine = { path = "../logicview-engine" }
+logicview-capture = { path = "../logicview-capture" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "rt", "macros"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

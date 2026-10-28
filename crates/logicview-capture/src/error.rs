@@ -12,6 +12,8 @@ pub enum CaptureError {
     BadChannel(usize),
     #[error("capture is already running")]
     Busy,
+    #[error("{0}")]
+    BadTrigger(String),
     #[error("sample buffer does not match the manifest")]
     BadLength,
     #[error("{0}")]

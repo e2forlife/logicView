@@ -1,16 +1,16 @@
-//! Facade over the demo capture session.
+//! Facade over capture sessions.
 //!
-//! Commands come from the UI (and, later, MCP). Events go out on a broadcast
-//! bus. Snapshots stay inside the session; readers copy the bytes they need
-//! under a short lock. There is no USB device in this crate.
+//! Commands come from the UI and from MCP. A session can stack more than one
+//! demo pod into a single channel list. Events go out on a broadcast bus.
 
+mod decode_cmd;
 mod run;
 mod usb;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use logicview_analysis::{cursor_span, find_edge, find_pattern, measure_pulse};
 use logicview_capture::{
-    planned_samples, AnalogStore, HostClock, LogicStore, Phase, Session, DEMO_CHANNELS,
+    demo_pod, planned_samples, AnalogStore, HostClock, LogicStore, Phase, Session,
 };
 use logicview_proto::DepthMode;
 use logicview_store::{
@@ -35,12 +35,6 @@ pub use logicview_capture::{
 
 const MAX_SESSIONS: usize = 8;
 
-const CHANNELS: [(&str, &str); DEMO_CHANNELS] = [
-    ("CLK", "#e2b340"),
-    ("UART", "#3dcc8e"),
-    ("SDA", "#5aa2ff"),
-    ("SCL", "#c58bff"),
-];
 const ANALOG_NAME: &str = "SINE";
 const ANALOG_COLOR: &str = "#ff8a5b";
 
@@ -48,8 +42,10 @@ const ANALOG_COLOR: &str = "#ff8a5b";
 pub enum EngineError {
     #[error("unknown session {0}")]
     UnknownSession(String),
-    #[error("unknown device {0}; this build connects to demo or usb:2a0e:0020")]
+    #[error("{0}")]
     UnknownDevice(String),
+    #[error("{0}")]
+    Decode(String),
     #[error("{0}")]
     Capture(#[from] logicview_capture::CaptureError),
     #[error("{0}")]
@@ -60,6 +56,16 @@ pub enum EngineError {
     Device(String),
     #[error("too many sessions")]
     TooManySessions,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub product_id: u16,
+    pub name: String,
+    pub channels: u8,
+    pub hardware_tested: bool,
+    pub note: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,6 +81,8 @@ pub struct ChannelInfo {
     pub index: usize,
     pub name: String,
     pub color: String,
+    pub device_id: String,
+    pub device_name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -98,6 +106,7 @@ pub struct Status {
     pub instant: bool,
     pub realtime: bool,
     pub channels: Vec<ChannelInfo>,
+    pub devices: Vec<DeviceInfo>,
     pub analog: Vec<AnalogInfo>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
@@ -153,11 +162,56 @@ pub struct SavedMeasurement {
     pub duty: Option<f64>,
 }
 
+pub(crate) struct BoundDevice {
+    id: String,
+    name: String,
+    kind: String,
+}
+
+pub(crate) struct ChannelOrigin {
+    device_id: String,
+    device_name: String,
+}
+
+pub(crate) struct DecoderInst {
+    id: String,
+    protocol: String,
+    channels: BTreeMap<String, usize>,
+    options: BTreeMap<String, String>,
+    region: Option<(u64, u64)>,
+    stack_on: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DecoderInfo {
+    pub id: String,
+    pub protocol: String,
+    pub channels: BTreeMap<String, usize>,
+    pub options: BTreeMap<String, String>,
+    pub stack_on: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AnnotationRow {
+    pub decoder: String,
+    pub protocol: String,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub class: String,
+    pub text: String,
+    pub fields: BTreeMap<String, String>,
+}
+
 struct Slot {
     pub(crate) id: String,
     name: String,
     pub(crate) channel_names: Vec<String>,
     channel_colors: Vec<String>,
+    pub(crate) origins: Vec<ChannelOrigin>,
+    pub(crate) devices: Vec<BoundDevice>,
+    pub(crate) decoders: Vec<DecoderInst>,
+    pub(crate) annotations: Vec<AnnotationRow>,
+    next_decoder: u64,
     pub(crate) session: Session,
     cursors: [Option<u64>; 2],
     measurements: Vec<SavedMeasurement>,
@@ -203,13 +257,25 @@ impl Engine {
         self.shared.events.subscribe()
     }
 
+    pub async fn list_profiles(&self) -> Vec<ProfileInfo> {
+        logicview_hal::logic_profiles()
+            .iter()
+            .map(|profile| ProfileInfo {
+                id: format!("usb:2a0e:{:04x}", profile.product_id),
+                product_id: profile.product_id,
+                name: profile.name.to_string(),
+                channels: profile.channels,
+                hardware_tested: profile.hardware_tested,
+                note: profile.note.to_string(),
+            })
+            .collect()
+    }
+
     pub async fn list_devices(&self) -> Vec<DeviceInfo> {
-        let mut devices = vec![DeviceInfo {
-            id: "demo".into(),
-            name: "Demo".into(),
-            kind: "demo".into(),
-            connected: true,
-        }];
+        let mut devices: Vec<DeviceInfo> = logicview_capture::demo_pods()
+            .iter()
+            .map(|pod| demo_device_info(pod.id))
+            .collect();
         if let Ok(pods) = logicview_hal::list_plus() {
             for pod in pods {
                 devices.push(DeviceInfo {
@@ -224,40 +290,117 @@ impl Engine {
     }
 
     pub async fn connect(&self, id: &str) -> Result<DeviceInfo, EngineError> {
-        if id == "demo" {
-            self.use_demo_channels().await;
-            let mut state = self.shared.state.lock().await;
-            state.device = "demo".into();
-            return Ok(DeviceInfo {
-                id: "demo".into(),
-                name: "Demo".into(),
-                kind: "demo".into(),
-                connected: true,
-            });
-        }
-        if id != logicview_hal::DEVICE_ID {
-            return Err(EngineError::UnknownDevice(id.to_string()));
-        }
-        let pod = logicview_hal::Pod::open().map_err(|err| EngineError::Device(err.to_string()))?;
-        let info = DeviceInfo {
-            id: id.into(),
-            name: format!(
-                "DSLogic Plus fw {}.{} ({:04x}:{:04x})",
-                pod.firmware_major,
-                pod.firmware_minor,
-                logicview_hal::VENDOR_ID,
-                logicview_hal::PLUS_PID
-            ),
-            kind: "usb".into(),
-            connected: true,
-        };
-        drop(pod);
-        {
+        if demo_pod(id).is_some() {
+            self.set_active_devices(&[id.to_string()]).await?;
             let mut state = self.shared.state.lock().await;
             state.device = id.into();
+            return Ok(demo_device_info(id));
         }
-        self.use_pod_channels(0xFFFF).await;
-        Ok(info)
+        if let Some(pid) = usb_product_id(id) {
+            if pid != logicview_hal::PLUS_PID || id != logicview_hal::DEVICE_ID {
+                let profile = logicview_hal::logic_profile(pid);
+                let name = profile.map(|item| item.name).unwrap_or("unknown product");
+                let channels = profile.map(|item| item.channels).unwrap_or(0);
+                return Err(EngineError::UnknownDevice(format!(
+                    "{id} ({name}, {channels} channels) is not opened: no hardware test for this product id"
+                )));
+            }
+            let pod = logicview_hal::Pod::open().map_err(|err| EngineError::Device(err.to_string()))?;
+            let info = DeviceInfo {
+                id: id.into(),
+                name: format!(
+                    "DSLogic Plus fw {}.{} ({:04x}:{:04x})",
+                    pod.firmware_major,
+                    pod.firmware_minor,
+                    logicview_hal::VENDOR_ID,
+                    logicview_hal::PLUS_PID
+                ),
+                kind: "usb".into(),
+                connected: true,
+            };
+            drop(pod);
+            {
+                let mut state = self.shared.state.lock().await;
+                state.device = id.into();
+            }
+            self.use_pod_channels(0xFFFF).await;
+            return Ok(info);
+        }
+        Err(EngineError::UnknownDevice(format!(
+            "unknown device {id}; open demo, demo:spi, or a tested Plus ({})",
+            logicview_hal::DEVICE_ID
+        )))
+    }
+
+    pub async fn attach_device(&self, id: Option<&str>, device_id: &str) -> Result<Status, EngineError> {
+        let pod = demo_pod(device_id).ok_or_else(|| {
+            if usb_product_id(device_id).is_some() {
+                EngineError::UnknownDevice(format!(
+                    "attach {device_id} is refused: stacking USB pods in one capture is not verified. Use demo and demo:spi."
+                ))
+            } else {
+                EngineError::UnknownDevice(format!("unknown device {device_id}"))
+            }
+        })?;
+        let mut state = self.shared.state.lock().await;
+        let id = self.resolve(&state, id)?;
+        let slot = state.slot_mut(&id)?;
+        if slot.session.phase.is_active() {
+            return Err(logicview_capture::CaptureError::Busy.into());
+        }
+        if slot.devices.iter().any(|device| device.kind != "demo") {
+            return Err(EngineError::Device(
+                "this session is on a USB pod; stacking a demo onto it is not supported".into(),
+            ));
+        }
+        if slot.devices.iter().any(|device| device.id == device_id) {
+            return Ok(slot.status(true));
+        }
+        let mut ids: Vec<String> = slot.devices.iter().map(|device| device.id.clone()).collect();
+        ids.push(pod.id.to_string());
+        install_demo_ids(slot, &ids)?;
+        Ok(slot.status(true))
+    }
+
+    pub async fn detach_device(&self, id: Option<&str>, device_id: &str) -> Result<Status, EngineError> {
+        let mut state = self.shared.state.lock().await;
+        let id = self.resolve(&state, id)?;
+        let slot = state.slot_mut(&id)?;
+        if slot.session.phase.is_active() {
+            return Err(logicview_capture::CaptureError::Busy.into());
+        }
+        if slot.devices.len() <= 1 {
+            return Err(EngineError::Device(
+                "a session keeps at least one device".into(),
+            ));
+        }
+        let ids: Vec<String> = slot
+            .devices
+            .iter()
+            .filter(|device| device.id != device_id)
+            .map(|device| device.id.clone())
+            .collect();
+        if ids.len() == slot.devices.len() {
+            return Err(EngineError::UnknownDevice(format!(
+                "device {device_id} is not in this session"
+            )));
+        }
+        install_demo_ids(slot, &ids)?;
+        Ok(slot.status(true))
+    }
+
+    async fn set_active_devices(&self, ids: &[String]) -> Result<(), EngineError> {
+        let mut state = self.shared.state.lock().await;
+        let active = state.active;
+        let slot = state
+            .slots
+            .get_mut(active)
+            .ok_or_else(|| EngineError::UnknownSession("active".into()))?;
+        if slot.session.phase.is_active() {
+            return Err(logicview_capture::CaptureError::Busy.into());
+        }
+        install_demo_ids(slot, ids)?;
+        Ok(())
     }
 
     pub async fn list_sessions(&self) -> (Vec<SessionBrief>, String) {
@@ -319,6 +462,7 @@ impl Engine {
             0.0
         };
         planned_samples(&config)?;
+        logicview_capture::check_trigger(&config)?;
         let id = {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
@@ -333,23 +477,26 @@ impl Engine {
     }
 
     pub async fn start(&self, id: Option<&str>, mode: StartMode) -> Result<Status, EngineError> {
-        let usb = {
-            let state = self.shared.state.lock().await;
-            state.device == logicview_hal::DEVICE_ID
-        };
-        if usb {
-            return self.start_usb(id, mode).await;
-        }
         let id = {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
         };
+        let usb = {
+            let state = self.shared.state.lock().await;
+            let slot = state.slot(&id)?;
+            session_uses_usb(&slot.devices)?
+        };
+        if usb {
+            return self.start_usb(Some(&id), mode).await;
+        }
         let (source, realtime, rate, generation, stop) = {
             let mut state = self.shared.state.lock().await;
             let (source, generation, realtime, rate) = {
                 let slot = state.slot_mut(&id)?;
                 let config = slot.session.config.clone();
-                let source = slot.session.begin(config, mode)?;
+                let waves = demo_waves(&slot.devices)?;
+                let source = slot.session.begin(config, mode, waves)?;
+                slot.annotations.clear();
                 let generation = slot.session.generation();
                 let realtime = slot.session.config.realtime;
                 let rate = slot.session.config.sample_rate_hz;
@@ -523,8 +670,26 @@ impl Engine {
             let slot = state.slot_mut(&id)?;
             let samples = slot.session.prepare(config.clone(), mode, 16, clock)?;
             let (names, colors) = pod_channel_style(mask);
+            let device_id = slot
+                .devices
+                .first()
+                .map(|device| device.id.clone())
+                .unwrap_or_else(|| logicview_hal::DEVICE_ID.to_string());
+            let device_name = slot
+                .devices
+                .first()
+                .map(|device| device.name.clone())
+                .unwrap_or_else(|| "DSLogic Plus".to_string());
+            slot.origins = names
+                .iter()
+                .map(|_| ChannelOrigin {
+                    device_id: device_id.clone(),
+                    device_name: device_name.clone(),
+                })
+                .collect();
             slot.channel_names = names;
             slot.channel_colors = colors;
+            slot.annotations.clear();
             let generation = slot.session.generation();
             let stop = Arc::new(AtomicBool::new(false));
             let image = slot.session.arm.clone();
@@ -677,18 +842,7 @@ impl Engine {
             .enumerate()
             .map(|(index, name)| logicview_proto::DslProbe {
                 name: name.clone(),
-                trigger: if slot.session.config.trigger_enabled
-                    && index == slot.session.config.trigger_channel as usize
-                {
-                    match slot.session.config.trigger_kind {
-                        TriggerKind::Rising => "rising".into(),
-                        TriggerKind::Falling => "falling".into(),
-                        TriggerKind::High => "high".into(),
-                        TriggerKind::Low => "low".into(),
-                    }
-                } else {
-                    String::new()
-                },
+                trigger: dsl_trigger_label(&slot.session.config, index),
             })
             .collect();
         let header = logicview_proto::write_dsl_header(&logicview_proto::DslHeader {
@@ -832,21 +986,23 @@ impl Engine {
             .iter()
             .map(|channel| channel.color.clone())
             .collect();
+        slot.devices = vec![BoundDevice {
+            id: "file".into(),
+            name: "File".into(),
+            kind: "file".into(),
+        }];
+        slot.origins = slot
+            .channel_names
+            .iter()
+            .map(|_| ChannelOrigin {
+                device_id: "file".into(),
+                device_name: "File".into(),
+            })
+            .collect();
+        slot.decoders.clear();
+        slot.annotations.clear();
         let is_active = slot.id == active;
         Ok(slot.status(is_active))
-    }
-
-    async fn use_demo_channels(&self) {
-        let mut state = self.shared.state.lock().await;
-        let active = state.active;
-        if let Some(slot) = state.slots.get_mut(active) {
-            if slot.session.phase.is_active() {
-                return;
-            }
-            slot.channel_names = CHANNELS.iter().map(|(name, _)| (*name).to_string()).collect();
-            slot.channel_colors = CHANNELS.iter().map(|(_, color)| (*color).to_string()).collect();
-            slot.session.store = LogicStore::new(DEMO_CHANNELS);
-        }
     }
 
     async fn use_pod_channels(&self, mask: u32) {
@@ -857,8 +1013,22 @@ impl Engine {
                 return;
             }
             let (names, colors) = pod_channel_style(mask);
+            slot.devices = vec![BoundDevice {
+                id: logicview_hal::DEVICE_ID.into(),
+                name: "DSLogic Plus".into(),
+                kind: "usb".into(),
+            }];
+            slot.origins = names
+                .iter()
+                .map(|_| ChannelOrigin {
+                    device_id: logicview_hal::DEVICE_ID.into(),
+                    device_name: "DSLogic Plus".into(),
+                })
+                .collect();
             slot.channel_names = names;
             slot.channel_colors = colors;
+            slot.decoders.clear();
+            slot.annotations.clear();
             slot.session.store = LogicStore::new(mask.count_ones() as usize);
         }
     }
@@ -889,22 +1059,23 @@ impl Default for Engine {
 
 impl Slot {
     fn demo(id: &str, name: &str) -> Self {
-        Self {
+        let mut slot = Self {
             id: id.to_string(),
             name: name.to_string(),
-            channel_names: CHANNELS
-                .iter()
-                .map(|(name, _)| (*name).to_string())
-                .collect(),
-            channel_colors: CHANNELS
-                .iter()
-                .map(|(_, color)| (*color).to_string())
-                .collect(),
+            channel_names: Vec::new(),
+            channel_colors: Vec::new(),
+            origins: Vec::new(),
+            devices: Vec::new(),
+            decoders: Vec::new(),
+            annotations: Vec::new(),
+            next_decoder: 1,
             session: Session::new(),
             cursors: [None, None],
             measurements: Vec::new(),
             next_measure: 1,
-        }
+        };
+        let _ = install_demo_ids(&mut slot, &["demo".to_string()]);
+        slot
     }
 
     fn status(&self, active: bool) -> Status {
@@ -929,6 +1100,26 @@ impl Slot {
                     index,
                     name: name.clone(),
                     color: color.clone(),
+                    device_id: self
+                        .origins
+                        .get(index)
+                        .map(|origin| origin.device_id.clone())
+                        .unwrap_or_else(|| "session".into()),
+                    device_name: self
+                        .origins
+                        .get(index)
+                        .map(|origin| origin.device_name.clone())
+                        .unwrap_or_else(|| "Session".into()),
+                })
+                .collect(),
+            devices: self
+                .devices
+                .iter()
+                .map(|device| DeviceInfo {
+                    id: device.id.clone(),
+                    name: device.name.clone(),
+                    kind: device.kind.clone(),
+                    connected: true,
                 })
                 .collect(),
             analog: vec![AnalogInfo {
@@ -941,6 +1132,124 @@ impl Slot {
             active,
         }
     }
+}
+
+fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
+    if !config.trigger_enabled {
+        return String::new();
+    }
+    let steps = logicview_capture::active_edge_steps(config);
+    if !steps.is_empty() {
+        return steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| step.channel as usize == index)
+            .map(|(order, step)| {
+                format!(
+                    "{}:{}",
+                    order + 1,
+                    if step.rising { "rising" } else { "falling" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    if index != config.trigger_channel as usize {
+        return String::new();
+    }
+    match config.trigger_kind {
+        TriggerKind::Rising => "rising".into(),
+        TriggerKind::Falling => "falling".into(),
+        TriggerKind::High => "high".into(),
+        TriggerKind::Low => "low".into(),
+    }
+}
+
+fn demo_device_info(id: &str) -> DeviceInfo {
+    let pod = demo_pod(id);
+    DeviceInfo {
+        id: id.to_string(),
+        name: pod.map(|item| item.name.to_string()).unwrap_or_else(|| id.to_string()),
+        kind: "demo".into(),
+        connected: true,
+    }
+}
+
+fn usb_product_id(id: &str) -> Option<u16> {
+    let rest = id.strip_prefix("usb:2a0e:")?;
+    let hex = rest.split([':', '#', '/']).next().unwrap_or(rest);
+    u16::from_str_radix(hex, 16).ok()
+}
+
+fn session_uses_usb(devices: &[BoundDevice]) -> Result<bool, EngineError> {
+    let usb = devices.iter().filter(|device| device.kind == "usb").count();
+    let demo = devices.iter().filter(|device| device.kind == "demo").count();
+    if usb == 0 && demo == devices.len() && !devices.is_empty() {
+        return Ok(false);
+    }
+    if usb == 1 && devices.len() == 1 {
+        return Ok(true);
+    }
+    if usb > 1 {
+        return Err(EngineError::Device(
+            "arming more than one USB pod in one capture is not verified on hardware".into(),
+        ));
+    }
+    Err(EngineError::Device(
+        "this session cannot be armed from its current devices".into(),
+    ))
+}
+
+fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> {
+    let mut devices = Vec::new();
+    let mut names = Vec::new();
+    let mut colors = Vec::new();
+    let mut origins = Vec::new();
+    for id in ids {
+        let pod = demo_pod(id).ok_or_else(|| {
+            EngineError::UnknownDevice(format!("unknown demo device {id}"))
+        })?;
+        devices.push(BoundDevice {
+            id: pod.id.to_string(),
+            name: pod.name.to_string(),
+            kind: "demo".into(),
+        });
+        for channel in pod.channels {
+            names.push(channel.name.to_string());
+            colors.push(channel.color.to_string());
+            origins.push(ChannelOrigin {
+                device_id: pod.id.to_string(),
+                device_name: pod.name.to_string(),
+            });
+        }
+    }
+    if names.is_empty() {
+        return Err(EngineError::Device("a session needs at least one channel".into()));
+    }
+    slot.devices = devices;
+    slot.channel_names = names;
+    slot.channel_colors = colors;
+    slot.origins = origins;
+    slot.decoders.clear();
+    slot.annotations.clear();
+    slot.session.store = LogicStore::new(slot.channel_names.len());
+    Ok(())
+}
+
+fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineError> {
+    let mut waves = Vec::new();
+    for device in devices {
+        let pod = demo_pod(&device.id).ok_or_else(|| {
+            EngineError::Device(format!("{} is not a demo source", device.id))
+        })?;
+        for channel in pod.channels {
+            waves.push(channel.level);
+        }
+    }
+    if waves.is_empty() {
+        return Err(EngineError::Device("session has no demo channels".into()));
+    }
+    Ok(waves)
 }
 
 fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {
