@@ -36,8 +36,8 @@ async fn main() {
     });
     println!("LogicView UI at http://{addr}");
     println!(
-        "MCP attach socket {} (logicview mcp)",
-        logicview_mcp::default_socket_path().display()
+        "MCP attach {} (logicview mcp)",
+        logicview_mcp::attach_location()
     );
     if let Err(err) = serve(engine, addr).await {
         eprintln!("logicview: {err}");
