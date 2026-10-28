@@ -17,6 +17,19 @@ cargo run -p logicview-app
 cargo run -p logicview-app -- mcp
 ```
 
+On Windows, from this directory:
+
+```
+scripts\package-release.cmd
+scripts\run-debug.cmd
+```
+
+`package-release.cmd` runs `cargo build --release -p logicview-app` and writes
+`dist\logicview-<version>-windows.zip`. The archive holds a
+`logicview-<version>` folder with `logicview.exe` and the files from
+`crates\logicview-ui\assets`. `run-debug.cmd` starts the same app with
+`cargo run` (debug build).
+
 The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`) and listens
 for an MCP client on `/tmp/logicview.sock` (override with `LOGICVIEW_SOCKET`).
 `logicview mcp` attaches to that socket when the UI is already running, and
