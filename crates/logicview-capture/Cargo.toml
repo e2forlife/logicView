@@ -1,0 +1,15 @@
+[package]
+name = "logicview-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Demo source, session state machine, and logic mipmaps"
+
+[dependencies]
+logicview-proto = { path = "../logicview-proto" }
+logicview-analysis = { path = "../logicview-analysis" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

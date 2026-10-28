@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LogicView</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <button id="device-chip" class="chip" type="button" title="Device">
+        <span class="dot"></span>
+        <span>Demo</span>
+      </button>
+      <div class="modes" role="tablist" aria-label="Instrument">
+        <button type="button" class="mode active" data-mode="logic">Logic</button>
+        <button type="button" class="mode" data-mode="scope" disabled title="Oscilloscope is a later phase">Scope</button>
+        <button type="button" class="mode" data-mode="data" disabled title="Data acquisition is a later phase">Data</button>
+      </div>
+      <div id="summary" class="summary">Demo</div>
+      <div class="tab-row">
+        <div id="tabs" class="tabs"></div>
+        <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
+      </div>
+      <button id="instant" class="ghost" type="button" title="Instant (I)">Instant</button>
+      <button id="start" class="start" type="button" title="Start or stop (Space)">Start</button>
+    </header>
+    <div class="workspace">
+      <div class="wave-wrap">
+        <div class="wave-main">
+          <div class="gutter-col">
+            <div class="gutter-spacer"></div>
+            <div id="gutter"></div>
+          </div>
+          <div class="canvas-col">
+            <canvas id="ruler"></canvas>
+            <canvas id="wave"></canvas>
+          </div>
+        </div>
+        <canvas id="overview"></canvas>
+        <div id="status" class="status">idle</div>
+      </div>
+      <aside class="rail" id="rail">
+        <button type="button" data-drawer="device" title="Device (O)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2"></circle></svg>
+        </button>
+        <button type="button" data-drawer="capture" title="Capture">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h10M5 17h12"></path></svg>
+        </button>
+        <button type="button" data-drawer="trigger" title="Trigger (T)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8-7 8-7-8z"></path></svg>
+        </button>
+        <button type="button" data-drawer="analyzers" title="Analyzers (D)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16l4-8 4 6 3-4 5 6"></path></svg>
+        </button>
+        <button type="button" data-drawer="measure" title="Measure (M)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18V6M4 18h16M8 18v-3M12 18v-6M16 18v-4"></path></svg>
+        </button>
+      </aside>
+      <div id="drawer" class="drawer hidden"></div>
+    </div>
+    <div id="hover" class="hover hidden"></div>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

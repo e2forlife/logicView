@@ -1,2 +1,5 @@
 /target
 /DSView-master
+**/*.fw
+**/*.bit
+**/*.bitstream

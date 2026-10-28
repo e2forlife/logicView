@@ -1,6 +1,31 @@
-[package]
-name = "logicView"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "crates/logicview-proto",
+    "crates/logicview-analysis",
+    "crates/logicview-capture",
+    "crates/logicview-store",
+    "crates/logicview-engine",
+    "crates/logicview-ui",
+    "crates/logicview-app",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tracing = "0.1"
+axum = { version = "0.7.9", features = ["macros", "ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+zip = { version = "2", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
