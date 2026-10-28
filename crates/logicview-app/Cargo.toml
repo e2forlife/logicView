@@ -1,0 +1,21 @@
+[package]
+name = "logicview-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "LogicView demo application"
+
+[[bin]]
+name = "logicview"
+path = "src/main.rs"
+
+[dependencies]
+logicview-engine = { path = "../logicview-engine" }
+logicview-ui = { path = "../logicview-ui" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "logicview-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-process capture engine shared by the UI"
+
+[dependencies]
+logicview-analysis = { path = "../logicview-analysis" }
+logicview-capture = { path = "../logicview-capture" }
+logicview-proto = { path = "../logicview-proto" }
+logicview-store = { path = "../logicview-store" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

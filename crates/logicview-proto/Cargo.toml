@@ -1,0 +1,13 @@
+[package]
+name = "logicview-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Clean-room capture contract: arm records, headers, sample unpacking"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
