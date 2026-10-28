@@ -26,6 +26,7 @@ const state = {
   req: 0,
   hoverText: "",
   hoverX: null,
+  lastMeasure: null,
   drawer: null,
   cursors: [null, null],
   devices: [],
@@ -166,8 +167,8 @@ function paintStatus() {
   startBtn.textContent = live ? "Stop" : "Start";
   startBtn.classList.toggle("running", live);
   const rate = formatHz(state.rate);
-  const seconds = (state.durationMs / 1000).toFixed(1);
-  summaryEl.textContent = `${settings.deviceName} · ${state.channels.length} ch · ${rate} · ${seconds} s`;
+  const span = state.durationMs < 1000 ? `${state.durationMs} ms` : `${(state.durationMs / 1000).toFixed(1)} s`;
+  summaryEl.textContent = `${settings.deviceName} · ${state.channels.length} ch · ${rate} · ${span}`;
   const chip = document.querySelector("#device-chip span:last-child");
   if (chip) chip.textContent = settings.deviceName;
   const count = state.total.toLocaleString();
@@ -1192,12 +1193,17 @@ async function dropCursor(which) {
 }
 
 async function keepMeasurement() {
+  const kept = state.lastMeasure;
+  if (!kept) {
+    statusEl.textContent = "hover a logic trace first";
+    return;
+  }
   try {
     await api({
       cmd: "save_measurement",
       session: state.active,
-      channel: 0,
-      sample: hoverSample(),
+      channel: kept.channel,
+      sample: kept.sample,
     });
     refreshMeasurements();
   } catch (err) {
@@ -1392,6 +1398,7 @@ async function runHover(ev) {
     const period = metrics.period_secs == null ? "—" : formatSeconds(metrics.period_secs);
     const freq = formatHz(metrics.frequency_hz);
     const duty = metrics.duty == null ? "—" : `${(metrics.duty * 100).toFixed(1)}%`;
+    state.lastMeasure = { channel: row.channel, sample };
     const line = `${row.name} ${level} · width ${width} · period ${period} · ${freq} · duty ${duty}`;
     const html = `<b style="color:${row.color}">${row.name}</b> <span class="muted">${level}</span><br>Width ${width}<br>Period ${period}<br>${freq} · duty ${duty}`;
     showHover(ev, line, html);
