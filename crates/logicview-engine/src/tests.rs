@@ -17,6 +17,7 @@ async fn five_second_demo_edge_survives_save_and_load() {
                 realtime: false,
                 trigger_enabled: false,
                 trigger_percent: 10.0,
+                ..SessionConfig::default()
             },
         )
         .await
@@ -68,6 +69,7 @@ async fn instant_clears_the_trigger_enable_bit() {
                 realtime: false,
                 trigger_enabled: true,
                 trigger_percent: 20.0,
+                ..SessionConfig::default()
             },
         )
         .await
@@ -90,6 +92,7 @@ async fn instant_clears_the_trigger_enable_bit() {
                 realtime: false,
                 trigger_enabled: true,
                 trigger_percent: 20.0,
+                ..SessionConfig::default()
             },
         )
         .await
@@ -105,6 +108,43 @@ async fn instant_clears_the_trigger_enable_bit() {
     assert_eq!(armed.stages[0].mask, 1);
     assert_eq!(armed.stages[0].edge, 1);
     assert!(armed.trigger_position >= 64);
+}
+
+#[tokio::test]
+async fn pattern_cursors_and_dsl_round_trip_on_the_demo() {
+    let engine = Engine::new();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let edge = engine
+        .search_pattern(None, 0, 0, &[Some(true), Some(false)], true)
+        .await
+        .unwrap();
+    assert_eq!(edge, Some(99));
+    engine.set_cursor(None, 0, Some(50)).await.unwrap();
+    engine.set_cursor(None, 1, Some(150)).await.unwrap();
+    let span = engine.cursor_span(None, 0).await.unwrap();
+    assert_eq!(span.samples, 100);
+    let saved = engine.save_measurement(None, 0, 75).await.unwrap();
+    assert_eq!(saved.pulse_width_samples, 50);
+    assert_eq!(engine.measurements(None).await.unwrap().len(), 1);
+    let dsl = engine.export_dsl(None).await.unwrap();
+    assert_eq!(&dsl[..2], b"PK");
+    let channel = logicview_store::read_dsl_channel(&dsl, 0).unwrap();
+    assert!(!channel.is_empty());
 }
 
 #[tokio::test]

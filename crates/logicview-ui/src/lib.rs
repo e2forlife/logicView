@@ -16,7 +16,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use logicview_capture::SessionConfig;
+use logicview_capture::{DepthMode, RunPolicy, SessionConfig, TriggerKind};
 use logicview_engine::{
     AnalogColumn, Column, Engine, EngineError, EngineEvent, PulseMetrics, StartMode,
 };
@@ -54,6 +54,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/command", post(command))
         .route("/api/events", get(events))
         .route("/api/export/lvcap", get(export_lvcap))
+        .route("/api/export/dsl", get(export_dsl))
         .route("/ws", get(ws_upgrade))
         .with_state(AppState { engine })
 }
@@ -97,7 +98,7 @@ async fn health() -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "logicview",
-        "phases": ["0", "1", "2"],
+        "phases": ["0", "1", "2", "3", "4"],
         "device": "demo"
     }))
 }
@@ -145,6 +146,21 @@ async fn export_lvcap(State(app): State<AppState>) -> Result<Response, ApiError>
             (
                 header::CONTENT_DISPOSITION,
                 "attachment; filename=\"capture.lvcap\"",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn export_dsl(State(app): State<AppState>) -> Result<Response, ApiError> {
+    let bytes = app.engine.export_dsl(None).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"capture.dsl\"",
             ),
         ],
         bytes,
@@ -248,6 +264,7 @@ async fn reply_socket(
 async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
     match cmd {
         Command::ListDevices => Ok(json!(engine.list_devices().await)),
+        Command::Connect { id } => Ok(json!(engine.connect(&id).await?)),
         Command::ListSessions => {
             let (sessions, active) = engine.list_sessions().await;
             Ok(json!({"sessions": sessions, "active": active}))
@@ -264,6 +281,18 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             realtime,
             trigger_enabled,
             trigger_percent,
+            depth,
+            run,
+            repeat_interval_ms,
+            rle,
+            threshold_volts,
+            one_sample_filter,
+            external_clock,
+            clock_falling,
+            discard_on_stop,
+            channel_enable,
+            trigger_channel,
+            trigger_kind,
         } => {
             engine
                 .configure(
@@ -274,6 +303,31 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                         realtime,
                         trigger_enabled,
                         trigger_percent,
+                        depth: if depth == "stream" {
+                            DepthMode::Stream
+                        } else {
+                            DepthMode::Buffer
+                        },
+                        run: match run.as_str() {
+                            "repeat" => RunPolicy::Repeat,
+                            "loop" => RunPolicy::Loop,
+                            _ => RunPolicy::Single,
+                        },
+                        repeat_interval_ms,
+                        rle,
+                        threshold_volts,
+                        one_sample_filter,
+                        external_clock,
+                        clock_falling,
+                        discard_on_stop,
+                        channel_enable,
+                        trigger_channel,
+                        trigger_kind: match trigger_kind.as_str() {
+                            "falling" => TriggerKind::Falling,
+                            "high" => TriggerKind::High,
+                            "low" => TriggerKind::Low,
+                            _ => TriggerKind::Rising,
+                        },
                     },
                 )
                 .await?;
@@ -307,6 +361,47 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                 .search_edge(session.as_deref(), channel, from, rising)
                 .await?;
             Ok(json!({"sample": edge}))
+        }
+        Command::SearchPattern {
+            session,
+            channel,
+            from,
+            pattern,
+            forward,
+        } => {
+            let bits = parse_pattern(&pattern);
+            let sample = engine
+                .search_pattern(session.as_deref(), channel, from, &bits, forward)
+                .await?;
+            Ok(json!({"sample": sample}))
+        }
+        Command::SetCursor {
+            session,
+            which,
+            sample,
+        } => {
+            let cursors = engine.set_cursor(session.as_deref(), which, sample).await?;
+            Ok(json!({"a": cursors[0], "b": cursors[1]}))
+        }
+        Command::CursorSpan { session, channel } => {
+            let span = engine.cursor_span(session.as_deref(), channel).await?;
+            Ok(json!({
+                "samples": span.samples,
+                "seconds": span.seconds,
+                "edges": span.edges,
+            }))
+        }
+        Command::SaveMeasurement {
+            session,
+            channel,
+            sample,
+        } => Ok(json!(
+            engine
+                .save_measurement(session.as_deref(), channel, sample)
+                .await?
+        )),
+        Command::ListMeasurements { session } => {
+            Ok(json!(engine.measurements(session.as_deref()).await?))
         }
         Command::Tile {
             session,
@@ -523,6 +618,7 @@ impl IntoResponse for ApiError {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Command {
     ListDevices,
+    Connect { id: String },
     ListSessions,
     CreateSession {
         name: Option<String>,
@@ -540,6 +636,55 @@ enum Command {
         trigger_enabled: bool,
         #[serde(default = "default_percent")]
         trigger_percent: f64,
+        #[serde(default)]
+        depth: String,
+        #[serde(default)]
+        run: String,
+        #[serde(default)]
+        repeat_interval_ms: u64,
+        #[serde(default)]
+        rle: bool,
+        #[serde(default = "default_threshold")]
+        threshold_volts: f64,
+        #[serde(default)]
+        one_sample_filter: bool,
+        #[serde(default)]
+        external_clock: bool,
+        #[serde(default)]
+        clock_falling: bool,
+        #[serde(default)]
+        discard_on_stop: bool,
+        #[serde(default)]
+        channel_enable: u32,
+        #[serde(default)]
+        trigger_channel: u8,
+        #[serde(default)]
+        trigger_kind: String,
+    },
+    SearchPattern {
+        session: Option<String>,
+        channel: usize,
+        from: u64,
+        pattern: String,
+        #[serde(default = "default_true")]
+        forward: bool,
+    },
+    SetCursor {
+        session: Option<String>,
+        which: usize,
+        sample: Option<u64>,
+    },
+    CursorSpan {
+        session: Option<String>,
+        channel: usize,
+    },
+    SaveMeasurement {
+        session: Option<String>,
+        channel: usize,
+        sample: u64,
+    },
+    ListMeasurements {
+        session: Option<String>,
     },
     Start {
         session: Option<String>,
@@ -581,8 +726,23 @@ fn default_percent() -> f64 {
     10.0
 }
 
+fn default_threshold() -> f64 {
+    1.6
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn parse_pattern(text: &str) -> Vec<Option<bool>> {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .map(|ch| match ch {
+            '1' | 'H' | 'h' => Some(true),
+            '0' | 'L' | 'l' => Some(false),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

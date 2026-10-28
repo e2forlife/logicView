@@ -27,6 +27,7 @@ const state = {
   hoverText: "",
   hoverX: null,
   drawer: null,
+  cursors: [null, null],
 };
 
 const settings = {
@@ -34,6 +35,19 @@ const settings = {
   duration: 2000,
   trigger: false,
   percent: 10,
+  depth: "buffer",
+  run: "single",
+  repeatMs: 500,
+  rle: false,
+  threshold: 1.6,
+  filter: false,
+  extClock: false,
+  clockFalling: false,
+  discard: false,
+  triggerKind: "rising",
+  pattern: "10",
+  device: "demo",
+  deviceName: "Demo",
 };
 
 const views = {};
@@ -143,7 +157,9 @@ function paintStatus() {
   startBtn.classList.toggle("running", live);
   const rate = formatHz(state.rate);
   const seconds = (state.durationMs / 1000).toFixed(1);
-  summaryEl.textContent = `${state.channels.length} ch · ${rate} · ${seconds} s`;
+  summaryEl.textContent = `${settings.deviceName} · ${state.channels.length} ch · ${rate} · ${seconds} s`;
+  const chip = document.querySelector("#device-chip span:last-child");
+  if (chip) chip.textContent = settings.deviceName;
   const count = state.total.toLocaleString();
   statusEl.textContent = state.hoverText
     ? `${state.phase} · ${count} samples · ${state.hoverText}`
@@ -255,6 +271,11 @@ function drawRuler() {
   if (state.triggerSample != null) {
     const x = (state.triggerSample - v.start) / v.spp;
     if (x >= -8 && x <= w + 8) drawDiamond(ctx, x, h / 2, "#f0c14d");
+  }
+  for (const [index, sample] of state.cursors.entries()) {
+    if (sample == null) continue;
+    const x = (sample - v.start) / v.spp;
+    if (x >= -8 && x <= w + 8) drawDiamond(ctx, x, h / 2, index === 0 ? "#5aa2ff" : "#ff8a5b");
   }
 }
 
@@ -605,6 +626,16 @@ async function toggleRun(instant) {
         realtime: true,
         trigger_enabled: settings.trigger,
         trigger_percent: settings.percent,
+        depth: settings.depth,
+        run: settings.run,
+        repeat_interval_ms: settings.repeatMs,
+        rle: settings.rle,
+        threshold_volts: settings.threshold,
+        one_sample_filter: settings.filter,
+        external_clock: settings.extClock,
+        clock_falling: settings.clockFalling,
+        discard_on_stop: settings.discard,
+        trigger_kind: settings.triggerKind,
       });
       applyStatus(status, false);
       const started = await api({ cmd: "start", session: state.active, instant: !!instant });
@@ -636,9 +667,10 @@ function openDrawer(name) {
 function drawerHtml(name) {
   if (name === "device") {
     return `<h2>Device</h2>
-      <p>Demo source. This build does not open a USB pod, upload firmware, or program an FPGA.</p>
-      <p>Channels are a clock, a UART-shaped line, an I2C-shaped pair, and a noisy 1 kHz sine.</p>
-      <button class="block" id="download" type="button">Download .lvcap</button>`;
+      <div id="device-list"><p>Looking for the pod…</p></div>
+      <p class="hint">DSLogic Plus firmware and the FPGA image stay outside this repo. Set LOGICVIEW_FIRMWARE_DIR if the pod still needs DSLogicPlus.bin.</p>
+      <button class="block" id="download" type="button">Download .lvcap</button>
+      <button class="block" id="download-dsl" type="button">Download .dsl</button>`;
   }
   if (name === "capture") {
     return `<h2>Capture</h2>
@@ -646,21 +678,56 @@ function drawerHtml(name) {
         <select id="set-rate">
           <option value="100000">100 kHz</option>
           <option value="1000000">1 MHz</option>
-          <option value="2000000">2 MHz</option>
+          <option value="20000000">20 MHz</option>
+          <option value="100000000">100 MHz</option>
         </select>
       </label>
       <label>Duration
         <select id="set-duration">
+          <option value="10">10 ms</option>
+          <option value="100">100 ms</option>
           <option value="1000">1.0 s</option>
           <option value="2000">2.0 s</option>
           <option value="5000">5.0 s</option>
         </select>
       </label>
-      <p class="hint">Space starts and stops. Drag pans. The wheel zooms about the cursor. Page Up and Page Down pan.</p>`;
+      <label>Depth
+        <select id="set-depth">
+          <option value="buffer">Buffer</option>
+          <option value="stream">Stream</option>
+        </select>
+      </label>
+      <label>Run
+        <select id="set-run">
+          <option value="single">Single</option>
+          <option value="repeat">Repeat</option>
+          <option value="loop">Loop</option>
+        </select>
+      </label>
+      <label>Repeat interval (ms)
+        <input id="set-repeat" type="number" min="0" step="100">
+      </label>
+      <label>Threshold (V)
+        <input id="set-threshold" type="number" min="0" max="5" step="0.1">
+      </label>
+      <label class="check"><input id="set-rle" type="checkbox"> RLE</label>
+      <label class="check"><input id="set-filter" type="checkbox"> One-sample filter</label>
+      <label class="check"><input id="set-ext" type="checkbox"> External clock</label>
+      <label class="check"><input id="set-fall" type="checkbox"> Clock falling edge</label>
+      <label class="check"><input id="set-discard" type="checkbox"> Discard on stop</label>
+      <p class="hint">Stop uploads the record unless discard is set. A short RLE capture is reported on the status line.</p>`;
   }
   if (name === "trigger") {
     return `<h2>Trigger</h2>
-      <label class="check"><input id="set-trigger" type="checkbox"> Arm on CLK rising</label>
+      <label class="check"><input id="set-trigger" type="checkbox"> Enable simple trigger</label>
+      <label>Kind
+        <select id="set-kind">
+          <option value="rising">Rising</option>
+          <option value="falling">Falling</option>
+          <option value="high">High</option>
+          <option value="low">Low</option>
+        </select>
+      </label>
       <label>Position
         <input id="set-percent" type="number" min="0" max="90" step="1">
       </label>
@@ -672,33 +739,183 @@ function drawerHtml(name) {
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace for width, period, frequency, and duty."}</p>
-    <p class="hint">The readout follows the cursor. It is the pulse under the pointer, not a stored marker.</p>`;
+    <label>Pattern (0, 1, x)
+      <input id="set-pattern" type="text" value="${settings.pattern}">
+    </label>
+    <button class="block" id="pat-next" type="button">Next match</button>
+    <button class="block" id="pat-prev" type="button">Previous match</button>
+    <button class="block" id="cur-a" type="button">Cursor A at hover</button>
+    <button class="block" id="cur-b" type="button">Cursor B at hover</button>
+    <p id="cursor-readout">Cursors are not set.</p>
+    <button class="block" id="keep-measure" type="button">Keep this measurement</button>
+    <div id="saved-measures"></div>`;
 }
 
 function bindDrawer(name) {
   if (name === "device") {
-    document.getElementById("download").addEventListener("click", downloadCapture);
+    document.getElementById("download").addEventListener("click", () => downloadCapture("/api/export/lvcap", "capture.lvcap"));
+    document.getElementById("download-dsl").addEventListener("click", () => downloadCapture("/api/export/dsl", "capture.dsl"));
+    loadDevices();
   }
   if (name === "capture") {
-    const rate = document.getElementById("set-rate");
-    const duration = document.getElementById("set-duration");
-    rate.value = String(settings.rate);
-    duration.value = String(settings.duration);
-    rate.addEventListener("change", () => { settings.rate = Number(rate.value); });
-    duration.addEventListener("change", () => { settings.duration = Number(duration.value); });
+    bindSelect("set-rate", "rate", true);
+    bindSelect("set-duration", "duration", true);
+    bindSelect("set-depth", "depth", false);
+    bindSelect("set-run", "run", false);
+    const repeat = document.getElementById("set-repeat");
+    const threshold = document.getElementById("set-threshold");
+    repeat.value = String(settings.repeatMs);
+    threshold.value = String(settings.threshold);
+    repeat.addEventListener("change", () => { settings.repeatMs = Number(repeat.value); });
+    threshold.addEventListener("change", () => { settings.threshold = Number(threshold.value); });
+    bindCheck("set-rle", "rle");
+    bindCheck("set-filter", "filter");
+    bindCheck("set-ext", "extClock");
+    bindCheck("set-fall", "clockFalling");
+    bindCheck("set-discard", "discard");
   }
   if (name === "trigger") {
     const box = document.getElementById("set-trigger");
     const percent = document.getElementById("set-percent");
+    const kind = document.getElementById("set-kind");
     box.checked = settings.trigger;
     percent.value = String(settings.percent);
+    kind.value = settings.triggerKind;
     box.addEventListener("change", () => { settings.trigger = box.checked; });
     percent.addEventListener("change", () => { settings.percent = Number(percent.value); });
+    kind.addEventListener("change", () => { settings.triggerKind = kind.value; });
+  }
+  if (name === "measure") {
+    document.getElementById("pat-next").addEventListener("click", () => searchPattern(true));
+    document.getElementById("pat-prev").addEventListener("click", () => searchPattern(false));
+    document.getElementById("cur-a").addEventListener("click", () => dropCursor(0));
+    document.getElementById("cur-b").addEventListener("click", () => dropCursor(1));
+    document.getElementById("keep-measure").addEventListener("click", keepMeasurement);
+    refreshMeasurements();
   }
 }
 
-async function downloadCapture() {
-  const res = await fetch("/api/export/lvcap");
+function bindSelect(id, key, numeric) {
+  const el = document.getElementById(id);
+  el.value = String(settings[key]);
+  el.addEventListener("change", () => {
+    settings[key] = numeric ? Number(el.value) : el.value;
+  });
+}
+
+function bindCheck(id, key) {
+  const el = document.getElementById(id);
+  el.checked = !!settings[key];
+  el.addEventListener("change", () => { settings[key] = el.checked; });
+}
+
+async function loadDevices() {
+  const list = document.getElementById("device-list");
+  if (!list) return;
+  try {
+    const devices = await api({ cmd: "list_devices" });
+    list.replaceChildren();
+    for (const device of devices) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "block";
+      button.textContent = device.name;
+      button.addEventListener("click", async () => {
+        try {
+          const connected = await api({ cmd: "connect", id: device.id });
+          settings.device = connected.id;
+          settings.deviceName = connected.name;
+          const status = await api({ cmd: "status", session: state.active });
+          applyStatus(status, false);
+        } catch (err) {
+          statusEl.textContent = err.message;
+        }
+      });
+      list.appendChild(button);
+    }
+  } catch (err) {
+    list.textContent = err.message;
+  }
+}
+
+function hoverSample() {
+  if (state.hoverX == null || state.total <= 0) return 0;
+  return Math.min(state.total - 1, Math.max(0, Math.floor(view().start + state.hoverX * view().spp)));
+}
+
+async function searchPattern(forward) {
+  const field = document.getElementById("set-pattern");
+  settings.pattern = field.value;
+  const from = hoverSample();
+  try {
+    const data = await api({
+      cmd: "search_pattern",
+      session: state.active,
+      channel: 0,
+      from,
+      pattern: settings.pattern,
+      forward,
+    });
+    if (data.sample == null) {
+      statusEl.textContent = "no match";
+      return;
+    }
+    const v = view();
+    v.start = Math.max(0, data.sample - wave.clientWidth * v.spp * 0.25);
+    v.userNavigated = true;
+    clampView();
+    scheduleTiles();
+    statusEl.textContent = `match at ${data.sample}`;
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function dropCursor(which) {
+  const sample = hoverSample();
+  try {
+    const data = await api({ cmd: "set_cursor", session: state.active, which, sample });
+    state.cursors = [data.a, data.b];
+    drawRuler();
+    const span = await api({ cmd: "cursor_span", session: state.active, channel: 0 });
+    const readout = document.getElementById("cursor-readout");
+    if (readout) {
+      readout.textContent = `A ${data.a} · B ${data.b} · ${span.samples} samples · ${span.edges} edges`;
+    }
+  } catch (err) {
+    const readout = document.getElementById("cursor-readout");
+    if (readout) readout.textContent = err.message;
+  }
+}
+
+async function keepMeasurement() {
+  try {
+    await api({
+      cmd: "save_measurement",
+      session: state.active,
+      channel: 0,
+      sample: hoverSample(),
+    });
+    refreshMeasurements();
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function refreshMeasurements() {
+  const host = document.getElementById("saved-measures");
+  if (!host) return;
+  const rows = await api({ cmd: "list_measurements", session: state.active });
+  host.replaceChildren();
+  for (const row of rows) {
+    const p = document.createElement("p");
+    p.textContent = `#${row.id} ch${row.channel} @ ${row.sample}: width ${row.pulse_width_samples}`;
+    host.appendChild(p);
+  }
+}
+
+async function downloadCapture(path, filename) {
+  const res = await fetch(path);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     statusEl.textContent = body.error || "export failed";
@@ -707,7 +924,7 @@ async function downloadCapture() {
   const blob = await res.blob();
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
-  link.download = "capture.lvcap";
+  link.download = filename;
   link.click();
   URL.revokeObjectURL(link.href);
 }

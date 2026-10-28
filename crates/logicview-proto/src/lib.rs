@@ -19,7 +19,7 @@ pub use envelope::{decode_envelope_header, encode_envelope_header};
 pub use error::ProtoError;
 pub use header::{
     actual_payload_bytes, actual_sample_count, encode_logic_header, parse_logic_header,
-    LogicHeader, LOGIC_CHECK_WORD, LOGIC_HEADER_LEN,
+    LogicHeader, LOGIC_CHECK_WORD, LOGIC_HEADER_LEN, LOGIC_HEADER_TRANSFER,
 };
 pub use mode::{logic_divider, DepthMode, ModeFlags};
 pub use samples::{
@@ -29,10 +29,18 @@ pub use samples::{
 
 /// Right-shift applied when a sample count is packed into an arm record.
 ///
-/// The written host behavior shifts the sample count right by 4 before packing
-/// it. A separate note calls 64 samples the hardware minimum unit, which would
-/// be a shift of 6. Those disagree. This constant locks the written shift of 4.
-/// A later hardware phase must replace it with a value measured on a pod.
+/// Measured on a high-speed DSLogic Plus, vendor `0x2A0E` product `0x0020`,
+/// one channel enabled, instant captures, 2026-10-28. The pod wrote that many
+/// bytes and then left the previous buffer contents in place:
+///
+/// | packed count | bytes kept | samples (`bytes * 8`) |
+/// | --- | --- | --- |
+/// | `0x10` | 32 | 256 |
+/// | `0x40` | 128 | 1024 |
+/// | `0x80` | 256 | 2048 |
+///
+/// `samples == packed << 4`, so the shift is 4. A shift of 6 would have kept
+/// four times as many bytes.
 pub const CAPTURE_COUNT_SHIFT: u32 = 4;
 
 /// Trigger positions are aligned down to this many samples.
@@ -110,12 +118,16 @@ mod tests {
     }
 
     #[test]
-    fn capture_count_shift_is_four() {
+    fn capture_count_shift_matches_the_plus_capture() {
         assert_eq!(CAPTURE_COUNT_SHIFT, 4);
         assert_eq!(pack_capture_count(4096), 256);
         assert_eq!(unpack_capture_count(256), 4096);
         // The shift discards bits below the quantum. 4097 cannot round-trip.
         assert_eq!(unpack_capture_count(pack_capture_count(4097)), 4096);
+        // One enabled channel: payload bytes = samples / 8.
+        assert_eq!(unpack_capture_count(0x10) / 8, 32);
+        assert_eq!(unpack_capture_count(0x40) / 8, 128);
+        assert_eq!(unpack_capture_count(0x80) / 8, 256);
     }
 
     #[test]

@@ -201,6 +201,42 @@ fn check_version(manifest: &Manifest) -> Result<(), StoreError> {
     }
 }
 
+/// Pieces of a version-3 `.dsl` zip: header text, session JSON, and one
+/// bit-packed block per logic channel.
+pub struct DslParts {
+    pub header: String,
+    pub session_json: String,
+    pub channels: Vec<Vec<u8>>,
+}
+
+pub fn write_dsl_bytes(parts: &DslParts) -> Result<Vec<u8>, StoreError> {
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(cursor);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    zip.start_file("header", opts)?;
+    zip.write_all(parts.header.as_bytes())?;
+    zip.start_file("decoders", opts)?;
+    zip.write_all(br#"{"version":2,"decoders":[]}"#)?;
+    zip.start_file("session", opts)?;
+    zip.write_all(parts.session_json.as_bytes())?;
+    for (index, bytes) in parts.channels.iter().enumerate() {
+        zip.start_file(format!("L-{index}/0"), opts)?;
+        zip.write_all(bytes)?;
+    }
+    let cursor = zip.finish()?;
+    Ok(cursor.into_inner())
+}
+
+pub fn read_dsl_channel(bytes: &[u8], channel: usize) -> Result<Vec<u8>, StoreError> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec()))?;
+    let mut file = archive
+        .by_name(&format!("L-{channel}/0"))
+        .map_err(|_| StoreError::MissingChannel(channel as u32))?;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 fn f32_bytes(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 4);
     for sample in samples {
@@ -270,5 +306,25 @@ mod tests {
         assert_eq!(from_zip.manifest.sample_count, 64);
         assert_eq!(from_zip.logic, data.logic);
         assert_eq!(from_zip.analog, data.analog);
+    }
+
+    #[test]
+    fn dsl_zip_keeps_the_header_and_channel_block() {
+        let bytes = write_dsl_bytes(&DslParts {
+            header: "[header]\nversion=3\n".into(),
+            session_json: "{\"depth\":\"buffer\"}".into(),
+            channels: vec![vec![0xAA, 0x55]],
+        })
+        .unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        let mut archive = ZipArchive::new(Cursor::new(bytes.clone())).unwrap();
+        let mut header = String::new();
+        archive
+            .by_name("header")
+            .unwrap()
+            .read_to_string(&mut header)
+            .unwrap();
+        assert!(header.contains("version=3"));
+        assert_eq!(read_dsl_channel(&bytes, 0).unwrap(), vec![0xAA, 0x55]);
     }
 }

@@ -252,6 +252,23 @@ impl LogicStore {
         self.channels.iter().map(|ch| ch.bytes.clone()).collect()
     }
 
+    /// Drop samples from the front so at most `samples` remain.
+    pub fn retain_tail(&mut self, samples: u64) {
+        let keep = samples & !7;
+        let len = self.len();
+        if keep >= len {
+            return;
+        }
+        let drop_bytes = ((len - keep) / 8) as usize;
+        for channel in &mut self.channels {
+            if channel.bytes.len() >= drop_bytes {
+                channel.bytes.drain(..drop_bytes);
+            }
+            channel.len = keep.min(channel.len);
+            channel.rebuild();
+        }
+    }
+
     pub fn tile(
         &self,
         channel: usize,
