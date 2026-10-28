@@ -117,6 +117,45 @@ pub fn measure_pulse(bytes: &[u8], len: u64, sample: u64, rate_hz: u64) -> Optio
     })
 }
 
+/// Sample where the last edge in `steps` occurs.
+///
+/// Each step is `(channel, rising)`. The next edge must be strictly after the
+/// previous one. An empty list, or a step that never happens, returns none.
+pub fn find_edge_sequence(
+    len: u64,
+    steps: &[(usize, bool)],
+    mut level: impl FnMut(usize, u64) -> bool,
+) -> Option<u64> {
+    if steps.is_empty() || len == 0 {
+        return None;
+    }
+    let mut from = 0u64;
+    let mut hit = None;
+    for &(channel, rising) in steps {
+        let edge = next_level_edge(len, from, rising, |sample| level(channel, sample))?;
+        from = edge;
+        hit = Some(edge);
+    }
+    hit
+}
+
+fn next_level_edge(len: u64, from: u64, rising: bool, mut level: impl FnMut(u64) -> bool) -> Option<u64> {
+    if from >= len {
+        return None;
+    }
+    let mut prev = level(from);
+    let mut sample = from + 1;
+    while sample < len {
+        let now = level(sample);
+        if now != prev && now == rising {
+            return Some(sample);
+        }
+        prev = now;
+        sample += 1;
+    }
+    None
+}
+
 /// Next or previous place where `pattern` matches.
 ///
 /// `None` in the pattern ignores that sample. Search starts strictly after
@@ -218,6 +257,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn sequence_fires_on_the_later_edge() {
+        let ch0 = [0xF0];
+        let ch1 = [0xCC];
+        let level = |channel: usize, sample: u64| {
+            bit_at(if channel == 0 { &ch0 } else { &ch1 }, sample)
+        };
+        assert_eq!(find_edge_sequence(8, &[(0, true), (1, true)], level), Some(6));
+        assert_eq!(find_edge_sequence(8, &[(1, true), (0, true)], level), Some(4));
+        assert_eq!(find_edge_sequence(8, &[(0, true), (0, true)], level), None);
+        assert_eq!(find_edge_sequence(8, &[], level), None);
     }
 
     #[test]

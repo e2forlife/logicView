@@ -57,6 +57,7 @@ pub(crate) async fn drive(
                 },
                 Feed::End => {
                     state.slots[index].session.finish();
+                    super::decode_cmd::rerun(&mut state.slots[index]);
                     clear_run(&mut state, &id, generation);
                     stop_after = true;
                 }
@@ -128,6 +129,7 @@ async fn settle(shared: &Shared, id: &str, generation: u64, error: Option<String
             state.slots[index].session.fail(message);
         } else {
             state.slots[index].session.finish();
+            super::decode_cmd::rerun(&mut state.slots[index]);
         }
         clear_run(&mut state, id, generation);
         let phase = state.slots[index].session.phase.as_str().to_string();

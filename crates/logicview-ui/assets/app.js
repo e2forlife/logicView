@@ -28,6 +28,9 @@ const state = {
   hoverX: null,
   drawer: null,
   cursors: [null, null],
+  devices: [],
+  annotations: [],
+  tableTab: "decoded",
 };
 
 const settings = {
@@ -45,6 +48,7 @@ const settings = {
   clockFalling: false,
   discard: false,
   triggerKind: "rising",
+  triggerSteps: [],
   pattern: "10",
   device: "demo",
   deviceName: "Demo",
@@ -98,11 +102,16 @@ function visibleRows() {
 }
 
 function applyStatus(status, fromLive) {
+  const previous = state.phase;
   state.phase = status.phase;
   state.rate = status.sample_rate_hz;
   state.durationMs = status.duration_ms;
   state.channels = status.channels || [];
   state.analog = status.analog || [];
+  if (status.devices) {
+    state.devices = status.devices;
+    settings.deviceName = status.devices.map((device) => device.name).join(" + ") || settings.deviceName;
+  }
   state.triggerSample = status.trigger_sample;
   const grew = status.sample_count !== state.total;
   state.total = status.sample_count;
@@ -114,6 +123,7 @@ function applyStatus(status, fromLive) {
   } else {
     drawOverview();
   }
+  if (status.phase === "stopped" && previous !== "stopped") loadAnnotations();
 }
 
 function fitView() {
@@ -161,9 +171,10 @@ function paintStatus() {
   const chip = document.querySelector("#device-chip span:last-child");
   if (chip) chip.textContent = settings.deviceName;
   const count = state.total.toLocaleString();
+  const trigger = state.triggerSample == null ? "" : ` · trigger @ ${state.triggerSample}`;
   statusEl.textContent = state.hoverText
-    ? `${state.phase} · ${count} samples · ${state.hoverText}`
-    : `${state.phase} · ${count} samples`;
+    ? `${state.phase} · ${count} samples${trigger} · ${state.hoverText}`
+    : `${state.phase} · ${count} samples${trigger}`;
 }
 
 function renderTabs() {
@@ -180,7 +191,7 @@ function renderTabs() {
 
 function renderGutter() {
   const all = allRows();
-  const sig = all.map((row) => row.key + row.color + (state.hidden.has(row.key) ? "0" : "1")).join("|");
+  const sig = all.map((row) => row.key + row.color + (row.device || "") + (state.hidden.has(row.key) ? "0" : "1")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
@@ -199,23 +210,36 @@ function renderGutter() {
     const swatch = document.createElement("span");
     swatch.className = "swatch";
     swatch.style.background = row.color;
+    const label = document.createElement("span");
+    label.className = "ch-label";
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = row.name;
     name.style.color = row.color;
-    el.append(box, swatch, name);
+    label.append(name);
+    if (row.device) {
+      const device = document.createElement("span");
+      device.className = "dev";
+      device.textContent = row.device;
+      label.append(device);
+    }
+    el.append(box, swatch, label);
     if (state.hidden.has(row.key)) el.style.opacity = "0.35";
     gutter.appendChild(el);
-  }
-  if (rows.length === 0 && all.length === 0) {
-    gutter.textContent = "";
   }
 }
 
 function allRows() {
   const rows = [];
   for (const channel of state.channels) {
-    rows.push({ key: "logic:" + channel.index, kind: "logic", channel: channel.index, name: channel.name, color: channel.color });
+    rows.push({
+      key: "logic:" + channel.index,
+      kind: "logic",
+      channel: channel.index,
+      name: channel.name,
+      color: channel.color,
+      device: channel.device_name || "",
+    });
   }
   for (const channel of state.analog) {
     rows.push({ key: "analog:" + channel.index, kind: "analog", channel: channel.index, name: channel.name, color: channel.color });
@@ -320,6 +344,30 @@ function drawWave() {
     ctx.moveTo(state.hoverX + 0.5, 0);
     ctx.lineTo(state.hoverX + 0.5, h);
     ctx.stroke();
+  }
+  drawAnnotations(ctx, w);
+}
+
+function drawAnnotations(ctx, w) {
+  if (!state.annotations.length) return;
+  const v = view();
+  const viewEnd = v.start + w * v.spp;
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  let labels = 0;
+  for (const row of state.annotations) {
+    if (!["address", "data", "word", "read", "write"].includes(row.class)) continue;
+    if (row.end_sample < v.start || row.start_sample > viewEnd) continue;
+    const x = Math.max(0, (row.start_sample - v.start) / v.spp);
+    const width = Math.max(2, (row.end_sample - row.start_sample) / v.spp);
+    ctx.fillStyle = "rgba(76, 141, 255, 0.22)";
+    ctx.fillRect(x, 2, Math.min(width, w - x), 16);
+    if (width > 48 && labels < 24) {
+      ctx.fillStyle = "#d5dbea";
+      ctx.fillText(row.text, x + 3, 3);
+      labels += 1;
+    }
   }
 }
 
@@ -636,6 +684,7 @@ async function toggleRun(instant) {
         clock_falling: settings.clockFalling,
         discard_on_stop: settings.discard,
         trigger_kind: settings.triggerKind,
+        trigger_steps: settings.triggerSteps,
       });
       applyStatus(status, false);
       const started = await api({ cmd: "start", session: state.active, instant: !!instant });
@@ -646,6 +695,16 @@ async function toggleRun(instant) {
   } finally {
     commandBusy = false;
     await refreshSessions();
+  }
+}
+
+function refreshTriggerDrawer() {
+  state.drawer = "trigger";
+  drawerEl.classList.remove("hidden");
+  drawerEl.innerHTML = drawerHtml("trigger");
+  bindDrawer("trigger");
+  for (const button of rail.querySelectorAll("button")) {
+    button.classList.toggle("active", button.dataset.drawer === "trigger");
   }
 }
 
@@ -667,8 +726,8 @@ function openDrawer(name) {
 function drawerHtml(name) {
   if (name === "device") {
     return `<h2>Device</h2>
-      <div id="device-list"><p>Looking for the pod…</p></div>
-      <p class="hint">DSLogic Plus firmware and the FPGA image stay outside this repo. Set LOGICVIEW_FIRMWARE_DIR if the pod still needs DSLogicPlus.bin.</p>
+      <div id="device-list"><p>Looking for pods…</p></div>
+      <p class="hint">Stack Demo and Demo SPI to put both pods on one waveform. Other product ids are listed as untested and are not opened. Firmware stays outside this repo.</p>
       <button class="block" id="download" type="button">Download .lvcap</button>
       <button class="block" id="download-dsl" type="button">Download .dsl</button>`;
   }
@@ -718,24 +777,48 @@ function drawerHtml(name) {
       <p class="hint">Stop uploads the record unless discard is set. A short RLE capture is reported on the status line.</p>`;
   }
   if (name === "trigger") {
+    const steps = settings.triggerSteps
+      .map((step, index) => `<div class="step">
+          <input type="number" min="0" max="31" value="${step.channel}" data-step="${index}" data-field="channel" aria-label="Step ${index + 1} channel">
+          <select data-step="${index}" data-field="edge" aria-label="Step ${index + 1} edge">
+            <option value="rising"${step.rising ? " selected" : ""}>Rising</option>
+            <option value="falling"${step.rising ? "" : " selected"}>Falling</option>
+          </select>
+          <button type="button" data-remove="${index}">Remove</button>
+        </div>`)
+      .join("");
+    const single = settings.triggerSteps.length ? " disabled" : "";
     return `<h2>Trigger</h2>
-      <label class="check"><input id="set-trigger" type="checkbox"> Enable simple trigger</label>
-      <label>Kind
-        <select id="set-kind">
+      <label class="check"><input id="set-trigger" type="checkbox"> Enable trigger</label>
+      <label>Single edge
+        <select id="set-kind"${single}>
           <option value="rising">Rising</option>
           <option value="falling">Falling</option>
           <option value="high">High</option>
           <option value="low">Low</option>
         </select>
       </label>
+      <p class="hint">A sequence replaces the single edge. Steps run in order and the mark is the last one.</p>
+      <div id="trigger-steps">${steps}</div>
+      <button class="block" id="add-step" type="button"${settings.triggerSteps.length >= 16 ? " disabled" : ""}>Add edge step</button>
       <label>Position
         <input id="set-percent" type="number" min="0" max="90" step="1">
       </label>
-      <p class="hint">Instant ignores the trigger. The diamond on the ruler is the reported edge.</p>`;
+      <p class="hint">Each step is one arm-record stage, up to 16. Demo captures search the stored samples for that sequence. A pod is sent the same stages; that sequence has not been run on hardware. Instant ignores the trigger.</p>`;
   }
   if (name === "analyzers") {
     return `<h2>Analyzers</h2>
-      <p>Protocol decoders are a later phase. The demo lines are already shaped like a clock, UART, and I2C so that work has a signal to land on.</p>`;
+      <label>Protocol
+        <select id="decoder-kind">
+          <option value="i2c">I2C</option>
+          <option value="spi">SPI</option>
+          <option value="uart">UART</option>
+          <option value="eeprom24">EEPROM 24xx on I2C</option>
+        </select>
+      </label>
+      <button class="block" id="add-decoder" type="button">Add decoder</button>
+      <div id="decoder-list"></div>
+      <p class="hint">I2C maps SDA/SCL. SPI maps SCK/MOSI/MISO/CS, including demo:spi/ names when both pods are stacked. EEPROM reads the I2C rows.</p>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace for width, period, frequency, and duty."}</p>
@@ -756,6 +839,10 @@ function bindDrawer(name) {
     document.getElementById("download").addEventListener("click", () => downloadCapture("/api/export/lvcap", "capture.lvcap"));
     document.getElementById("download-dsl").addEventListener("click", () => downloadCapture("/api/export/dsl", "capture.dsl"));
     loadDevices();
+  }
+  if (name === "analyzers") {
+    document.getElementById("add-decoder").addEventListener("click", addDecoder);
+    refreshDecoders();
   }
   if (name === "capture") {
     bindSelect("set-rate", "rate", true);
@@ -784,6 +871,32 @@ function bindDrawer(name) {
     box.addEventListener("change", () => { settings.trigger = box.checked; });
     percent.addEventListener("change", () => { settings.percent = Number(percent.value); });
     kind.addEventListener("change", () => { settings.triggerKind = kind.value; });
+    document.getElementById("add-step").addEventListener("click", () => {
+      const next = settings.triggerSteps.length === 0 ? 1 : settings.triggerSteps.length === 1 ? 3 : 0;
+      settings.triggerSteps.push({ channel: next, rising: true });
+      settings.trigger = true;
+      refreshTriggerDrawer();
+    });
+    for (const input of document.querySelectorAll("#trigger-steps [data-field='channel']")) {
+      input.addEventListener("change", () => {
+        const index = Number(input.dataset.step);
+        const channel = Math.max(0, Math.min(31, Number(input.value) || 0));
+        settings.triggerSteps[index].channel = channel;
+        input.value = String(channel);
+      });
+    }
+    for (const select of document.querySelectorAll("#trigger-steps [data-field='edge']")) {
+      select.addEventListener("change", () => {
+        const index = Number(select.dataset.step);
+        settings.triggerSteps[index].rising = select.value !== "falling";
+      });
+    }
+    for (const button of document.querySelectorAll("#trigger-steps [data-remove]")) {
+      button.addEventListener("click", () => {
+        settings.triggerSteps.splice(Number(button.dataset.remove), 1);
+        refreshTriggerDrawer();
+      });
+    }
   }
   if (name === "measure") {
     document.getElementById("pat-next").addEventListener("click", () => searchPattern(true));
@@ -815,26 +928,216 @@ async function loadDevices() {
   try {
     const devices = await api({ cmd: "list_devices" });
     list.replaceChildren();
+    const attached = new Set((state.devices || []).map((device) => device.id));
     for (const device of devices) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "block";
-      button.textContent = device.name;
-      button.addEventListener("click", async () => {
-        try {
-          const connected = await api({ cmd: "connect", id: device.id });
-          settings.device = connected.id;
-          settings.deviceName = connected.name;
-          const status = await api({ cmd: "status", session: state.active });
-          applyStatus(status, false);
-        } catch (err) {
-          statusEl.textContent = err.message;
-        }
-      });
-      list.appendChild(button);
+      const row = document.createElement("div");
+      const use = document.createElement("button");
+      use.type = "button";
+      use.className = "block";
+      use.textContent = attached.has(device.id) ? `${device.name} (in session)` : `Use ${device.name}`;
+      use.addEventListener("click", () => useDevice(device.id));
+      row.append(use);
+      if (device.kind === "demo") {
+        const stack = document.createElement("button");
+        stack.type = "button";
+        stack.className = "block";
+        stack.textContent = attached.has(device.id) ? `Remove ${device.name}` : `Stack ${device.name}`;
+        stack.addEventListener("click", () => stackDevice(device, attached.has(device.id)));
+        row.append(stack);
+      }
+      list.append(row);
     }
+    api({ cmd: "list_profiles" }).then((profiles) => {
+      const note = document.createElement("p");
+      note.className = "hint";
+      const untested = profiles.filter((profile) => !profile.hardware_tested).length;
+      const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
+      note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
+      list.append(note);
+    }).catch(() => {});
   } catch (err) {
     list.textContent = err.message;
+  }
+}
+
+async function useDevice(id) {
+  try {
+    const connected = await api({ cmd: "connect", id });
+    settings.device = connected.id;
+    settings.deviceName = connected.name;
+    const status = await api({ cmd: "status", session: state.active });
+    applyStatus(status, false);
+    state.gutterSig = "";
+    renderGutter();
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function stackDevice(device, remove) {
+  try {
+    const status = await api({
+      cmd: remove ? "detach_device" : "attach_device",
+      id: device.id,
+      session: state.active,
+    });
+    applyStatus(status, false);
+    state.gutterSig = "";
+    renderGutter();
+    loadDevices();
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+function decoderChannels(protocol) {
+  if (protocol === "i2c") return { scl: "SCL", sda: "SDA" };
+  if (protocol === "spi") {
+    const prefix = state.channels.some((channel) => channel.device_id === "demo:spi") ? "demo:spi/" : "";
+    return { sck: prefix + "SCK", mosi: prefix + "MOSI", miso: prefix + "MISO", cs: prefix + "CS" };
+  }
+  if (protocol === "uart") return { rx: "UART" };
+  return {};
+}
+
+async function addDecoder() {
+  const protocol = document.getElementById("decoder-kind").value;
+  try {
+    await api({
+      cmd: "add_decoder",
+      session: state.active,
+      protocol,
+      channels: decoderChannels(protocol),
+    });
+    await refreshDecoders();
+    await loadAnnotations();
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function refreshDecoders() {
+  const host = document.getElementById("decoder-list");
+  if (!host) return;
+  const rows = await api({ cmd: "list_decoders", session: state.active });
+  host.replaceChildren();
+  for (const row of rows) {
+    const line = document.createElement("p");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "block";
+    button.textContent = `Remove ${row.protocol} ${row.id}`;
+    button.addEventListener("click", async () => {
+      await api({ cmd: "remove_decoder", session: state.active, id: row.id });
+      await refreshDecoders();
+      await loadAnnotations();
+    });
+    line.append(button);
+    host.append(line);
+  }
+}
+
+async function loadAnnotations() {
+  if (!state.active) return;
+  const query = document.getElementById("table-search");
+  const text = query ? query.value.trim() : "";
+  try {
+    state.annotations = await api({
+      cmd: "read_annotations",
+      session: state.active,
+      query: text || null,
+      limit: 300,
+    });
+  } catch (err) {
+    state.annotations = [];
+    statusEl.textContent = err.message;
+  }
+  renderTable();
+  drawWave();
+}
+
+function renderTable() {
+  const body = document.getElementById("table-body");
+  if (!body) return;
+  if (state.tableTab === "edges") {
+    body.innerHTML = `<div class="table-empty">
+      <p>Pattern search uses 0, 1, and x on the hovered logic channel.</p>
+      <button type="button" id="edge-next">Next match</button>
+      <button type="button" id="edge-prev">Previous match</button>
+      <p id="edge-hit"></p>
+    </div>`;
+    document.getElementById("edge-next").addEventListener("click", () => searchFromTable(true));
+    document.getElementById("edge-prev").addEventListener("click", () => searchFromTable(false));
+    return;
+  }
+  if (!state.annotations.length) {
+    body.innerHTML = `<div class="table-empty">No decoded rows yet. Add I2C or SPI, then capture.</div>`;
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "ann";
+  for (const row of state.annotations) {
+    const tr = document.createElement("tr");
+    const time = (row.start_sample / Math.max(1, state.rate)).toFixed(6);
+    tr.innerHTML = `<td>${time}s</td><td>${row.protocol}</td><td>${row.class}</td><td>${row.text}</td>`;
+    tr.addEventListener("click", () => panTo(row.start_sample));
+    table.append(tr);
+  }
+  body.replaceChildren(table);
+}
+
+function panTo(sample) {
+  const v = view();
+  v.start = Math.max(0, sample - wave.clientWidth * v.spp * 0.2);
+  v.userNavigated = true;
+  clampView();
+  scheduleTiles();
+  drawRuler();
+}
+
+async function searchFromTable(forward) {
+  const field = document.getElementById("table-search");
+  const pattern = field && field.value ? field.value : settings.pattern;
+  settings.pattern = pattern;
+  const from = hoverSample();
+  try {
+    const data = await api({
+      cmd: "search_pattern",
+      session: state.active,
+      channel: state.hoverChannel || 0,
+      from,
+      pattern,
+      forward,
+    });
+    const hit = document.getElementById("edge-hit");
+    if (data.sample == null) {
+      if (hit) hit.textContent = "no match";
+      return;
+    }
+    if (hit) hit.textContent = `match at ${data.sample}`;
+    panTo(data.sample);
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function exportAnnotations() {
+  try {
+    const query = document.getElementById("table-search");
+    const data = await api({
+      cmd: "export_annotations",
+      session: state.active,
+      format: "csv",
+      query: query && query.value.trim() ? query.value.trim() : null,
+    });
+    const blob = new Blob([data], { type: "text/csv" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "annotations.csv";
+    link.click();
+    URL.revokeObjectURL(link.href);
+  } catch (err) {
+    statusEl.textContent = err.message;
   }
 }
 
@@ -909,7 +1212,9 @@ async function refreshMeasurements() {
   host.replaceChildren();
   for (const row of rows) {
     const p = document.createElement("p");
-    p.textContent = `#${row.id} ch${row.channel} @ ${row.sample}: width ${row.pulse_width_samples}`;
+    const duty = row.duty == null ? "—" : `${(row.duty * 100).toFixed(1)}%`;
+    const freq = row.frequency_hz == null ? "—" : `${Math.round(row.frequency_hz)} Hz`;
+    p.textContent = `#${row.id} ch${row.channel} @ ${row.sample}: width ${row.pulse_width_samples} · period ${row.period_samples ?? "—"} · ${freq} · duty ${duty}`;
     host.appendChild(p);
   }
 }
@@ -1081,6 +1386,7 @@ async function runHover(ev) {
   }
   try {
     const metrics = await api({ cmd: "measure", session: state.active, channel: row.channel, sample });
+    state.hoverChannel = row.channel;
     const level = metrics.level_high ? "high" : "low";
     const width = formatSeconds(metrics.width_secs);
     const period = metrics.period_secs == null ? "—" : formatSeconds(metrics.period_secs);
@@ -1119,6 +1425,25 @@ function hideHover() {
   paintStatus();
 }
 
+for (const button of document.querySelectorAll(".table-tab")) {
+  button.addEventListener("click", () => {
+    state.tableTab = button.dataset.tab;
+    for (const tab of document.querySelectorAll(".table-tab")) {
+      tab.classList.toggle("active", tab === button);
+    }
+    renderTable();
+  });
+}
+const tableSearch = document.getElementById("table-search");
+tableSearch.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  ev.preventDefault();
+  if (state.tableTab === "edges") searchFromTable(true);
+  else loadAnnotations();
+});
+document.getElementById("table-export").addEventListener("click", exportAnnotations);
+renderTable();
+
 document.getElementById("start").addEventListener("click", () => toggleRun(false));
 document.getElementById("instant").addEventListener("click", () => toggleRun(true));
 document.getElementById("tab-add").addEventListener("click", () => addSession());
@@ -1140,6 +1465,12 @@ window.addEventListener("keydown", (ev) => {
   if (key === "t" || key === "T") { openDrawer("trigger"); return; }
   if (key === "d" || key === "D") { openDrawer("analyzers"); return; }
   if (key === "m" || key === "M") { openDrawer("measure"); return; }
+  if (key === "r" || key === "R") {
+    ev.preventDefault();
+    const search = document.getElementById("table-search");
+    if (search) search.focus();
+    return;
+  }
   if (key === "Escape") { openDrawer(state.drawer); return; }
   if (key === "PageDown" || key === "PageUp") {
     ev.preventDefault();

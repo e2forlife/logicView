@@ -246,6 +246,7 @@ async fn settle(
         state.slots[index].session.fail(message);
     } else if state.slots[index].session.phase != Phase::Error {
         state.slots[index].session.finish();
+        super::decode_cmd::rerun(&mut state.slots[index]);
     }
     state.running.retain(|key, run| key != id || run.generation != generation);
     let phase = state.slots[index].session.phase.as_str().to_string();

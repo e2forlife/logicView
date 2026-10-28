@@ -1,6 +1,7 @@
+use logicview_analysis::find_edge_sequence;
 use logicview_proto::{
     align_trigger_position, encode_arm, unpack_logic_atoms, ArmConfig, DepthMode, LogicHeader,
-    ModeFlags, Stage,
+    ModeFlags, Stage, UpperStage,
 };
 
 use crate::demo::DemoSource;
@@ -64,7 +65,8 @@ pub enum RunPolicy {
     Loop,
 }
 
-/// Simple trigger on one channel.
+/// Simple trigger on one channel. A non-empty [`SessionConfig::trigger_steps`]
+/// list replaces this with an ordered edge sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TriggerKind {
     #[default]
@@ -73,6 +75,19 @@ pub enum TriggerKind {
     High,
     Low,
 }
+
+/// One edge in a sequential trigger. `rising` is false for a falling edge.
+///
+/// The arm record stores each step as its own stage, in order, up to 16.
+/// Stages are what the pod's trigger RAM can hold. The demo source does not
+/// wait on that RAM: it searches the captured samples for the same sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriggerStep {
+    pub channel: u8,
+    pub rising: bool,
+}
+
+pub const MAX_TRIGGER_STEPS: usize = 16;
 
 /// Clock the arm divider is computed from.
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +117,8 @@ pub struct SessionConfig {
     pub channel_enable: u32,
     pub trigger_channel: u8,
     pub trigger_kind: TriggerKind,
+    /// Ordered edges. Empty means the single `trigger_channel` / `trigger_kind`.
+    pub trigger_steps: Vec<TriggerStep>,
 }
 
 impl Default for SessionConfig {
@@ -124,8 +141,44 @@ impl Default for SessionConfig {
             channel_enable: 0,
             trigger_channel: 0,
             trigger_kind: TriggerKind::Rising,
+            trigger_steps: Vec::new(),
         }
     }
+}
+
+/// Edges that arm the capture, in order.
+///
+/// A non-empty `trigger_steps` list wins. Otherwise a rising or falling
+/// `trigger_kind` is one step. High and low stay a single level stage.
+pub fn active_edge_steps(config: &SessionConfig) -> Vec<TriggerStep> {
+    if !config.trigger_steps.is_empty() {
+        return config.trigger_steps.clone();
+    }
+    match config.trigger_kind {
+        TriggerKind::Rising => vec![TriggerStep {
+            channel: config.trigger_channel,
+            rising: true,
+        }],
+        TriggerKind::Falling => vec![TriggerStep {
+            channel: config.trigger_channel,
+            rising: false,
+        }],
+        TriggerKind::High | TriggerKind::Low => Vec::new(),
+    }
+}
+
+pub fn check_trigger(config: &SessionConfig) -> Result<(), CaptureError> {
+    if config.trigger_steps.len() > MAX_TRIGGER_STEPS {
+        return Err(CaptureError::BadTrigger(
+            "a trigger sequence has at most 16 steps".into(),
+        ));
+    }
+    if config.trigger_steps.iter().any(|step| step.channel > 31) {
+        return Err(CaptureError::BadTrigger(
+            "trigger channels are 0 through 31".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub struct Session {
@@ -139,6 +192,8 @@ pub struct Session {
     pub error: Option<String>,
     pub warnings: Vec<String>,
     pub total_samples: u64,
+    /// Demo captures search stored samples for the edge sequence.
+    resolve_edges: bool,
     generation: u64,
 }
 
@@ -155,6 +210,7 @@ impl Session {
             error: None,
             warnings: Vec::new(),
             total_samples: 0,
+            resolve_edges: false,
             generation: 0,
         }
     }
@@ -167,18 +223,23 @@ impl Session {
         &mut self,
         config: SessionConfig,
         mode: StartMode,
+        waves: Vec<fn(u64) -> bool>,
     ) -> Result<DemoSource, CaptureError> {
+        let mut config = config;
+        config.channel_enable = 0;
+        let width = waves.len();
         let total = self.prepare(
             config,
             mode,
-            DEMO_CHANNELS,
+            width,
             HostClock {
                 hw_max_hz: DEMO_HW_MAX_RATE,
                 half_rate_hz: None,
                 quarter_rate_hz: None,
             },
         )?;
-        Ok(DemoSource::new(&self.config, total, self.instant))
+        self.resolve_edges = true;
+        Ok(DemoSource::new(&self.config, total, self.instant, waves))
     }
 
     /// Build the arm record and an empty store. `channels` is the width used
@@ -208,8 +269,47 @@ impl Session {
         self.error = None;
         self.warnings.clear();
         self.total_samples = total;
+        self.resolve_edges = false;
         self.phase = Phase::Arming;
         Ok(total)
+    }
+
+    /// Mark the sample where the last edge of the sequence occurs.
+    ///
+    /// Used by the demo source. A USB capture keeps the position from the
+    /// device header instead, because this machine cannot check the pod.
+    pub fn locate_edge_trigger(&mut self) {
+        if !self.resolve_edges
+            || self.instant
+            || !self.config.trigger_enabled
+            || self.trigger_sample.is_some()
+        {
+            return;
+        }
+        let steps = active_edge_steps(&self.config);
+        if steps.is_empty() {
+            return;
+        }
+        let len = self.store.len();
+        if len == 0 {
+            return;
+        }
+        if steps
+            .iter()
+            .any(|step| step.channel as usize >= self.store.channel_count())
+        {
+            return;
+        }
+        let pairs: Vec<(usize, bool)> = steps
+            .iter()
+            .map(|step| (step.channel as usize, step.rising))
+            .collect();
+        let found = find_edge_sequence(len, &pairs, |channel, sample| {
+            self.store.level(channel, sample).unwrap_or(false)
+        });
+        if let Some(sample) = found {
+            self.trigger_sample = Some(sample);
+        }
     }
 
     pub fn on_header(&mut self, header: LogicHeader) {
@@ -240,6 +340,7 @@ impl Session {
         ) {
             self.phase = Phase::Running;
         }
+        self.locate_edge_trigger();
         Ok(())
     }
 
@@ -250,6 +351,20 @@ impl Session {
     }
 
     pub fn finish(&mut self) {
+        self.locate_edge_trigger();
+        if self.resolve_edges && self.config.trigger_enabled && !self.instant {
+            let steps = active_edge_steps(&self.config);
+            if !steps.is_empty() && self.trigger_sample.is_none() {
+                if steps
+                    .iter()
+                    .any(|step| step.channel as usize >= self.store.channel_count())
+                {
+                    self.warn("trigger sequence names a channel this capture does not have");
+                } else {
+                    self.warn("trigger sequence was not seen in the captured samples");
+                }
+            }
+        }
         self.phase = Phase::Stopped;
     }
 
@@ -267,6 +382,50 @@ impl Default for Session {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn apply_edge_stages(
+    steps: &[TriggerStep],
+    stages: &mut [Stage; 16],
+    upper: &mut Option<[UpperStage; 16]>,
+) -> Result<u8, CaptureError> {
+    if steps.len() > MAX_TRIGGER_STEPS {
+        return Err(CaptureError::BadTrigger(
+            "a trigger sequence has at most 16 steps".into(),
+        ));
+    }
+    let mut upper_stages = [UpperStage::default(); 16];
+    let mut needs_upper = false;
+    for (index, step) in steps.iter().enumerate() {
+        if step.channel > 31 {
+            return Err(CaptureError::BadTrigger(
+                "trigger channels are 0 through 31".into(),
+            ));
+        }
+        let bit = 1u32 << (step.channel % 16);
+        let value = if step.rising { bit } else { 0 };
+        if step.channel < 16 {
+            stages[index] = Stage {
+                mask: bit,
+                value,
+                edge: bit,
+                invert: false,
+                logic_or: false,
+                count: 1,
+            };
+        } else {
+            needs_upper = true;
+            upper_stages[index] = UpperStage {
+                mask: bit,
+                value,
+                edge: bit,
+            };
+        }
+    }
+    if needs_upper {
+        *upper = Some(upper_stages);
+    }
+    Ok(steps.len() as u8)
 }
 
 fn enabled_mask(mask: u32, channels: usize) -> u32 {
@@ -325,23 +484,43 @@ fn build_arm(
         0
     };
     let mut stages = [Stage::default(); 16];
+    let mut upper = None;
     let stage_count = if config.trigger_enabled && !instant {
-        let bit = 1u32 << config.trigger_channel.min(31);
-        let (value, edge) = match config.trigger_kind {
-            TriggerKind::Rising => (bit, bit),
-            TriggerKind::Falling => (0, bit),
-            TriggerKind::High => (bit, 0),
-            TriggerKind::Low => (0, 0),
-        };
-        stages[0] = Stage {
-            mask: bit,
-            value,
-            edge,
-            invert: false,
-            logic_or: false,
-            count: 1,
-        };
-        1
+        let steps = active_edge_steps(config);
+        if !steps.is_empty() {
+            // One stage per edge, in order. The record format holds 16.
+            // The demo path proves the sequence by searching samples; the
+            // pod image is written and has not been run on hardware.
+            apply_edge_stages(&steps, &mut stages, &mut upper)?
+        } else {
+            let channel = config.trigger_channel.min(31);
+            let bit = 1u32 << (channel % 16);
+            let (value, edge) = match config.trigger_kind {
+                TriggerKind::High => (bit, 0),
+                TriggerKind::Low => (0, 0),
+                TriggerKind::Rising => (bit, bit),
+                TriggerKind::Falling => (0, bit),
+            };
+            if channel < 16 {
+                stages[0] = Stage {
+                    mask: bit,
+                    value,
+                    edge,
+                    invert: false,
+                    logic_or: false,
+                    count: 1,
+                };
+            } else {
+                let mut upper_stages = [UpperStage::default(); 16];
+                upper_stages[0] = UpperStage {
+                    mask: bit,
+                    value,
+                    edge,
+                };
+                upper = Some(upper_stages);
+            }
+            1
+        }
     } else {
         0
     };
@@ -356,7 +535,7 @@ fn build_arm(
         channel_enable: enable,
         fine_gain: 0,
         stages,
-        upper: None,
+        upper,
     };
     encode_arm(&arm).map_err(|err| CaptureError::Proto(err.to_string()))
 }
@@ -381,4 +560,70 @@ pub fn planned_samples(config: &SessionConfig) -> Result<u64, CaptureError> {
         });
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logicview_proto::decode_arm;
+
+    #[test]
+    fn two_edges_occupy_two_stages_including_the_upper_record() {
+        let config = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            trigger_enabled: true,
+            trigger_steps: vec![
+                TriggerStep {
+                    channel: 1,
+                    rising: true,
+                },
+                TriggerStep {
+                    channel: 17,
+                    rising: false,
+                },
+            ],
+            ..SessionConfig::default()
+        };
+        let bytes = build_arm(
+            &config,
+            9_984,
+            false,
+            0xFFFF,
+            &HostClock {
+                hw_max_hz: 100_000_000,
+                half_rate_hz: None,
+                quarter_rate_hz: None,
+            },
+        )
+        .unwrap();
+        let armed = decode_arm(&bytes).unwrap();
+        assert_eq!(armed.stage_count, 2);
+        assert!(armed.mode.contains(ModeFlags::TRIGGER_ENABLE));
+        assert_eq!(armed.stages[0].mask, 1 << 1);
+        assert_eq!(armed.stages[0].value, 1 << 1);
+        assert_eq!(armed.stages[0].edge, 1 << 1);
+        assert_eq!(armed.stages[0].count, 1);
+        assert_eq!(armed.stages[1].mask, 0);
+        let upper = armed.upper.expect("channel 17 is in the second record");
+        assert_eq!(upper[1].mask, 1 << 1);
+        assert_eq!(upper[1].value, 0);
+        assert_eq!(upper[1].edge, 1 << 1);
+    }
+
+    #[test]
+    fn a_seventeenth_step_is_refused() {
+        let config = SessionConfig {
+            trigger_enabled: true,
+            trigger_steps: (0..17)
+                .map(|channel| TriggerStep {
+                    channel,
+                    rising: true,
+                })
+                .collect(),
+            ..SessionConfig::default()
+        };
+        let err = check_trigger(&config).unwrap_err();
+        assert!(err.to_string().contains("16"));
+    }
 }

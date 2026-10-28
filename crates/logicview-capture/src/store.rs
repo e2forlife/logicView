@@ -211,6 +211,14 @@ impl LogicStore {
         self.len() == 0
     }
 
+    pub fn level(&self, channel: usize, sample: u64) -> Option<bool> {
+        let bytes = self.channel_bytes(channel).ok()?;
+        if sample >= self.len() {
+            return None;
+        }
+        Some(logicview_analysis::bit_at(bytes, sample))
+    }
+
     pub fn channel_bytes(&self, channel: usize) -> Result<&[u8], CaptureError> {
         self.channels
             .get(channel)

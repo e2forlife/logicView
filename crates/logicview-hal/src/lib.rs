@@ -5,11 +5,13 @@
 //! points at the folder that contains `DSLogicPlus.bin`.
 
 mod capture;
+mod catalog;
 mod device;
 mod profile;
 
 pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
 pub use device::{list_plus, Pod};
+pub use catalog::{logic_profile, logic_profiles, LogicProfile};
 pub use profile::{
     plan_clock, threshold_code, ClockPlan, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
     HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, VENDOR_ID,

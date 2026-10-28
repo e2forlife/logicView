@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use logicview_capture::SessionConfig;
+use logicview_capture::{SessionConfig, TriggerStep};
 use logicview_proto::{decode_arm, ModeFlags};
 
 use super::{Engine, StartMode};
@@ -151,5 +151,241 @@ async fn pattern_cursors_and_dsl_round_trip_on_the_demo() {
 async fn usb_connect_is_refused() {
     let engine = Engine::new();
     let error = engine.connect("usb:2a0e:0034").await.unwrap_err();
-    assert!(error.to_string().contains("demo"));
+    let text = error.to_string();
+    assert!(
+        text.contains("not opened") && text.contains("hardware test"),
+        "{text}"
+    );
+    let profiles = engine.list_profiles().await;
+    assert!(profiles.iter().any(|profile| {
+        profile.product_id == 0x0020 && profile.hardware_tested
+    }));
+    assert!(profiles
+        .iter()
+        .any(|profile| profile.product_id == 0x0034 && !profile.hardware_tested));
+}
+
+#[tokio::test]
+async fn two_demo_pods_stack_decode_and_measure_the_clock() {
+    use std::collections::BTreeMap;
+
+    let engine = Engine::new();
+    engine.attach_device(None, "demo:spi").await.unwrap();
+    let status = engine.status(None).await.unwrap();
+    assert_eq!(status.channels.len(), 8);
+    assert_eq!(status.channels[0].device_id, "demo");
+    assert_eq!(status.channels[0].name, "CLK");
+    assert_eq!(status.channels[2].name, "SDA");
+    assert_eq!(status.channels[3].name, "SCL");
+    assert_eq!(status.channels[4].device_id, "demo:spi");
+    assert_eq!(status.channels[4].name, "SCK");
+    assert_eq!(status.devices.len(), 2);
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let pulse = engine.measure(None, 0, 75).await.unwrap();
+    assert_eq!(pulse.pulse_width_samples, 50);
+    assert_eq!(pulse.period_samples, Some(100));
+    assert_eq!(pulse.frequency_hz, Some(10_000.0));
+    assert_eq!(pulse.duty, Some(0.5));
+    let saved = engine.save_measurement(None, 0, 75).await.unwrap();
+    assert_eq!(saved.frequency_hz, Some(10_000.0));
+    assert_eq!(saved.duty, Some(0.5));
+
+    let mut i2c_channels = BTreeMap::new();
+    i2c_channels.insert("scl".into(), "demo/SCL".into());
+    i2c_channels.insert("sda".into(), "demo/SDA".into());
+    let i2c = engine
+        .add_decoder(None, "i2c", &i2c_channels, &BTreeMap::new(), None, None)
+        .await
+        .unwrap();
+    let eeprom = engine
+        .add_decoder(None, "eeprom24", &BTreeMap::new(), &BTreeMap::new(), None, Some(&i2c.id))
+        .await
+        .unwrap();
+    assert_eq!(eeprom.stack_on.as_deref(), Some(i2c.id.as_str()));
+
+    let mut spi_channels = BTreeMap::new();
+    spi_channels.insert("sck".into(), "demo:spi/SCK".into());
+    spi_channels.insert("mosi".into(), "demo:spi/MOSI".into());
+    spi_channels.insert("miso".into(), "demo:spi/MISO".into());
+    spi_channels.insert("cs".into(), "demo:spi/CS".into());
+    engine
+        .add_decoder(None, "spi", &spi_channels, &BTreeMap::new(), None, None)
+        .await
+        .unwrap();
+
+    let rows = engine
+        .read_annotations(None, None, None, None, None, 0, 5_000)
+        .await
+        .unwrap();
+    assert!(rows.iter().any(|row| {
+        row.protocol == "i2c"
+            && row.class == "address"
+            && row.fields.get("address").map(String::as_str) == Some("50")
+            && row.fields.get("read").map(String::as_str) == Some("false")
+    }));
+    assert!(rows.iter().any(|row| {
+        row.protocol == "i2c"
+            && row.class == "data"
+            && row.fields.get("data").map(String::as_str) == Some("5A")
+    }));
+    assert!(rows
+        .iter()
+        .any(|row| row.protocol == "eeprom24" && row.text == "Write 0x10 = 0x5A"));
+    assert!(rows
+        .iter()
+        .any(|row| row.protocol == "eeprom24" && row.text == "Read 0x10 = 0x5A"));
+    assert!(rows.iter().any(|row| {
+        row.protocol == "spi"
+            && row.class == "word"
+            && row.fields.get("mosi").map(String::as_str) == Some("A5")
+            && row.fields.get("miso").map(String::as_str) == Some("3C")
+    }));
+
+    let found = engine.search_annotations(None, "A0-10-5A").await.unwrap();
+    assert!(found.len() >= 3);
+    let csv = engine.export_annotations(None, "csv", Some("Read 0x10")).await.unwrap();
+    assert!(csv.contains("Read 0x10 = 0x5A"));
+    let text = engine.export_annotations(None, "text", Some("MOSI 0xA5")).await.unwrap();
+    assert!(text.contains("MOSI 0xA5 MISO 0x3C"));
+}
+
+#[tokio::test]
+async fn sequential_trigger_arms_on_channel_1_and_fires_on_channel_3() {
+    let engine = Engine::new();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                realtime: false,
+                trigger_enabled: true,
+                trigger_steps: vec![
+                    TriggerStep {
+                        channel: 1,
+                        rising: true,
+                    },
+                    TriggerStep {
+                        channel: 3,
+                        rising: true,
+                    },
+                ],
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let status = engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(status.trigger_sample, Some(40));
+    assert!(status.warnings.is_empty(), "{:?}", status.warnings);
+    let armed = decode_arm(&engine.arm_record(None).await.unwrap()).unwrap();
+    assert_eq!(armed.stage_count, 2);
+    assert!(armed.mode.contains(ModeFlags::TRIGGER_ENABLE));
+    assert_eq!(armed.stages[0].mask, 1 << 1);
+    assert_eq!(armed.stages[0].value, 1 << 1);
+    assert_eq!(armed.stages[0].edge, 1 << 1);
+    assert_eq!(armed.stages[0].count, 1);
+    assert_eq!(armed.stages[1].mask, 1 << 3);
+    assert_eq!(armed.stages[1].value, 1 << 3);
+    assert_eq!(armed.stages[1].edge, 1 << 3);
+    assert_eq!(armed.stages[1].count, 1);
+    assert!(armed.upper.is_none());
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                realtime: false,
+                trigger_enabled: true,
+                trigger_steps: vec![
+                    TriggerStep {
+                        channel: 3,
+                        rising: true,
+                    },
+                    TriggerStep {
+                        channel: 1,
+                        rising: true,
+                    },
+                ],
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let reversed = engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(reversed.trigger_sample, Some(50));
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                realtime: false,
+                trigger_enabled: true,
+                trigger_steps: vec![
+                    TriggerStep {
+                        channel: 0,
+                        rising: true,
+                    },
+                    TriggerStep {
+                        channel: 0,
+                        rising: false,
+                    },
+                ],
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let clock = engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(clock.trigger_sample, Some(100));
+
+    let refused = engine
+        .configure(
+            None,
+            SessionConfig {
+                trigger_steps: (0..17)
+                    .map(|channel| TriggerStep {
+                        channel,
+                        rising: true,
+                    })
+                    .collect(),
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("16"));
 }

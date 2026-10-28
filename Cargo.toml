@@ -4,9 +4,11 @@ members = [
     "crates/logicview-proto",
     "crates/logicview-hal",
     "crates/logicview-analysis",
+    "crates/logicview-decode",
     "crates/logicview-capture",
     "crates/logicview-store",
     "crates/logicview-engine",
+    "crates/logicview-mcp",
     "crates/logicview-ui",
     "crates/logicview-app",
 ]
