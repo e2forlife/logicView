@@ -127,21 +127,27 @@ async function api(body) {
   return json.data;
 }
 
-function naturalRows() {
+function logicRowModel(channel, decoderId) {
+  const index = channel.index;
+  return {
+    key: decoderId ? "logic:" + index + "@" + decoderId : "logic:" + index,
+    tileKey: "logic:" + index,
+    kind: "logic",
+    channel: index,
+    name: channel.name,
+    color: channel.color,
+    device: channel.device_name || "",
+    decoderId: decoderId || "",
+  };
+}
+
+function sourceRows() {
   const rows = [];
-  for (const channel of state.channels) {
-    rows.push({
-      key: "logic:" + channel.index,
-      kind: "logic",
-      channel: channel.index,
-      name: channel.name,
-      color: channel.color,
-      device: channel.device_name || "",
-    });
-  }
+  for (const channel of state.channels) rows.push(logicRowModel(channel, ""));
   for (const channel of state.analog) {
     rows.push({
       key: "analog:" + channel.index,
+      tileKey: "analog:" + channel.index,
       kind: "analog",
       channel: channel.index,
       name: channel.name,
@@ -160,29 +166,75 @@ function naturalRows() {
       bus,
     });
   }
-  for (const decoder of state.decoders || []) {
-    if (decoderCondensed(decoder.id)) {
-      rows.push({
-        key: "condense:" + decoder.id,
-        kind: "condense",
-        channel: Number(Object.values(decoder.channels || [])[0]) || 0,
-        name: protocolLabel(decoder.protocol),
-        color: "#8eb6ff",
-        device: "",
-        decoderId: decoder.id,
-      });
-      continue;
-    }
-    if (decoder.protocol !== "spi") continue;
+  return rows;
+}
+
+function decoderIndexes(decoder) {
+  const seen = new Set();
+  const indexes = [];
+  for (const value of Object.values(decoder.channels || {})) {
+    const index = Number(value);
+    if (!Number.isFinite(index) || seen.has(index)) continue;
+    seen.add(index);
+    indexes.push(index);
+  }
+  return indexes;
+}
+
+function indexesInOrder(indexes, source) {
+  const wanted = new Set(indexes);
+  const ordered = [];
+  for (const row of source) {
+    if (row.kind === "logic" && wanted.has(row.channel) && !ordered.includes(row.channel)) ordered.push(row.channel);
+  }
+  for (const index of indexes) {
+    if (!ordered.includes(index)) ordered.push(index);
+  }
+  return ordered;
+}
+
+function groupRows(decoder, source) {
+  const indexes = indexesInOrder(decoderIndexes(decoder), source);
+  const channel = indexes.length ? indexes[0] : 0;
+  if (decoderCondensed(decoder.id)) {
+    return [{
+      key: "condense:" + decoder.id,
+      kind: "condense",
+      channel,
+      name: protocolLabel(decoder.protocol),
+      color: "#8eb6ff",
+      device: "",
+      decoderId: decoder.id,
+    }];
+  }
+  const rows = [];
+  if (!overlayEnabled(decoder.id)) {
+    rows.push({
+      key: "lane:" + decoder.id,
+      kind: "lane",
+      channel,
+      name: protocolLabel(decoder.protocol),
+      color: "#8eb6ff",
+      device: "",
+      decoderId: decoder.id,
+    });
+  }
+  const byIndex = new Map(state.channels.map((item) => [item.index, item]));
+  for (const index of indexes) {
+    const signal = byIndex.get(index);
+    if (signal) rows.push(logicRowModel(signal, decoder.id));
+  }
+  if (decoder.protocol === "spi") {
     if (!state.spiView[decoder.id]) state.spiView[decoder.id] = { analog: false };
     const analog = state.spiView[decoder.id].analog;
     rows.push({
       key: "decode:" + decoder.id,
       kind: "bus",
-      channel: decoder.channels.mosi ?? 0,
+      channel: Number(decoder.channels.mosi ?? channel) || 0,
       name: "MOSI/MISO",
       color: analog ? "#7dcea0" : "#d5deea",
       device: "",
+      decoderId: decoder.id,
       bus: {
         id: "decode:" + decoder.id,
         name: "MOSI/MISO",
@@ -193,6 +245,39 @@ function naturalRows() {
     });
   }
   return rows;
+}
+
+function displayRows() {
+  const source = orderedSourceRows();
+  const decoders = state.decoders || [];
+  const groups = decoders.map((decoder) => {
+    const indexes = decoderIndexes(decoder);
+    let anchor = -1;
+    source.forEach((row, index) => {
+      if (anchor >= 0) return;
+      if (row.kind === "logic" && indexes.includes(row.channel)) anchor = index;
+    });
+    return { id: decoder.id, anchor, rows: groupRows(decoder, source) };
+  });
+  const claimed = new Set();
+  for (const decoder of decoders) {
+    for (const index of decoderIndexes(decoder)) claimed.add(index);
+  }
+  const out = [];
+  const placed = new Set();
+  source.forEach((row, index) => {
+    for (const group of groups) {
+      if (group.anchor !== index || placed.has(group.id)) continue;
+      out.push(...group.rows);
+      placed.add(group.id);
+    }
+    if (row.kind === "logic" && claimed.has(row.channel)) return;
+    out.push(row);
+  });
+  for (const group of groups) {
+    if (!placed.has(group.id)) out.push(...group.rows);
+  }
+  return out;
 }
 
 function probeForRow(row) {
@@ -209,6 +294,7 @@ function channelIsEnabled(index) {
 }
 
 function rowEnabled(row) {
+  if (row.kind === "lane" || row.kind === "condense") return true;
   if (row.kind === "bus") {
     if (row.bus && row.bus.decode) return true;
     return row.bus.channels.some((index) => channelIsEnabled(index));
@@ -218,8 +304,8 @@ function rowEnabled(row) {
   return channelIsEnabled(probe ? probe.index : row.channel);
 }
 
-function orderedRows() {
-  const rows = naturalRows();
+function orderedSourceRows() {
+  const rows = sourceRows();
   const order = view().order;
   if (!order || !order.length) return rows;
   const map = new Map(rows.map((row) => [row.key, row]));
@@ -233,6 +319,10 @@ function orderedRows() {
   }
   for (const row of map.values()) out.push(row);
   return out;
+}
+
+function orderedRows() {
+  return displayRows();
 }
 
 function visibleRows() {
@@ -463,33 +553,33 @@ function rowMetrics() {
   const stage = document.querySelector(".wave-stage");
   const viewport = Math.max(1, stage ? stage.clientHeight : 1);
   const v = view();
-  const lanes = overlayLanes();
   const laneH = 26;
-  const laneBlock = lanes.length * laneH;
+  const flexRows = rows.filter((row) => row.kind !== "lane");
+  const laneCount = rows.length - flexRows.length;
   if (!v.heights) v.heights = {};
   if (!v.customHeights) {
-    const count = Math.max(1, rows.length);
-    const room = Math.max(28, viewport - laneBlock);
+    const count = Math.max(1, flexRows.length);
+    const room = Math.max(28, viewport - laneCount * laneH);
     const base = Math.floor(room / count);
     let used = 0;
-    rows.forEach((row, index) => {
-      const height = index === rows.length - 1 ? Math.max(28, room - used) : Math.max(28, base);
+    flexRows.forEach((row, index) => {
+      const height = index === flexRows.length - 1 ? Math.max(28, room - used) : Math.max(28, base);
       v.heights[row.key] = height;
       used += Math.max(28, base);
     });
   } else {
-    for (const row of rows) {
+    for (const row of flexRows) {
       if (!v.heights[row.key]) v.heights[row.key] = 64;
     }
   }
-  let top = laneBlock;
+  let top = 0;
   const layout = rows.map((row) => {
-    const height = Math.max(28, v.heights[row.key] || 64);
+    const height = row.kind === "lane" ? laneH : Math.max(28, v.heights[row.key] || 64);
     const item = { row, top, height };
     top += height;
     return item;
   });
-  return { layout, total: Math.max(1, top), viewport, lanes, laneH, laneBlock };
+  return { layout, total: Math.max(1, top), viewport, lanes: [], laneH, laneBlock: 0 };
 }
 
 function startRowResize(key, startY) {
@@ -516,24 +606,24 @@ function startRowResize(key, startY) {
 }
 
 function renderGutter() {
-  const rows = orderedRows();
   const metrics = rowMetrics();
   const selected = view().selected;
-  const laneSig = (metrics.lanes || []).map((decoder) => decoder.id).join(",");
-  const sig = laneSig + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
+  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
-  for (const decoder of metrics.lanes || []) {
-    const lane = document.createElement("div");
-    lane.className = "decode-lane";
-    lane.style.height = metrics.laneH + "px";
-    lane.style.flex = "none";
-    lane.textContent = protocolLabel(decoder.protocol);
-    gutter.appendChild(lane);
-  }
   for (const item of metrics.layout) {
     const row = item.row;
+    if (row.kind === "lane") {
+      const lane = document.createElement("div");
+      lane.className = "decode-lane";
+      lane.style.height = item.height + "px";
+      lane.style.flex = "none";
+      lane.dataset.key = row.key;
+      lane.textContent = row.name;
+      gutter.appendChild(lane);
+      continue;
+    }
     const el = document.createElement("div");
     el.className = "ch" + (row.key === selected ? " selected" : "") + (state.hidden.has(row.key) ? " dim" : "");
     el.dataset.key = row.key;
@@ -751,7 +841,7 @@ function drawWave() {
   for (const item of layout) {
     const row = item.row;
     if (state.hidden.has(row.key)) continue;
-    const cols = state.tiles[row.key];
+    const cols = state.tiles[row.tileKey || row.key];
     if (!cols) continue;
     if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
     else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
@@ -955,12 +1045,8 @@ function decoderChannelIndexes(decoder) {
   return Object.values(decoder.channels || {}).map(Number).filter((index) => Number.isFinite(index));
 }
 
-function channelHiddenByDecoder(index) {
-  return (state.decoders || []).some((decoder) => decoderCondensed(decoder.id) && decoderChannelIndexes(decoder).includes(index));
-}
-
 function rowHiddenByDecoder(row) {
-  return row.kind === "logic" && channelHiddenByDecoder(row.channel);
+  return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId);
 }
 
 function rowKindLabel(row) {
@@ -968,10 +1054,6 @@ function rowKindLabel(row) {
   if (row.kind === "analog") return "Analog";
   if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
   return "Digital";
-}
-
-function overlayLanes() {
-  return (state.decoders || []).filter((decoder) => !decoderCondensed(decoder.id) && !overlayEnabled(decoder.id));
 }
 
 function valueAnnotations(decoder) {
@@ -987,10 +1069,15 @@ function annotationLabel(row) {
   return row.text || row.class || "";
 }
 
-function logicRow(layout, channel) {
+function logicRow(layout, channel, decoderId) {
   const index = Number(channel);
   if (!Number.isFinite(index)) return null;
-  return layout.find((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key)) || null;
+  const matches = layout.filter((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key));
+  if (decoderId) {
+    const owned = matches.find((item) => item.row.decoderId === decoderId);
+    if (owned) return owned;
+  }
+  return matches.find((item) => !item.row.decoderId) || matches[0] || null;
 }
 
 function dataLineTargets(decoder) {
@@ -1006,7 +1093,7 @@ function dataLineTargets(decoder) {
   if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
   if (decoder.protocol === "eeprom24") {
     const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
-    return [{ channel: parent && parent.channels ? parent.channels.sda : null, label: text }];
+    return [{ channel: parent && parent.channels ? parent.channels.sda : null, decoderId: parent && parent.id, label: text }];
   }
   const first = Object.values(channels)[0];
   return [{ channel: first, label: text }];
@@ -1100,30 +1187,22 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
   ctx.font = "12px sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  let laneIndex = 0;
   for (const decoder of state.decoders || []) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
     if (decoderCondensed(decoder.id)) continue;
     if (overlayEnabled(decoder.id)) {
       for (const target of dataLineTargets(decoder)) {
-        const item = logicRow(layout, target.channel);
+        const item = logicRow(layout, target.channel, target.decoderId || decoder.id);
         if (!item) continue;
         const pad = Math.max(8, item.height * 0.22);
         drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
       }
     } else {
-      const top = laneIndex * metrics.laneH + 3;
-      drawValueBoxes(ctx, rows, top, top + metrics.laneH - 6, false, canvasW);
-      laneIndex += 1;
+      const item = layout.find((entry) => entry.row.kind === "lane" && entry.row.decoderId === decoder.id);
+      if (!item) continue;
+      drawValueBoxes(ctx, rows, item.top + 3, item.top + item.height - 3, false, canvasW);
     }
-  }
-  if (metrics.laneBlock > 0) {
-    ctx.strokeStyle = "rgba(255,255,255,0.08)";
-    ctx.beginPath();
-    ctx.moveTo(0, metrics.laneBlock + 0.5);
-    ctx.lineTo(canvasW, metrics.laneBlock + 0.5);
-    ctx.stroke();
   }
   ctx.restore();
 }
@@ -1491,22 +1570,35 @@ async function runTiles() {
   }
 }
 
+function tileRequests() {
+  const seen = new Set();
+  const rows = [];
+  for (const row of visibleRows()) {
+    if (row.kind !== "logic" && row.kind !== "analog") continue;
+    const key = row.tileKey || row.key;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ row, key });
+  }
+  return rows;
+}
+
 async function fetchTiles() {
-  const rows = visibleRows().filter((row) => row.kind === "logic" || row.kind === "analog");
+  const requests = tileRequests();
   const width = Math.max(1, Math.floor(wave.clientWidth || 1));
   const v = view();
   const req = ++state.req;
   const spp = Math.max(v.spp, 1e-9);
   const start = v.start;
-  if (rows.length === 0) {
+  if (requests.length === 0) {
     state.tiles = {};
     drawWave();
     drawRuler();
     return;
   }
-  const pending = { req, got: {}, expect: rows.length, start, spp, width };
+  const pending = { req, got: {}, expect: requests.length, start, spp, width };
   state.pending = pending;
-  const bodies = rows.map((row) => ({
+  const bodies = requests.map(({ row, key }) => ({
     cmd: "tile",
     req,
     session: state.active,
@@ -1515,7 +1607,7 @@ async function fetchTiles() {
     columns: width,
     samples_per_pixel: spp,
     kind: row.kind,
-    key: row.key,
+    key,
   }));
   const sent = socket && socket.readyState === WebSocket.OPEN;
   if (sent) {
@@ -1529,13 +1621,13 @@ async function fetchTiles() {
       };
       pending.done = finish;
       pending.timer = setTimeout(async () => {
-        if (state.req === req && Object.keys(pending.got).length < rows.length) {
+        if (state.req === req && Object.keys(pending.got).length < requests.length) {
           await httpTiles(req, bodies, pending);
         }
         finish();
       }, 280);
       for (const body of bodies) socket.send(JSON.stringify(body));
-      if (Object.keys(pending.got).length >= rows.length) finish();
+      if (Object.keys(pending.got).length >= requests.length) finish();
     });
   } else {
     await httpTiles(req, bodies, pending);
@@ -1753,7 +1845,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Overlay draws on the data lines, or above the waveform when it is off. Hiding the channels leaves only the decoded data.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Overlay draws on the data lines. With overlay off, that decoder’s lane heads only its channels. Hiding those channels leaves only the decoded data. A channel used by two decoders appears in each group.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
