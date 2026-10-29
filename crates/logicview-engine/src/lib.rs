@@ -310,24 +310,29 @@ impl Engine {
             return Ok(demo_device_info(id));
         }
         if let Some(pid) = usb_product_id(id) {
-            if pid != logicview_hal::PLUS_PID || id != logicview_hal::DEVICE_ID {
-                let profile = logicview_hal::logic_profile(pid);
-                let name = profile.map(|item| item.name).unwrap_or("unknown product");
-                let channels = profile.map(|item| item.channels).unwrap_or(0);
+            let Some(profile) = logicview_hal::logic_profile(pid) else {
                 return Err(EngineError::UnknownDevice(format!(
-                    "{id} ({name}, {channels} channels) is not opened: no hardware test for this product id"
+                    "{id} (unknown product, 0 channels) is not opened: no hardware test for this product id"
+                )));
+            };
+            let canonical = format!("usb:{:04x}:{:04x}", logicview_hal::VENDOR_ID, pid);
+            if !profile.hardware_tested || id != canonical {
+                return Err(EngineError::UnknownDevice(format!(
+                    "{id} ({}, {} channels) is not opened: no hardware test for this product id",
+                    profile.name, profile.channels
                 )));
             }
-            let pod =
-                logicview_hal::Pod::open().map_err(|err| EngineError::Device(err.to_string()))?;
+            let pod = logicview_hal::Pod::open_product(Some(pid))
+                .map_err(|err| EngineError::Device(err.to_string()))?;
             let info = DeviceInfo {
                 id: id.into(),
                 name: format!(
-                    "DSLogic Plus fw {}.{} ({:04x}:{:04x})",
+                    "{} fw {}.{} ({:04x}:{:04x})",
+                    profile.name,
                     pod.firmware_major,
                     pod.firmware_minor,
                     logicview_hal::VENDOR_ID,
-                    logicview_hal::PLUS_PID
+                    pid
                 ),
                 kind: "usb".into(),
                 connected: true,
@@ -337,12 +342,18 @@ impl Engine {
                 let mut state = self.shared.state.lock().await;
                 state.device = id.into();
             }
-            self.use_pod_channels(0xFFFF).await;
+            let mask = if profile.channels >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << profile.channels) - 1
+            };
+            self.use_pod_channels(mask, id, profile.name).await;
             return Ok(info);
         }
         Err(EngineError::UnknownDevice(format!(
-            "unknown device {id}; open demo, demo:spi, or a tested Plus ({})",
-            logicview_hal::DEVICE_ID
+            "unknown device {id}; open demo, demo:spi, or a tested pod ({}, {})",
+            logicview_hal::DEVICE_ID,
+            logicview_hal::U3_DEVICE_ID
         )))
     }
 
@@ -713,43 +724,73 @@ impl Engine {
             discard,
             continuous,
             header_wait,
+            product_id,
         ) = {
             let mut state = self.shared.state.lock().await;
-            let config = state.slot(&id)?.session.config.clone();
-            let mask = if config.channel_enable == 0 {
-                0xFFFF
-            } else {
-                config.channel_enable
-            };
-            logicview_hal::plan_clock(
-                config.sample_rate_hz,
-                mask,
-                config.depth == DepthMode::Stream,
-            )
-            .map_err(|err| {
-                EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
-            })?;
-            let clock = HostClock {
-                hw_max_hz: logicview_hal::HW_CLOCK_HZ,
-                half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
-                quarter_rate_hz: Some(logicview_hal::QUARTER_RATE_HZ),
-            };
-            let slot = state.slot_mut(&id)?;
-            let samples = slot.session.prepare(config.clone(), mode, 16, clock)?;
-            if slot.catalog_names.is_empty() {
-                remember_catalog(slot);
-            }
-            let (names, colors) = pod_channel_style(mask);
-            let device_id = slot
+            let slot_ref = state.slot(&id)?;
+            let config = slot_ref.session.config.clone();
+            let device_id = slot_ref
                 .devices
                 .first()
                 .map(|device| device.id.clone())
                 .unwrap_or_else(|| logicview_hal::DEVICE_ID.to_string());
-            let device_name = slot
+            let device_name = slot_ref
                 .devices
                 .first()
                 .map(|device| device.name.clone())
                 .unwrap_or_else(|| "DSLogic Plus".to_string());
+            let pid = usb_product_id(&device_id).unwrap_or(logicview_hal::PLUS_PID);
+            let profile_channels = logicview_hal::logic_profile(pid)
+                .map(|profile| usize::from(profile.channels))
+                .unwrap_or(16);
+            let mask = if config.channel_enable == 0 {
+                if profile_channels >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << profile_channels) - 1
+                }
+            } else {
+                config.channel_enable
+            };
+            let clock = if pid == logicview_hal::U3PRO32_PID {
+                let planned = logicview_hal::plan_u3_clock(
+                    config.sample_rate_hz,
+                    mask,
+                    config.depth == DepthMode::Stream,
+                )
+                .map_err(|err| {
+                    EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
+                })?;
+                HostClock {
+                    hw_max_hz: planned.hw_max_hz,
+                    half_rate_hz: None,
+                    quarter_rate_hz: None,
+                    pre_divider: planned.pre_divider,
+                }
+            } else {
+                logicview_hal::plan_clock(
+                    config.sample_rate_hz,
+                    mask,
+                    config.depth == DepthMode::Stream,
+                )
+                .map_err(|err| {
+                    EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
+                })?;
+                HostClock {
+                    hw_max_hz: logicview_hal::HW_CLOCK_HZ,
+                    half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
+                    quarter_rate_hz: Some(logicview_hal::QUARTER_RATE_HZ),
+                    pre_divider: 1,
+                }
+            };
+            let slot = state.slot_mut(&id)?;
+            let samples = slot
+                .session
+                .prepare(config.clone(), mode, profile_channels, clock)?;
+            if slot.catalog_names.is_empty() {
+                remember_catalog(slot);
+            }
+            let (names, colors) = pod_channel_style(mask);
             slot.origins = names
                 .iter()
                 .map(|_| ChannelOrigin {
@@ -776,7 +817,11 @@ impl Engine {
                 image,
                 u64::from(mask.count_ones()),
                 samples,
-                Some(logicview_hal::threshold_code(config.threshold_volts)),
+                if pid == logicview_hal::U3PRO32_PID {
+                    None
+                } else {
+                    Some(logicview_hal::threshold_code(config.threshold_volts))
+                },
                 config.depth == DepthMode::Stream,
                 config.run,
                 Duration::from_millis(config.repeat_interval_ms),
@@ -788,6 +833,7 @@ impl Engine {
                     let secs = samples / config.sample_rate_hz.max(1) + 3;
                     Duration::from_secs(secs.min(120))
                 },
+                Some(pid),
             )
         };
         let shared = Arc::clone(&self.shared);
@@ -808,6 +854,7 @@ impl Engine {
                 discard,
                 continuous,
                 header_wait,
+                product_id,
             )
             .await;
         });
@@ -1123,7 +1170,7 @@ impl Engine {
         Ok(slot.status(is_active))
     }
 
-    async fn use_pod_channels(&self, mask: u32) {
+    async fn use_pod_channels(&self, mask: u32, device_id: &str, device_name: &str) {
         let mut state = self.shared.state.lock().await;
         let active = state.active;
         if let Some(slot) = state.slots.get_mut(active) {
@@ -1132,15 +1179,15 @@ impl Engine {
             }
             let (names, colors) = pod_channel_style(mask);
             slot.devices = vec![BoundDevice {
-                id: logicview_hal::DEVICE_ID.into(),
-                name: "DSLogic Plus".into(),
+                id: device_id.into(),
+                name: device_name.into(),
                 kind: "usb".into(),
             }];
             slot.origins = names
                 .iter()
                 .map(|_| ChannelOrigin {
-                    device_id: logicview_hal::DEVICE_ID.into(),
-                    device_name: "DSLogic Plus".into(),
+                    device_id: device_id.into(),
+                    device_name: device_name.into(),
                 })
                 .collect();
             slot.channel_names = names;
@@ -1492,8 +1539,8 @@ fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {
     ];
     let mut names = Vec::new();
     let mut colors = Vec::new();
-    for bit in 0..16 {
-        if mask & (1 << bit) != 0 {
+    for bit in 0..32 {
+        if mask & (1u32 << bit) != 0 {
             names.push(format!("D{bit}"));
             colors.push(COLORS[bit % COLORS.len()].to_string());
         }

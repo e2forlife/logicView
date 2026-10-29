@@ -199,6 +199,9 @@ async fn usb_connect_is_refused() {
         .any(|profile| { profile.product_id == 0x0020 && profile.hardware_tested }));
     assert!(profiles
         .iter()
+        .any(|profile| profile.product_id == 0x002C && profile.hardware_tested));
+    assert!(profiles
+        .iter()
         .any(|profile| profile.product_id == 0x0034 && !profile.hardware_tested));
 }
 
@@ -476,4 +479,23 @@ async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
         engine.search_edge(None, 0, 0, true, true).await.unwrap(),
         Some(50)
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+async fn plugged_in_u3pro32_is_listed_before_demo_devices() {
+    let engine = Engine::new();
+    let devices = engine.list_devices().await;
+    assert_eq!(
+        devices.first().map(|device| device.id.as_str()),
+        Some("usb:2a0e:002c")
+    );
+    assert!(devices.iter().any(|device| device.kind == "demo"));
+    let info = engine.connect("usb:2a0e:002c").await.expect("connect");
+    assert!(info.name.contains("U3Pro32"), "{}", info.name);
+    let status = engine.status(None).await.unwrap();
+    assert_eq!(status.channels.len(), 32);
+    assert_eq!(status.channels[0].name, "D0");
+    assert_eq!(status.channels[31].name, "D31");
+    assert_eq!(status.devices[0].id, "usb:2a0e:002c");
 }

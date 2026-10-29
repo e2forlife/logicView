@@ -1,4 +1,4 @@
-//! Arm, header, and sample upload for one Plus capture.
+//! Arm, header, and sample upload for one capture on a tested pod.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use logicview_proto::{
     actual_payload_bytes, actual_sample_count, parse_logic_header, LogicHeader, ProtoError,
     LOGIC_HEADER_LEN, LOGIC_HEADER_TRANSFER,
 };
-use nusb::transfer::{Bulk, Buffer, In};
+use nusb::transfer::{Buffer, Bulk, In};
 
 use crate::device::Pod;
 use crate::HalError;
@@ -36,6 +36,8 @@ pub struct CaptureJob {
     /// Stop after this many sample bytes and return them. `None` reads the
     /// budget the header describes.
     pub sample_limit: Option<u64>,
+    /// Open this product. `None` opens the first tested pod.
+    pub product_id: Option<u16>,
 }
 
 /// How an early stop treats samples still in the pod.
@@ -71,7 +73,10 @@ pub fn run_capture(
     if job.enabled_channels == 0 {
         return Err(HalError::Message("no channels enabled".into()));
     }
-    let pod = Pod::open()?;
+    let pod = match job.product_id {
+        Some(pid) => Pod::open_product(Some(pid))?,
+        None => Pod::open()?,
+    };
     if let Some(code) = job.threshold {
         pod.set_threshold(code)?;
     }
@@ -97,6 +102,7 @@ pub fn run_capture(
     let mut discarded = false;
     let mut limit_after_stop: Option<u64> = None;
     let mut filler = 0u32;
+    let mut leader = pod.sample_leader();
     let overall = std::time::Instant::now() + job.header_wait + Duration::from_secs(4);
     let mut deadline = std::time::Instant::now() + job.header_wait;
 
@@ -164,9 +170,7 @@ pub fn run_capture(
                     {
                         filler += 1;
                         if filler > 8 {
-                            failed = Some(HalError::Interrupted(
-                                "header fill stayed 0x55".into(),
-                            ));
+                            failed = Some(HalError::Interrupted("header fill stayed 0x55".into()));
                             break;
                         }
                         if ep.pending() < 4 {
@@ -199,12 +203,21 @@ pub fn run_capture(
                 }
 
                 let budget = read_budget(job, expected_bytes, limit_after_stop);
+                let packet = &done.buffer[..done.actual_len];
+                let payload = take_after_leader(&mut leader, packet);
+                if payload.is_empty() {
+                    if done.actual_len >= LOGIC_HEADER_TRANSFER && ep.pending() < 4 {
+                        ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
+                    }
+                    deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    continue;
+                }
                 let room = budget.saturating_sub(kept);
                 if room == 0 {
                     break;
                 }
-                let take = done.actual_len.min(room as usize);
-                pending.extend_from_slice(&done.buffer[..take]);
+                let take = payload.len().min(room as usize);
+                pending.extend_from_slice(&payload[..take]);
                 kept += take as u64;
                 let whole = pending.len() / atom * atom;
                 if whole > 0 {
@@ -295,6 +308,19 @@ fn budget_bytes(job: &CaptureJob, header: &LogicHeader) -> u64 {
     actual_payload_bytes(samples, job.enabled_channels)
 }
 
+/// Drop the fixed leader in front of the sample bytes.
+///
+/// The length is a bulk packet, not a run of zeros. An all-low capture stays
+/// aligned once that packet has been discarded.
+fn take_after_leader<'a>(leader: &mut u64, packet: &'a [u8]) -> &'a [u8] {
+    if *leader == 0 {
+        return packet;
+    }
+    let drop_n = (*leader as usize).min(packet.len());
+    *leader -= drop_n as u64;
+    &packet[drop_n..]
+}
+
 #[cfg(test)]
 mod hw {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -335,6 +361,7 @@ mod hw {
             abort_after_header: false,
             header_wait: Duration::from_secs(3),
             sample_limit: None,
+            product_id: Some(crate::PLUS_PID),
         }
     }
 
@@ -353,7 +380,11 @@ mod hw {
         if bytes.iter().all(|byte| *byte == 0xFF) {
             return "floating inputs 0xFF".into();
         }
-        let shown: Vec<String> = bytes.iter().take(8).map(|byte| format!("{byte:02X}")).collect();
+        let shown: Vec<String> = bytes
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
         format!("mixed {}", shown.join(" "))
     }
 
@@ -393,13 +424,22 @@ mod hw {
     }
 
     fn reopen(label: &str) {
-        let (report, bytes) = take(&job(256, ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST, false));
+        let (report, bytes) = take(&job(
+            256,
+            ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST,
+            false,
+        ));
         assert!(
-            report.header.is_some_and(|header| header.check_word == 0x5555_5555),
+            report
+                .header
+                .is_some_and(|header| header.check_word == 0x5555_5555),
             "{label} reopen header"
         );
         assert_eq!(report.sample_bytes, 32, "{label} reopen length");
-        assert!(bytes.iter().all(|byte| *byte == 0xAA), "{label} reopen pattern");
+        assert!(
+            bytes.iter().all(|byte| *byte == 0xAA),
+            "{label} reopen pattern"
+        );
     }
 
     #[test]
@@ -439,6 +479,57 @@ mod hw {
         let again = run_capture(&job(256, ModeFlags::INSTANT, false), |_| Ok(())).expect("reopen");
         assert_eq!(again.header.unwrap().check_word, 0x5555_5555);
         assert_eq!(again.sample_bytes, 32);
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+    fn u3pro32_short_buffer_returns_check_word_and_samples() {
+        let _pod = pod_lock();
+        let listed = crate::list_pods().expect("scan");
+        let wide = listed
+            .iter()
+            .find(|pod| pod.product_id == crate::U3PRO32_PID)
+            .expect("u3pro32 listed");
+        assert_eq!(wide.id, crate::U3_DEVICE_ID);
+
+        {
+            let pod = Pod::open_product(Some(crate::U3PRO32_PID)).expect("open");
+            assert_eq!(pod.product_id(), crate::U3PRO32_PID);
+            pod.reload_fpga().expect("fpga reload");
+            let status = pod.status().expect("status");
+            assert!(
+                status & (1 << 6) != 0,
+                "DONE after reload, status {status:#04x}, speed {:?}",
+                pod.speed()
+            );
+            assert_eq!(
+                pod.sample_leader(),
+                crate::U3_HS_SAMPLE_LEADER,
+                "high-speed leader, speed {:?}",
+                pod.speed()
+            );
+        }
+
+        let mut bytes = Vec::new();
+        // 4096 samples is one high-speed payload packet. A 256-sample
+        // internal test on this pod ends in a few bytes of previous memory.
+        let report = run_capture(&u3_job(4096), |event| {
+            if let CaptureEvent::Samples(chunk) = event {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(())
+        })
+        .expect("internal-test capture");
+        assert_eq!(report.header.unwrap().check_word, 0x5555_5555);
+        assert_eq!(bytes.len(), 512, "4096 samples on one channel is 512 bytes");
+        assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
+    }
+
+    fn u3_job(samples: u64) -> CaptureJob {
+        let mut capture = armed(samples, ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST, 200);
+        capture.product_id = Some(crate::U3PRO32_PID);
+        capture.threshold = None;
+        capture
     }
 
     #[test]
@@ -491,8 +582,14 @@ mod hw {
         let (first, first_bytes) = take(&armed(1_024, internal, 100));
         std::thread::sleep(Duration::from_millis(150));
         let (second, second_bytes) = take(&armed(1_024, internal, 100));
-        assert!(first.sample_bytes > 0 && second.sample_bytes > 0, "repeat samples");
-        assert!(!second_bytes.is_empty(), "repeat stop retained the second record");
+        assert!(
+            first.sample_bytes > 0 && second.sample_bytes > 0,
+            "repeat samples"
+        );
+        assert!(
+            !second_bytes.is_empty(),
+            "repeat stop retained the second record"
+        );
         assert_eq!(first_bytes.len(), second_bytes.len());
         reopen("repeat");
 
@@ -521,11 +618,8 @@ mod hw {
 
         eprintln!("-- one-sample filter --");
         let (plain, plain_bytes) = take(&armed(1_024, internal, 100));
-        let (filtered, filtered_bytes) = take(&armed(
-            1_024,
-            internal | ModeFlags::ONE_SAMPLE_FILTER,
-            100,
-        ));
+        let (filtered, filtered_bytes) =
+            take(&armed(1_024, internal | ModeFlags::ONE_SAMPLE_FILTER, 100));
         assert!(plain.sample_bytes > 0 && filtered.sample_bytes > 0);
         eprintln!(
             "filter off={} on={}",
@@ -559,10 +653,7 @@ mod hw {
         }
         let warning_text = warning.clone().unwrap_or_default();
         if rle_header.remaining > 0 {
-            assert!(
-                warning_text.contains("RLE shortfall"),
-                "{warning_text}"
-            );
+            assert!(warning_text.contains("RLE shortfall"), "{warning_text}");
         }
         reopen("rle");
 
@@ -617,5 +708,26 @@ fn cancel(ep: &mut nusb::Endpoint<Bulk, In>) {
         if ep.wait_next_complete(Duration::from_millis(50)).is_none() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod leader {
+    use super::take_after_leader;
+
+    #[test]
+    fn the_leader_is_one_packet_and_later_zeros_stay() {
+        let mut leader = 512u64;
+        let packet = vec![0u8; 512];
+        assert!(take_after_leader(&mut leader, &packet).is_empty());
+        assert_eq!(leader, 0);
+        let samples = [0x00, 0xAA, 0xAA];
+        assert_eq!(take_after_leader(&mut leader, &samples), &samples);
+
+        let mut leader = 512u64;
+        let low = [0x00, 0x00];
+        assert_eq!(take_after_leader(&mut leader, &low), &[]);
+        assert_eq!(leader, 510);
+        assert_eq!(take_after_leader(&mut leader, &low), &low[..0]);
     }
 }
