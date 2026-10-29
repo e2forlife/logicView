@@ -39,6 +39,8 @@ const state = {
   menu: null,
   cursors: [null, null],
   devices: [],
+  probes: [],
+  edgeChannel: null,
   annotations: [],
   tableTab: "decoded",
   gutterSig: "",
@@ -66,6 +68,7 @@ const settings = {
   pattern: "10",
   device: "demo",
   deviceName: "Demo",
+  channelEnable: 0,
 };
 
 const views = {};
@@ -171,7 +174,17 @@ function applyStatus(status, fromLive) {
   state.rate = status.sample_rate_hz || state.rate;
   state.durationMs = status.duration_ms || state.durationMs;
   if (status.channels) state.channels = status.channels;
+  if (status.probes) state.probes = status.probes;
+  if (typeof status.channel_enable === "number") settings.channelEnable = status.channel_enable;
   if (status.analog) state.analog = status.analog;
+  const channelSig = (state.channels || []).map((channel) => channel.name).join("|");
+  if (channelSig !== state.channelSig) {
+    state.channelSig = channelSig;
+    view().customHeights = false;
+    view().heights = {};
+    state.gutterSig = "";
+    if (state.tab === "device") selectTab("device");
+  }
   if (status.devices) {
     state.devices = status.devices;
     settings.deviceName = status.devices.map((device) => device.name).join(" + ") || settings.deviceName;
@@ -351,17 +364,74 @@ function startChannelDrag(key, startY) {
   window.addEventListener("pointerup", up);
 }
 
+function rowMetrics() {
+  const rows = orderedRows();
+  const stage = document.querySelector(".wave-stage");
+  const viewport = Math.max(1, stage ? stage.clientHeight : 1);
+  const v = view();
+  if (!v.heights) v.heights = {};
+  if (!v.customHeights) {
+    const count = Math.max(1, rows.length);
+    const base = Math.floor(viewport / count);
+    let used = 0;
+    rows.forEach((row, index) => {
+      const height = index === rows.length - 1 ? Math.max(28, viewport - used) : Math.max(28, base);
+      v.heights[row.key] = height;
+      used += Math.max(28, base);
+    });
+  } else {
+    for (const row of rows) {
+      if (!v.heights[row.key]) v.heights[row.key] = 64;
+    }
+  }
+  let top = 0;
+  const layout = rows.map((row) => {
+    const height = Math.max(28, v.heights[row.key] || 64);
+    const item = { row, top, height };
+    top += height;
+    return item;
+  });
+  return { layout, total: Math.max(1, top), viewport };
+}
+
+function startRowResize(key, startY) {
+  const v = view();
+  v.customHeights = true;
+  const start = v.heights[key] || 64;
+  const move = (ev) => {
+    const y = ev.clientY;
+    v.heights[key] = Math.max(28, Math.min(420, Math.round(start + (y - startY))));
+    state.gutterSig = "";
+    renderGutter();
+    drawWave();
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move);
+    window.removeEventListener("mouseup", up);
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+  };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
 function renderGutter() {
   const rows = orderedRows();
+  const metrics = rowMetrics();
   const selected = view().selected;
-  const sig = rows.map((row) => row.key + row.color + (state.hidden.has(row.key) ? "0" : "1") + (row.key === selected ? "s" : "")).join("|");
+  const sig = metrics.layout.map((item) => item.row.key + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
-  for (const row of rows) {
+  for (const item of metrics.layout) {
+    const row = item.row;
     const el = document.createElement("div");
     el.className = "ch" + (row.key === selected ? " selected" : "") + (state.hidden.has(row.key) ? " dim" : "");
     el.dataset.key = row.key;
+    el.style.height = item.height + "px";
+    el.style.flex = "none";
     el.title = row.device ? `${row.name} · ${row.device} · drag to reorder` : "Drag to reorder";
     const bar = document.createElement("span");
     bar.className = "bar";
@@ -387,9 +457,18 @@ function renderGutter() {
       renderGutter();
       scheduleTiles();
     });
-    el.append(bar, name, kind, eye);
+    const handle = document.createElement("div");
+    handle.className = "row-resize";
+    handle.title = "Drag to resize this row";
+    handle.addEventListener("mousedown", (ev) => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      startRowResize(row.key, ev.clientY);
+    });
+    el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
-      if (ev.button !== 0 || ev.target.closest("button")) return;
+      if (ev.button !== 0 || ev.target.closest("button, .row-resize")) return;
       startChannelDrag(row.key, ev.clientY);
     });
     gutter.appendChild(el);
@@ -415,10 +494,11 @@ function moveChannel(fromKey, toKey) {
   drawWave();
 }
 
-function prep(canvas) {
+function prep(canvas, forceHeight) {
   const dpr = window.devicePixelRatio || 1;
   const w = Math.max(1, canvas.clientWidth);
-  const h = Math.max(1, canvas.clientHeight);
+  if (forceHeight) canvas.style.height = forceHeight + "px";
+  const h = Math.max(1, forceHeight || canvas.clientHeight);
   const bw = Math.floor(w * dpr);
   const bh = Math.floor(h * dpr);
   if (canvas.width !== bw || canvas.height !== bh) {
@@ -484,12 +564,13 @@ function drawDiamond(ctx, x, y, color) {
 }
 
 function drawWave() {
-  const { ctx, w, h } = prep(wave);
+  const metrics = rowMetrics();
+  const { ctx, w, h } = prep(wave, metrics.total);
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#0b0f14";
   ctx.fillRect(0, 0, w, h);
-  const rows = orderedRows();
-  if (state.total <= 0 || rows.length === 0) {
+  const layout = metrics.layout;
+  if (state.total <= 0 || layout.length === 0) {
     ctx.fillStyle = "#8b95a6";
     ctx.font = "14px sans-serif";
     ctx.textAlign = "center";
@@ -497,40 +578,54 @@ function drawWave() {
     ctx.fillText("Press Run to capture the demo source", w / 2, h / 2);
     return;
   }
-  const rowH = h / rows.length;
-  drawGrid(ctx, w, h, rows, rowH);
+  drawGrid(ctx, w, h, layout);
   const endX = traceEndX(w);
   ctx.save();
   ctx.beginPath();
   ctx.rect(0, 0, Math.max(0, endX), h);
   ctx.clip();
-  rows.forEach((row, index) => {
-    const top = index * rowH;
-    if (state.hidden.has(row.key)) return;
+  for (const item of layout) {
+    const row = item.row;
+    if (state.hidden.has(row.key)) continue;
     const cols = state.tiles[row.key];
-    if (!cols) return;
-    if (row.kind === "analog") drawAnalog(ctx, cols, top, rowH, row.color);
-    else drawDigital(ctx, cols, top, rowH, row.color);
-  });
+    if (!cols) continue;
+    if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
+    else drawDigital(ctx, cols, item.top, item.height, row.color);
+  }
   drawAnnotations(ctx, w);
   ctx.restore();
-  rows.forEach((row, index) => {
-    if (row.kind !== "logic" || state.hidden.has(row.key)) return;
-    const top = index * rowH;
-    const pad = Math.max(8, rowH * 0.22);
+  for (const item of layout) {
+    const row = item.row;
+    if (row.kind !== "logic" || state.hidden.has(row.key)) continue;
+    const top = item.top;
+    const pad = Math.max(8, item.height * 0.22);
     ctx.font = "11px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.lineWidth = 3;
     ctx.strokeStyle = "rgba(8, 12, 18, 0.9)";
     ctx.strokeText("H", 8, top + pad);
-    ctx.strokeText("L", 8, top + rowH - pad);
+    ctx.strokeText("L", 8, top + item.height - pad);
     ctx.fillStyle = "#d5deea";
     ctx.fillText("H", 8, top + pad);
-    ctx.fillText("L", 8, top + rowH - pad);
-  });
+    ctx.fillText("L", 8, top + item.height - pad);
+  }
   drawMeasureSpan(ctx, w, h);
   drawMarkerLines(ctx, h);
+  if (pointer && pointer.kind === "cursors") {
+    const v = view();
+    ctx.save();
+    ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = "#8eb6ff";
+    for (const sample of [pointer.a, pointer.b]) {
+      const x = (sample - v.start) / v.spp;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, 0);
+      ctx.lineTo(x + 0.5, h);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
   if (state.hoverX != null) {
     ctx.strokeStyle = "rgba(255,255,255,0.28)";
     ctx.beginPath();
@@ -540,7 +635,7 @@ function drawWave() {
   }
 }
 
-function drawGrid(ctx, w, h, rows, rowH) {
+function drawGrid(ctx, w, h, layout) {
   const v = view();
   ctx.save();
   ctx.lineWidth = 1;
@@ -560,8 +655,10 @@ function drawGrid(ctx, w, h, rows, rowH) {
       }
     }
   }
-  rows.forEach((row, index) => {
-    const top = index * rowH;
+  for (const item of layout) {
+    const row = item.row;
+    const top = item.top;
+    const rowH = item.height;
     ctx.strokeStyle = "rgba(255,255,255,0.045)";
     ctx.beginPath();
     ctx.moveTo(0, top + 0.5);
@@ -591,7 +688,7 @@ function drawGrid(ctx, w, h, rows, rowH) {
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
     }
-  });
+  }
   ctx.restore();
 }
 
@@ -813,12 +910,15 @@ function scheduleTiles() {
 }
 
 async function runTiles() {
-  while (tileAgain) {
-    tileAgain = false;
-    await fetchTiles();
+  try {
+    while (tileAgain) {
+      tileAgain = false;
+      await fetchTiles();
+    }
+  } finally {
+    tileFlight = false;
+    if (tileAgain) scheduleTiles();
   }
-  tileFlight = false;
-  if (tileAgain) scheduleTiles();
 }
 
 async function fetchTiles() {
@@ -827,20 +927,21 @@ async function fetchTiles() {
   const v = view();
   const req = ++state.req;
   const spp = Math.max(v.spp, 1e-9);
+  const start = v.start;
   if (rows.length === 0) {
     state.tiles = {};
     drawWave();
     drawRuler();
     return;
   }
-  const pending = { req, got: {}, expect: rows.length };
+  const pending = { req, got: {}, expect: rows.length, start, spp, width };
   state.pending = pending;
   const bodies = rows.map((row) => ({
     cmd: "tile",
     req,
     session: state.active,
     channel: row.channel,
-    start: v.start,
+    start,
     columns: width,
     samples_per_pixel: spp,
     kind: row.kind,
@@ -849,23 +950,35 @@ async function fetchTiles() {
   const sent = socket && socket.readyState === WebSocket.OPEN;
   if (sent) {
     await new Promise((resolve) => {
-      pending.done = resolve;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (pending.timer) clearTimeout(pending.timer);
+        resolve();
+      };
+      pending.done = finish;
       pending.timer = setTimeout(async () => {
         if (state.req === req && Object.keys(pending.got).length < rows.length) {
           await httpTiles(req, bodies, pending);
         }
-        resolve();
+        finish();
       }, 280);
       for (const body of bodies) socket.send(JSON.stringify(body));
-      if (Object.keys(pending.got).length >= rows.length) {
-        clearTimeout(pending.timer);
-        resolve();
-      }
+      if (Object.keys(pending.got).length >= rows.length) finish();
     });
   } else {
     await httpTiles(req, bodies, pending);
   }
   if (state.req !== req) return;
+  const now = view();
+  const sameView = now.start === start
+    && now.spp === spp
+    && Math.max(1, Math.floor(wave.clientWidth || 1)) === width;
+  if (!sameView) {
+    tileAgain = true;
+    return;
+  }
   if (Object.keys(pending.got).length) {
     state.tiles = pending.got;
     drawWave();
@@ -874,14 +987,14 @@ async function fetchTiles() {
 }
 
 async function httpTiles(req, bodies, pending) {
-  const results = await Promise.all(bodies.map(async (body) => {
-    const data = await api(body);
-    return { key: body.key, columns: data.columns };
+  await Promise.all(bodies.map(async (body) => {
+    if (pending.got[body.key]) return;
+    try {
+      const data = await api(body);
+      if (state.req !== req) return;
+      pending.got[body.key] = data.columns;
+    } catch (_) { /* a channel left out of this capture has no tile */ }
   }));
-  if (state.req !== req) return;
-  for (const result of results) pending.got[result.key] = result.columns;
-  if (pending.timer) clearTimeout(pending.timer);
-  if (pending.done) pending.done();
 }
 
 function onTileFrame(frame) {
@@ -907,13 +1020,14 @@ function parseFrame(buffer) {
   const columns = [];
   if (kind === 1) {
     for (let i = 0; i < count; i++) {
-      const o = 32 + i * 4;
-      if (o + 4 > buffer.byteLength) break;
+      const o = 32 + i * 5;
+      if (o + 5 > buffer.byteLength) break;
       columns.push({
         first: viewBytes.getUint8(o) !== 0,
         last: viewBytes.getUint8(o + 1) !== 0,
         toggled: viewBytes.getUint8(o + 2) !== 0,
         edges: viewBytes.getUint8(o + 3),
+        valid: viewBytes.getUint8(o + 4) !== 0,
       });
     }
   } else {
@@ -1003,6 +1117,7 @@ async function runCapture() {
       trigger_kind: settings.triggerKind,
       trigger_channel: settings.triggerChannel,
       trigger_steps: settings.triggerSteps,
+      channel_enable: settings.channelEnable,
     });
     applyStatus(status, false);
     const started = await api({ cmd: "start", session: state.active, instant: false });
@@ -1061,7 +1176,7 @@ function panelHtml(name) {
     return `<h2>Cursors</h2>
       <h3>Markers</h3>
       <div id="marker-list"></div>
-      <p class="hint">Add a marker from the toolbar, then click the waveform. Drag a marker to move it; it snaps to the nearest edge under the cursor.</p>
+      <p class="hint">The cursor tool places one cursor, or a pair if Pair is selected. Drag a cursor to move it. The waveform keeps the M1, M2, … labels. Names stay in this list.</p>
       <h3>Cursor pair</h3>
       <button class="block" id="cur-a" type="button">Cursor A at hover</button>
       <button class="block" id="cur-b" type="button">Cursor B at hover</button>
@@ -1144,6 +1259,9 @@ function devicePanel() {
       </select>
     </label>
     <div class="acq-row"><span>Digital channels</span><span class="value">${state.channels.length} · ${logic}</span></div>
+    <h3>Sample</h3>
+    <div id="channel-enable">${channelChecks(state.probes.length ? state.probes : state.channels)}</div>
+    <p class="hint">Unchecked channels are left out of the next capture.</p>
     <div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>
     <label class="acq-row">Input voltage
       <select id="set-threshold" aria-label="Input voltage">
@@ -1197,6 +1315,13 @@ function devicePanel() {
     </details>`;
 }
 
+function channelChecks(probes) {
+  return probes.map((probe) => {
+    const on = settings.channelEnable === 0 || (settings.channelEnable & (1 << probe.index)) !== 0;
+    return `<label class="check"><input type="checkbox" data-bit="${probe.index}"${on ? " checked" : ""}> ${probe.name}</label>`;
+  }).join("");
+}
+
 function bindPanel(name) {
   if (name === "device") {
     loadDeviceChoices();
@@ -1240,6 +1365,21 @@ function bindPanel(name) {
       const toolbar = document.getElementById("trig-percent");
       if (toolbar) toolbar.value = String(settings.percent);
     });
+    const sampleBoxes = [...document.querySelectorAll("#channel-enable input")];
+    const writeSampleMask = () => {
+      const checked = sampleBoxes.filter((box) => box.checked);
+      if (!checked.length && sampleBoxes[0]) sampleBoxes[0].checked = true;
+      if (sampleBoxes.every((box) => box.checked)) {
+        settings.channelEnable = 0;
+        return;
+      }
+      let mask = 0;
+      for (const box of sampleBoxes) {
+        if (box.checked) mask |= 1 << Number(box.dataset.bit);
+      }
+      settings.channelEnable = mask;
+    };
+    for (const box of sampleBoxes) box.addEventListener("change", writeSampleMask);
     bindCheck("set-rle", "rle");
     bindCheck("set-filter", "filter");
     bindCheck("set-ext", "extClock");
@@ -1320,6 +1460,12 @@ function renderMarkerList() {
     const label = document.createElement("span");
     const seconds = marker.sample / Math.max(1, state.rate);
     label.textContent = `M${marker.n} · ${formatSeconds(seconds)} · sample ${marker.sample}`;
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.value = marker.name || "";
+    nameInput.placeholder = "Name";
+    nameInput.setAttribute("aria-label", `Name for M${marker.n}`);
+    nameInput.addEventListener("input", () => { marker.name = nameInput.value; });
     const jump = document.createElement("button");
     jump.type = "button";
     jump.textContent = "Show";
@@ -1333,7 +1479,7 @@ function renderMarkerList() {
       drawWave();
       drawRuler();
     });
-    row.append(dot, label, jump, remove);
+    row.append(dot, label, nameInput, jump, remove);
     host.appendChild(row);
   });
 }
@@ -1390,6 +1536,9 @@ function syncDeviceSelect() {
   if (!select || !select.options.length) return;
   const key = (state.devices || []).map((device) => device.id).join("+");
   if ([...select.options].some((option) => option.value === key)) select.value = key;
+  const chosen = [...select.options].find((option) => option.value === select.value);
+  const name = document.getElementById("device-name");
+  if (name && chosen) name.textContent = chosen.textContent;
 }
 
 async function loadDeviceChoices() {
@@ -1579,11 +1728,57 @@ function sampleAt(clientX) {
 
 function rowAt(clientY) {
   const rect = wave.getBoundingClientRect();
-  const rows = orderedRows();
-  if (!rows.length) return null;
   const y = clientY - rect.top;
-  const index = Math.min(rows.length - 1, Math.max(0, Math.floor(y / (rect.height / rows.length))));
-  return rows[index];
+  const { layout } = rowMetrics();
+  if (!layout.length) return null;
+  for (const item of layout) {
+    if (y >= item.top && y < item.top + item.height) return item.row;
+  }
+  return layout[layout.length - 1].row;
+}
+
+function boundaryAt(clientY) {
+  const rect = wave.getBoundingClientRect();
+  const y = clientY - rect.top;
+  const { layout } = rowMetrics();
+  for (let index = 0; index < layout.length - 1; index++) {
+    const edge = layout[index].top + layout[index].height;
+    if (Math.abs(y - edge) <= 4) return layout[index].row.key;
+  }
+  return null;
+}
+
+function placeEdgeButtons(clientY) {
+  state.edgePointerY = clientY;
+  const prev = document.getElementById("edge-prev");
+  const next = document.getElementById("edge-next");
+  const stage = document.querySelector(".wave-stage");
+  const row = rowAt(clientY);
+  if (!prev || !next || !stage || !row || row.kind !== "logic" || state.total <= 0) {
+    hideEdgeButtons();
+    return;
+  }
+  const item = rowMetrics().layout.find((entry) => entry.row.key === row.key);
+  if (!item) {
+    hideEdgeButtons();
+    return;
+  }
+  const mid = item.top + item.height / 2 - stage.scrollTop;
+  if (mid < 10 || mid > stage.clientHeight - 10) {
+    hideEdgeButtons();
+    return;
+  }
+  state.edgeChannel = row.channel;
+  prev.style.top = mid + "px";
+  next.style.top = mid + "px";
+  prev.classList.remove("hidden");
+  next.classList.remove("hidden");
+}
+
+function hideEdgeButtons() {
+  state.edgeChannel = null;
+  document.getElementById("edge-prev")?.classList.add("hidden");
+  document.getElementById("edge-next")?.classList.add("hidden");
 }
 
 function activeLogicChannel() {
@@ -1666,9 +1861,9 @@ async function searchPattern(forward) {
   }
 }
 
-async function stepEdge(forward) {
+async function stepEdge(forward, channel) {
   if (state.total <= 0) return;
-  const channel = activeLogicChannel();
+  if (channel == null) channel = state.edgeChannel == null ? activeLogicChannel() : state.edgeChannel;
   const from = state.hoverX == null
     ? Math.floor(view().start + wave.clientWidth * view().spp * 0.5)
     : hoverSample();
@@ -1839,6 +2034,7 @@ function placeMarker(sample, channel) {
     n: state.nextMarker,
     sample,
     channel,
+    name: "",
   };
   state.nextMarker += 1;
   view().markers.push(marker);
@@ -1905,7 +2101,13 @@ function zoomBy(factor) {
 }
 
 wave.addEventListener("pointerdown", (ev) => {
-  if (ev.button !== 0 || state.total <= 0) return;
+  if (ev.button !== 0) return;
+  const boundary = state.total > 0 ? boundaryAt(ev.clientY) : null;
+  if (boundary && state.tool !== "marker" && state.tool !== "measure") {
+    startRowResize(boundary, ev.clientY);
+    return;
+  }
+  if (state.total <= 0) return;
   const rect = wave.getBoundingClientRect();
   const x = ev.clientX - rect.left;
   const existing = markerAt(x);
@@ -1917,6 +2119,13 @@ wave.addEventListener("pointerdown", (ev) => {
   if (state.tool === "marker") {
     const row = rowAt(ev.clientY);
     const channel = row && row.kind === "logic" ? row.channel : activeLogicChannel();
+    const mode = document.getElementById("cursor-mode");
+    if (mode && mode.value === "pair") {
+      const sample = sampleAt(ev.clientX);
+      pointer = { kind: "cursors", a: sample, b: sample, x: ev.clientX, channel };
+      wave.setPointerCapture(ev.pointerId);
+      return;
+    }
     const marker = placeMarker(sampleAt(ev.clientX), channel);
     pointer = { kind: "marker", marker, x: ev.clientX, moved: false, fresh: true };
     wave.setPointerCapture(ev.pointerId);
@@ -1962,6 +2171,12 @@ wave.addEventListener("pointermove", (ev) => {
     hideHover();
     return;
   }
+  if (pointer && pointer.kind === "cursors") {
+    pointer.b = sampleAt(ev.clientX);
+    drawWave();
+    hideHover();
+    return;
+  }
   if (pointer && pointer.kind === "measure") {
     pointer.b = sampleAt(ev.clientX);
     drawWave();
@@ -1969,6 +2184,7 @@ wave.addEventListener("pointermove", (ev) => {
     showHover(ev, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(pointer.b - pointer.a)} samples`);
     return;
   }
+  placeEdgeButtons(ev.clientY);
   queueHover(ev);
   drawWave();
 });
@@ -1977,6 +2193,16 @@ wave.addEventListener("pointerup", async (ev) => {
   const active = pointer;
   pointer = null;
   if (!active) return;
+  if (active.kind === "cursors") {
+    const channel = active.channel;
+    if (Math.abs(active.b - active.a) < 2) placeMarker(active.a, channel);
+    else {
+      placeMarker(Math.min(active.a, active.b), channel);
+      placeMarker(Math.max(active.a, active.b), channel);
+    }
+    drawWave();
+    return;
+  }
   if (active.kind === "marker" && active.moved && !active.fresh) {
     await snapMarker(active.marker, ev.clientX, ev.clientY);
   } else if (active.kind === "measure" && active.a !== active.b) {
@@ -2041,8 +2267,8 @@ async function runHover(ev) {
   const rect = wave.getBoundingClientRect();
   const x = ev.clientX - rect.left;
   const y = ev.clientY - rect.top;
-  const rows = orderedRows();
-  if (rows.length === 0 || state.total <= 0) {
+  const { layout } = rowMetrics();
+  if (layout.length === 0 || state.total <= 0) {
     hideHover();
     return;
   }
@@ -2050,9 +2276,7 @@ async function runHover(ev) {
     hideHover();
     return;
   }
-  const rowH = rect.height / rows.length;
-  const index = Math.floor(y / rowH);
-  const row = rows[index];
+  const row = rowAt(ev.clientY);
   if (!row || state.hidden.has(row.key)) {
     hideHover();
     return;
@@ -2298,8 +2522,31 @@ document.getElementById("tool-marker").addEventListener("click", () => setTool("
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
 document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1 / 1.4));
 document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1.4));
-document.getElementById("edge-prev").addEventListener("click", () => stepEdge(false));
-document.getElementById("edge-next").addEventListener("click", () => stepEdge(true));
+document.getElementById("edge-prev").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  stepEdge(false, state.edgeChannel);
+});
+document.getElementById("edge-next").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  stepEdge(true, state.edgeChannel);
+});
+const waveStage = document.querySelector(".wave-stage");
+let rowScrollLock = false;
+function syncRowScroll(from, to) {
+  if (!from || !to || rowScrollLock) return;
+  rowScrollLock = true;
+  to.scrollTop = from.scrollTop;
+  rowScrollLock = false;
+}
+waveStage.addEventListener("scroll", () => {
+  syncRowScroll(waveStage, gutter);
+  if (state.edgePointerY != null) placeEdgeButtons(state.edgePointerY);
+});
+gutter.addEventListener("scroll", () => syncRowScroll(gutter, waveStage));
+waveStage.addEventListener("pointerleave", (ev) => {
+  if (ev.relatedTarget && waveStage.contains(ev.relatedTarget)) return;
+  hideEdgeButtons();
+});
 document.getElementById("timebase").addEventListener("input", (ev) => applyTimebase(Number(ev.target.value)));
 
 const trigEnable = document.getElementById("trig-enable");

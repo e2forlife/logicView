@@ -408,3 +408,37 @@ async fn sequential_trigger_arms_on_channel_1_and_fires_on_channel_3() {
         .unwrap_err();
     assert!(refused.to_string().contains("16"));
 }
+
+#[tokio::test]
+async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
+    let engine = Engine::new();
+    let before = engine.status(None).await.unwrap();
+    assert_eq!(before.probes.len(), 4);
+    assert_eq!(before.probes[1].name, "UART");
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 1,
+                realtime: false,
+                channel_enable: 0b1101,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let status = engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    let names: Vec<_> = status.channels.iter().map(|channel| channel.name.as_str()).collect();
+    assert_eq!(names, ["CLK", "SDA", "SCL"]);
+    assert_eq!(status.probes[1].name, "UART");
+    assert_eq!(status.channel_enable, 0b1101);
+    assert_eq!(
+        engine.search_edge(None, 0, 0, true, true).await.unwrap(),
+        Some(50)
+    );
+}

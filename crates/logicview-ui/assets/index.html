@@ -13,7 +13,6 @@
         <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
       </svg>
       <strong>LogicView</strong>
-      <span class="subtitle">for DreamSourceLab DSLogic</span>
     </header>
     <nav class="menubar" aria-label="Menu">
       <button type="button" data-menu="file">File</button>
@@ -29,12 +28,13 @@
       <div class="device-chip" title="Device">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
         <span class="device-meta">
-          <select id="device-select" aria-label="Device">
-            <option value="demo">Demo</option>
-          </select>
+          <strong id="device-name">Demo</strong>
           <span class="connected"><i class="dot"></i> Connected</span>
         </span>
         <span class="chev" aria-hidden="true">▾</span>
+        <select id="device-select" aria-label="Device">
+          <option value="demo">Demo</option>
+        </select>
       </div>
       <button id="run" class="run" type="button" title="Run capture">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
@@ -73,9 +73,13 @@
       </button>
       <input id="timebase" type="range" min="0" max="18" value="14" aria-label="Time per division">
       <span id="timebase-label">50 ms/div</span>
-      <button id="tool-marker" class="icon-btn" type="button" title="Add marker" aria-label="Add marker">
+      <button id="tool-marker" class="icon-btn" type="button" title="Place cursors" aria-label="Place cursors">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v18M6 4h11l-3 4 3 4H6"></path></svg>
       </button>
+      <select id="cursor-mode" aria-label="Cursor placement" title="Cursor placement">
+        <option value="single">Single</option>
+        <option value="pair">Pair</option>
+      </select>
       <button id="tool-measure" class="icon-btn" type="button" title="Add measurement" aria-label="Add measurement">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v8M19 8v8M5 12h14M8 12l-2-2M8 12l-2 2M16 12l2-2M16 12l2 2"></path></svg>
       </button>
@@ -94,10 +98,10 @@
             <canvas id="ruler"></canvas>
             <div class="wave-stage">
               <canvas id="wave"></canvas>
-              <button id="edge-prev" class="edge-btn edge-prev" type="button" title="Previous edge" aria-label="Previous edge">
+              <button id="edge-prev" class="edge-btn edge-prev hidden" type="button" title="Previous edge" aria-label="Previous edge">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"></path></svg>
               </button>
-              <button id="edge-next" class="edge-btn edge-next" type="button" title="Next edge" aria-label="Next edge">
+              <button id="edge-next" class="edge-btn edge-next hidden" type="button" title="Next edge" aria-label="Next edge">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l6 6-6 6"></path></svg>
               </button>
             </div>
