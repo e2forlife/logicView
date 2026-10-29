@@ -161,6 +161,18 @@ function naturalRows() {
     });
   }
   for (const decoder of state.decoders || []) {
+    if (decoderCondensed(decoder.id)) {
+      rows.push({
+        key: "condense:" + decoder.id,
+        kind: "condense",
+        channel: Number(Object.values(decoder.channels || [])[0]) || 0,
+        name: protocolLabel(decoder.protocol),
+        color: "#8eb6ff",
+        device: "",
+        decoderId: decoder.id,
+      });
+      continue;
+    }
     if (decoder.protocol !== "spi") continue;
     if (!state.spiView[decoder.id]) state.spiView[decoder.id] = { analog: false };
     const analog = state.spiView[decoder.id].analog;
@@ -224,7 +236,7 @@ function orderedRows() {
 }
 
 function visibleRows() {
-  return orderedRows().filter((row) => !state.hidden.has(row.key) && rowEnabled(row));
+  return orderedRows().filter((row) => !state.hidden.has(row.key) && rowEnabled(row) && !rowHiddenByDecoder(row));
 }
 
 function triggerOrigin() {
@@ -546,7 +558,7 @@ function renderGutter() {
     }
     const kind = document.createElement("span");
     kind.className = "kind";
-    kind.textContent = row.kind === "analog" ? "Analog" : row.kind === "bus" ? (row.bus.analog ? "Analog" : "Bus") : "Digital";
+    kind.textContent = rowKindLabel(row);
     const eye = document.createElement("button");
     eye.type = "button";
     eye.className = "eye";
@@ -745,6 +757,7 @@ function drawWave() {
     else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
   }
   drawBuses(ctx, layout);
+  drawCondensedRows(ctx, w, layout);
   drawDecodeOverlay(ctx, w, metrics);
   ctx.restore();
   for (const item of layout) {
@@ -911,13 +924,54 @@ function drawMeasureSpan(ctx, w, h) {
 
 const FRAME_CLASS = new Set(["select", "start", "stop", "ack", "nack"]);
 
+const DECODE_FORMATS = {
+  hex: "Hex",
+  dec: "Decimal",
+  bin: "Binary",
+  oct: "Octal",
+  analog: "Analog",
+};
+
+function decodePref(id) {
+  if (!state.decodeView[id]) state.decodeView[id] = { overlay: true, condensed: false, format: "hex" };
+  return state.decodeView[id];
+}
+
 function overlayEnabled(id) {
   const pref = state.decodeView[id];
   return !pref || pref.overlay !== false;
 }
 
+function decoderCondensed(id) {
+  return !!(state.decodeView[id] && state.decodeView[id].condensed);
+}
+
+function decodeFormat(id) {
+  const pref = state.decodeView[id];
+  return pref && DECODE_FORMATS[pref.format] ? pref.format : "hex";
+}
+
+function decoderChannelIndexes(decoder) {
+  return Object.values(decoder.channels || {}).map(Number).filter((index) => Number.isFinite(index));
+}
+
+function channelHiddenByDecoder(index) {
+  return (state.decoders || []).some((decoder) => decoderCondensed(decoder.id) && decoderChannelIndexes(decoder).includes(index));
+}
+
+function rowHiddenByDecoder(row) {
+  return row.kind === "logic" && channelHiddenByDecoder(row.channel);
+}
+
+function rowKindLabel(row) {
+  if (row.kind === "condense") return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
+  if (row.kind === "analog") return "Analog";
+  if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
+  return "Digital";
+}
+
 function overlayLanes() {
-  return (state.decoders || []).filter((decoder) => !overlayEnabled(decoder.id));
+  return (state.decoders || []).filter((decoder) => !decoderCondensed(decoder.id) && !overlayEnabled(decoder.id));
 }
 
 function valueAnnotations(decoder) {
@@ -1008,7 +1062,7 @@ function traceHexagon(ctx, x, y, w, h) {
   ctx.closePath();
 }
 
-function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf) {
+function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
   const height = Math.max(12, bottom - top);
   let lastLabel = -1;
   ctx.lineWidth = 1.25;
@@ -1020,7 +1074,7 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf) {
     traceHexagon(ctx, x0, top, width, height);
     ctx.save();
     ctx.fillStyle = color || "#3d8dfd";
-    ctx.globalAlpha = 0.36;
+    ctx.globalAlpha = alpha == null ? 0.36 : alpha;
     ctx.fill();
     ctx.globalAlpha = 0.92;
     ctx.strokeStyle = color || "#c6dcff";
@@ -1050,6 +1104,7 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
   for (const decoder of state.decoders || []) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
+    if (decoderCondensed(decoder.id)) continue;
     if (overlayEnabled(decoder.id)) {
       for (const target of dataLineTargets(decoder)) {
         const item = logicRow(layout, target.channel);
@@ -1071,6 +1126,88 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
     ctx.stroke();
   }
   ctx.restore();
+}
+
+function annotationNumbers(row) {
+  const fields = row.fields || {};
+  if (row.protocol === "spi" && (fields.mosi || fields.miso)) {
+    const out = [];
+    if (fields.mosi) out.push(parseInt(fields.mosi, 16));
+    if (fields.miso) out.push(parseInt(fields.miso, 16));
+    return out.filter((value) => Number.isFinite(value));
+  }
+  if (fields.data) return [parseInt(fields.data, 16)].filter((value) => Number.isFinite(value));
+  if (fields.address) return [parseInt(fields.address, 16)].filter((value) => Number.isFinite(value));
+  return [];
+}
+
+function formatDecoded(value, format) {
+  const n = value & 0xff;
+  if (format === "dec") return String(n);
+  if (format === "bin") return n.toString(2).padStart(8, "0");
+  if (format === "oct") return n.toString(8);
+  return "0x" + n.toString(16).toUpperCase().padStart(2, "0");
+}
+
+function condensedLabel(row, format) {
+  const parts = annotationNumbers(row).map((value) => formatDecoded(value, format));
+  return parts.length ? parts.join(" / ") : annotationLabel(row);
+}
+
+function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
+  const max = 255;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  let started = false;
+  for (const row of rows) {
+    const value = valueOf(row);
+    if (!Number.isFinite(value)) continue;
+    const y = bot - (Math.max(0, Math.min(max, value)) / max) * (bot - top);
+    const x0 = sampleX(row.start_sample);
+    const x1 = Math.max(x0 + 1, sampleX(row.end_sample));
+    if (!started) {
+      ctx.moveTo(x0, y);
+      started = true;
+    } else ctx.lineTo(x0, y);
+    ctx.lineTo(x1, y);
+  }
+  ctx.stroke();
+}
+
+function drawCondensedRows(ctx, canvasW, layout) {
+  for (const item of layout) {
+    if (item.row.kind !== "condense") continue;
+    const decoder = (state.decoders || []).find((row) => row.id === item.row.decoderId);
+    if (!decoder) continue;
+    const rows = valueAnnotations(decoder);
+    const format = decodeFormat(decoder.id);
+    const pad = Math.max(8, item.height * 0.22);
+    const bandTop = item.top + pad;
+    const bandBot = item.top + item.height - pad;
+    if (format === "analog") {
+      const fields = rows[0] && rows[0].fields;
+      if (fields && (fields.mosi || fields.miso)) {
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+      } else {
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#8eb6ff", (row) => {
+          const values = annotationNumbers(row);
+          return values.length ? values[0] : NaN;
+        });
+      }
+      ctx.fillStyle = "rgba(176, 188, 204, 0.7)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("255", 6, bandTop + 8);
+      ctx.fillText("0", 6, bandBot - 6);
+      continue;
+    }
+    const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
+    const mid = (bandTop + bandBot) / 2;
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, (row) => condensedLabel(row, format), 0.82);
+  }
 }
 
 function spiWords(decoderId) {
@@ -1413,7 +1550,12 @@ async function fetchTiles() {
     return;
   }
   if (Object.keys(pending.got).length) {
-    state.tiles = pending.got;
+    const previous = state.tileView;
+    const sameTileView = previous
+      && previous.start === start
+      && previous.spp === spp
+      && previous.width === width;
+    state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
     state.tileView = { start, spp, width };
     drawWave();
     drawRuler();
@@ -1611,7 +1753,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode, and can lay decoded values on the data line. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Overlay draws on the data lines, or above the waveform when it is off. Hiding the channels leaves only the decoded data.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -3073,9 +3215,12 @@ function openMenu(button) {
     pop.appendChild(item);
   }
   const rect = button.getBoundingClientRect();
-  pop.style.left = rect.left + "px";
-  pop.style.top = rect.bottom + "px";
   pop.classList.remove("hidden");
+  const width = pop.offsetWidth;
+  let left = rect.left;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  pop.style.left = left + "px";
+  pop.style.top = rect.bottom + "px";
   for (const other of document.querySelectorAll(".menubar button")) {
     other.classList.toggle("open", other === button);
   }
@@ -3419,7 +3564,16 @@ function openDecodeConfig(decoder) {
   const options = decoder.options || {};
   const channels = decoder.channels || {};
   const overlayOn = overlayEnabled(decoder.id);
+  const pref = decodePref(decoder.id);
   const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the data line</label>`];
+  if (Object.keys(channels).length) {
+    const format = decodeFormat(decoder.id);
+    const options = Object.entries(DECODE_FORMATS).map(([value, label]) => `<option value="${value}"${format === value ? " selected" : ""}>${label}</option>`).join("");
+    parts.push(`<label class="check"><input id="decode-condense" type="checkbox"${pref.condensed ? " checked" : ""}> Hide channels under this decoder</label>
+      <label class="field">Decoded data
+        <select id="decode-format">${options}</select>
+      </label>`);
+  }
   parts.push(...Object.keys(channels).map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
@@ -3530,10 +3684,13 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
   }
   const stack = document.getElementById("decode-stack");
   const overlayBox = document.getElementById("decode-overlay");
-  if (overlayBox) {
-    state.decodeView[id] = state.decodeView[id] || {};
-    state.decodeView[id].overlay = overlayBox.checked;
-  }
+  const condenseBox = document.getElementById("decode-condense");
+  const formatBox = document.getElementById("decode-format");
+  const pref = decodePref(id);
+  if (overlayBox) pref.overlay = overlayBox.checked;
+  if (condenseBox) pref.condensed = condenseBox.checked;
+  if (formatBox && DECODE_FORMATS[formatBox.value]) pref.format = formatBox.value;
+  state.gutterSig = "";
   try {
     await api({
       cmd: "update_decoder",
@@ -3546,6 +3703,7 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     closeDecodeConfig();
     await refreshDecoders();
     await loadAnnotations();
+    scheduleTiles();
   } catch (err) {
     statusEl.textContent = err.message;
   }

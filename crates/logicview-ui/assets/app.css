@@ -47,8 +47,8 @@ button:disabled { cursor: default; }
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 32px;
-  padding: 0 12px;
+  height: 36px;
+  padding: 0 8px 0 12px;
   background: #0e131a;
   border-bottom: 1px solid var(--line);
   font-size: 13px;
@@ -69,11 +69,11 @@ button:disabled { cursor: default; }
 .menubar {
   display: flex;
   gap: 2px;
-  height: 28px;
   align-items: center;
-  padding: 0 6px;
-  background: var(--bg-bar);
-  border-bottom: 1px solid var(--line);
+  margin-left: auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
 }
 
 .menubar > button {
