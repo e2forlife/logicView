@@ -933,15 +933,29 @@ function annotationLabel(row) {
   return row.text || row.class || "";
 }
 
-function decoderTraceSpan(decoder, layout) {
-  const indexes = new Set(Object.values(decoder.channels || {}).map((index) => Number(index)));
-  const hits = layout.filter((item) => item.row.kind === "logic" && indexes.has(item.row.channel));
-  const used = hits.length ? hits : layout.filter((item) => item.row.kind === "logic");
-  if (!used.length) return null;
-  return {
-    top: Math.min(...used.map((item) => item.top)),
-    bottom: Math.max(...used.map((item) => item.top + item.height)),
-  };
+function logicRow(layout, channel) {
+  const index = Number(channel);
+  if (!Number.isFinite(index)) return null;
+  return layout.find((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key)) || null;
+}
+
+function dataLineTargets(decoder) {
+  const channels = decoder.channels || {};
+  const text = annotationLabel;
+  if (decoder.protocol === "spi") {
+    return [
+      { channel: channels.mosi, label: (row) => (row.fields && row.fields.mosi ? "0x" + row.fields.mosi : text(row)) },
+      { channel: channels.miso, label: (row) => (row.fields && row.fields.miso ? "0x" + row.fields.miso : text(row)) },
+    ];
+  }
+  if (decoder.protocol === "i2c") return [{ channel: channels.sda, label: text }];
+  if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
+  if (decoder.protocol === "eeprom24") {
+    const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
+    return [{ channel: parent && parent.channels ? parent.channels.sda : null, label: text }];
+  }
+  const first = Object.values(channels)[0];
+  return [{ channel: first, label: text }];
 }
 
 function traceRoundRect(ctx, x, y, w, h, r) {
@@ -982,6 +996,50 @@ function drawValueBoxes(ctx, rows, top, bottom, translucent, canvasW) {
   }
 }
 
+function traceHexagon(ctx, x, y, w, h) {
+  const point = Math.max(3, Math.min(14, h * 0.42, w * 0.28));
+  ctx.beginPath();
+  ctx.moveTo(x + point, y);
+  ctx.lineTo(x + w - point, y);
+  ctx.lineTo(x + w, y + h / 2);
+  ctx.lineTo(x + w - point, y + h);
+  ctx.lineTo(x + point, y + h);
+  ctx.lineTo(x, y + h / 2);
+  ctx.closePath();
+}
+
+function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf) {
+  const height = Math.max(12, bottom - top);
+  let lastLabel = -1;
+  ctx.lineWidth = 1.25;
+  for (const row of rows) {
+    const x0 = sampleX(row.start_sample);
+    const x1 = Math.max(x0 + 2, sampleX(row.end_sample));
+    if (x1 < 0 || x0 > canvasW) continue;
+    const width = x1 - x0;
+    traceHexagon(ctx, x0, top, width, height);
+    ctx.save();
+    ctx.fillStyle = color || "#3d8dfd";
+    ctx.globalAlpha = 0.36;
+    ctx.fill();
+    ctx.globalAlpha = 0.92;
+    ctx.strokeStyle = color || "#c6dcff";
+    ctx.stroke();
+    ctx.restore();
+    const label = labelOf(row);
+    const point = Math.max(3, Math.min(14, height * 0.42, width * 0.28));
+    if (width < point * 2 + 20 || x0 < lastLabel) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0 + point, top, Math.max(0, width - point * 2), height);
+    ctx.clip();
+    ctx.fillStyle = "#f7fafc";
+    ctx.fillText(label, x0 + point + 4, top + height / 2);
+    ctx.restore();
+    lastLabel = x0 + Math.min(width, ctx.measureText(label).width + point + 10);
+  }
+}
+
 function drawDecodeOverlay(ctx, canvasW, metrics) {
   const layout = metrics.layout;
   ctx.save();
@@ -993,10 +1051,12 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
     if (overlayEnabled(decoder.id)) {
-      const span = decoderTraceSpan(decoder, layout);
-      if (!span) continue;
-      const pad = 6;
-      drawValueBoxes(ctx, rows, span.top + pad, span.bottom - pad, true, canvasW);
+      for (const target of dataLineTargets(decoder)) {
+        const item = logicRow(layout, target.channel);
+        if (!item) continue;
+        const pad = Math.max(8, item.height * 0.22);
+        drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
+      }
     } else {
       const top = laneIndex * metrics.laneH + 3;
       drawValueBoxes(ctx, rows, top, top + metrics.laneH - 6, false, canvasW);
@@ -1551,7 +1611,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode, and can lay the decoded values on the traces. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode, and can lay decoded values on the data line. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -3351,7 +3411,7 @@ function openDecodeConfig(decoder) {
   const options = decoder.options || {};
   const channels = decoder.channels || {};
   const overlayOn = overlayEnabled(decoder.id);
-  const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the waveform</label>`];
+  const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the data line</label>`];
   parts.push(...Object.keys(channels).map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
