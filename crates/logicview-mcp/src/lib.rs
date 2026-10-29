@@ -871,7 +871,11 @@ fn summary_text(data: &Value) -> String {
 
 fn tool_defs() -> Vec<Value> {
     vec![
-        tool("list_devices", "List demo pods and any tested USB pod that is plugged in.", json!({})),
+        tool(
+            "list_devices",
+            "List plugged-in DreamSourceLab pods ahead of demo devices. Untested product ids are shown and are not opened.",
+            json!({}),
+        ),
         tool("list_profiles", "Logic pod profiles. Untested product ids are not opened.", json!({})),
         tool("connect", "Replace the session devices with one demo pod or the tested Plus.", json!({"id": {"type": "string"}})),
         tool("attach_device", "Stack another demo pod into the active session.", json!({"id": {"type": "string"}})),

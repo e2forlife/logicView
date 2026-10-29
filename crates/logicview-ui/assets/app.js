@@ -1233,7 +1233,8 @@ function devicePanel() {
         <p class="hint">${hardware ? "Opened pod. The name is the one the engine reports." : "Software demo. No pod serial number."}</p>
       </div>
     </div>
-    <p id="profile-note" class="hint">Choose the source from the device menu. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
+    <p id="plugged-in" class="hint">Looking for a DreamSourceLab pod.</p>
+    <p id="profile-note" class="hint">Choose the source from the device menu. A plugged-in pod is listed above the demo devices. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
     <h3>Acquisition</h3>
     <label class="acq-row">Sample rate
       <select id="set-rate" aria-label="Sample rate">
@@ -1548,8 +1549,9 @@ async function loadDeviceChoices() {
     const devices = await api({ cmd: "list_devices" });
     const previous = select.value;
     select.replaceChildren();
+    const hardware = devices.filter((device) => device.kind !== "demo");
     const demos = devices.filter((device) => device.kind === "demo");
-    for (const device of demos) {
+    for (const device of [...hardware, ...demos]) {
       const option = document.createElement("option");
       option.value = device.id;
       option.textContent = device.name;
@@ -1561,12 +1563,11 @@ async function loadDeviceChoices() {
       stacked.textContent = "Demo + Demo SPI";
       select.append(stacked);
     }
-    for (const device of devices) {
-      if (device.kind === "demo") continue;
-      const option = document.createElement("option");
-      option.value = device.id;
-      option.textContent = device.name;
-      select.append(option);
+    const plugged = document.getElementById("plugged-in");
+    if (plugged) {
+      plugged.textContent = hardware.length
+        ? `Plugged in: ${hardware.map((device) => device.name).join(", ")}. Pick it in the device menu to capture.`
+        : "No DreamSourceLab pod is plugged in.";
     }
     syncDeviceSelect();
     if (!select.value && previous) select.value = previous;
