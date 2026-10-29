@@ -35,6 +35,14 @@ if errorlevel 1 exit /b 1
 copy /y "target\release\logicview.exe" "%STAGE%\logicview.exe" >nul
 if errorlevel 1 exit /b 1
 
+rem The packaged exe is a Windows GUI binary (subsystem 2). A console
+rem subsystem would flash a terminal when the user launches LogicView.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='%STAGE%\logicview.exe'; $b=[IO.File]::ReadAllBytes((Resolve-Path $p)); $pe=[BitConverter]::ToInt32($b,60); $sub=[BitConverter]::ToUInt16($b,$pe+92); if ($sub -ne 2) { Write-Error ('logicview.exe subsystem is ' + $sub + '; expected 2 (Windows GUI)'); exit 1 }"
+if errorlevel 1 (
+  echo logicview.exe is not a windowed Windows binary.
+  exit /b 1
+)
+
 if not exist "crates\logicview-ui\assets\index.html" (
   echo Missing UI assets in crates\logicview-ui\assets
   exit /b 1

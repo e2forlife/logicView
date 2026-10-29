@@ -62,13 +62,24 @@ pub fn router(engine: Engine) -> Router {
         .with_state(AppState { engine })
 }
 
-pub async fn serve(engine: Engine, addr: SocketAddr) -> Result<(), UiError> {
+pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, UiError> {
     if !addr.ip().is_loopback() {
         return Err(UiError::NonLoopback(addr));
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok(tokio::net::TcpListener::bind(addr).await?)
+}
+
+pub async fn serve(engine: Engine, addr: SocketAddr) -> Result<(), UiError> {
+    let listener = bind(addr).await?;
+    serve_listener(engine, listener).await
+}
+
+pub async fn serve_listener(
+    engine: Engine,
+    listener: tokio::net::TcpListener,
+) -> Result<(), UiError> {
     let local = listener.local_addr()?;
-    tracing::info!("LogicView demo UI at http://{local}");
+    tracing::info!(%local, "LogicView UI listening");
     axum::serve(listener, router(engine)).await?;
     Ok(())
 }
