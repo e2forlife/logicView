@@ -54,15 +54,23 @@ pub struct ListedPod {
     pub product_id: u16,
 }
 
+/// A plugged-in high-speed Plus is vendor `0x2A0E` product `0x0020`.
+/// Speed is not part of that identity: some hosts omit it until the device is open.
+pub fn matches_plus(vendor_id: u16, product_id: u16) -> bool {
+    vendor_id == VENDOR_ID && product_id == PLUS_PID
+}
+
 pub fn list_plus() -> Result<Vec<ListedPod>, HalError> {
     let devices = nusb::list_devices()
         .wait()
         .map_err(|err| HalError::Usb(err.to_string()))?;
     let mut found = Vec::new();
     for dev in devices {
-        if dev.vendor_id() == VENDOR_ID && dev.product_id() == PLUS_PID && dev.speed() == Some(nusb::Speed::High)
-        {
-            let product = dev.product_string().unwrap_or("DSLogic Plus");
+        if matches_plus(dev.vendor_id(), dev.product_id()) {
+            let product = dev
+                .product_string()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("DSLogic Plus");
             found.push(ListedPod {
                 id: crate::DEVICE_ID.to_string(),
                 name: format!("{product} ({:04x}:{:04x})", dev.vendor_id(), dev.product_id()),
@@ -78,11 +86,7 @@ impl Pod {
         let info = nusb::list_devices()
             .wait()
             .map_err(|err| HalError::Usb(err.to_string()))?
-            .find(|dev| {
-                dev.vendor_id() == VENDOR_ID
-                    && dev.product_id() == PLUS_PID
-                    && dev.speed() == Some(nusb::Speed::High)
-            })
+            .find(|dev| matches_plus(dev.vendor_id(), dev.product_id()))
             .ok_or(HalError::NotFound)?;
         let device = info
             .open()
@@ -344,4 +348,16 @@ fn candidate_dirs() -> Vec<PathBuf> {
         dirs.push(Path::new(&local).join("Temp").join("lv-fw"));
     }
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_plus;
+
+    #[test]
+    fn plus_identity_is_the_tested_high_speed_pod() {
+        assert!(matches_plus(0x2A0E, 0x0020));
+        assert!(!matches_plus(0x2A0E, 0x0034));
+        assert!(!matches_plus(0x1234, 0x0020));
+    }
 }

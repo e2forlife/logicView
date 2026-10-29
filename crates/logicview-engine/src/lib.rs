@@ -109,6 +109,10 @@ pub struct Status {
     pub instant: bool,
     pub realtime: bool,
     pub channels: Vec<ChannelInfo>,
+    /// Every logic probe on the connected devices. `index` is the enable bit.
+    pub probes: Vec<ChannelInfo>,
+    /// Zero means every probe is sampled. Otherwise each set bit is one probe.
+    pub channel_enable: u32,
     pub devices: Vec<DeviceInfo>,
     pub analog: Vec<AnalogInfo>,
     pub warnings: Vec<String>,
@@ -171,6 +175,7 @@ pub(crate) struct BoundDevice {
     kind: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct ChannelOrigin {
     device_id: String,
     device_name: String,
@@ -211,6 +216,9 @@ struct Slot {
     pub(crate) channel_names: Vec<String>,
     channel_colors: Vec<String>,
     pub(crate) origins: Vec<ChannelOrigin>,
+    catalog_names: Vec<String>,
+    catalog_colors: Vec<String>,
+    catalog_origins: Vec<ChannelOrigin>,
     pub(crate) devices: Vec<BoundDevice>,
     pub(crate) decoders: Vec<DecoderInst>,
     pub(crate) annotations: Vec<AnnotationRow>,
@@ -510,8 +518,13 @@ impl Engine {
             let (source, generation, realtime, rate) = {
                 let slot = state.slot_mut(&id)?;
                 let config = slot.session.config.clone();
-                let waves = demo_waves(&slot.devices)?;
-                let source = slot.session.begin(config, mode, waves)?;
+                let mask = config.channel_enable;
+                let waves = demo_waves_masked(&slot.devices, mask)?;
+                apply_sampled_channels(slot, mask)?;
+                let mut packed = config;
+                packed.channel_enable = 0;
+                let source = slot.session.begin(packed, mode, waves)?;
+                slot.session.config.channel_enable = mask;
                 slot.annotations.clear();
                 let generation = slot.session.generation();
                 let realtime = slot.session.config.realtime;
@@ -721,6 +734,9 @@ impl Engine {
             };
             let slot = state.slot_mut(&id)?;
             let samples = slot.session.prepare(config.clone(), mode, 16, clock)?;
+            if slot.catalog_names.is_empty() {
+                remember_catalog(slot);
+            }
             let (names, colors) = pod_channel_style(mask);
             let device_id = slot
                 .devices
@@ -1084,6 +1100,7 @@ impl Engine {
             .iter()
             .map(|channel| channel.color.clone())
             .collect();
+        slot.session.config.channel_enable = 0;
         slot.devices = vec![BoundDevice {
             id: "file".into(),
             name: "File".into(),
@@ -1097,6 +1114,7 @@ impl Engine {
                 device_name: "File".into(),
             })
             .collect();
+        remember_catalog(slot);
         slot.decoders.clear();
         slot.annotations.clear();
         let is_active = slot.id == active;
@@ -1125,6 +1143,8 @@ impl Engine {
                 .collect();
             slot.channel_names = names;
             slot.channel_colors = colors;
+            remember_catalog(slot);
+            slot.session.config.channel_enable = 0;
             slot.decoders.clear();
             slot.annotations.clear();
             slot.session.store = LogicStore::new(mask.count_ones() as usize);
@@ -1163,6 +1183,9 @@ impl Slot {
             channel_names: Vec::new(),
             channel_colors: Vec::new(),
             origins: Vec::new(),
+            catalog_names: Vec::new(),
+            catalog_colors: Vec::new(),
+            catalog_origins: Vec::new(),
             devices: Vec::new(),
             decoders: Vec::new(),
             annotations: Vec::new(),
@@ -1174,6 +1197,32 @@ impl Slot {
         };
         let _ = install_demo_ids(&mut slot, &["demo".to_string()]);
         slot
+    }
+
+    fn channel_list(
+        &self,
+        names: &[String],
+        colors: &[String],
+        origins: &[ChannelOrigin],
+    ) -> Vec<ChannelInfo> {
+        names
+            .iter()
+            .zip(colors.iter())
+            .enumerate()
+            .map(|(index, (name, color))| ChannelInfo {
+                index,
+                name: name.clone(),
+                color: color.clone(),
+                device_id: origins
+                    .get(index)
+                    .map(|origin| origin.device_id.clone())
+                    .unwrap_or_else(|| "session".into()),
+                device_name: origins
+                    .get(index)
+                    .map(|origin| origin.device_name.clone())
+                    .unwrap_or_else(|| "Session".into()),
+            })
+            .collect()
     }
 
     fn status(&self, active: bool) -> Status {
@@ -1189,27 +1238,25 @@ impl Slot {
             trigger_sample: self.session.trigger_sample,
             instant: self.session.instant,
             realtime: self.session.config.realtime,
-            channels: self
-                .channel_names
-                .iter()
-                .zip(self.channel_colors.iter())
-                .enumerate()
-                .map(|(index, (name, color))| ChannelInfo {
-                    index,
-                    name: name.clone(),
-                    color: color.clone(),
-                    device_id: self
-                        .origins
-                        .get(index)
-                        .map(|origin| origin.device_id.clone())
-                        .unwrap_or_else(|| "session".into()),
-                    device_name: self
-                        .origins
-                        .get(index)
-                        .map(|origin| origin.device_name.clone())
-                        .unwrap_or_else(|| "Session".into()),
-                })
-                .collect(),
+            channels: self.channel_list(&self.channel_names, &self.channel_colors, &self.origins),
+            probes: self.channel_list(
+                if self.catalog_names.is_empty() {
+                    &self.channel_names
+                } else {
+                    &self.catalog_names
+                },
+                if self.catalog_names.is_empty() {
+                    &self.channel_colors
+                } else {
+                    &self.catalog_colors
+                },
+                if self.catalog_names.is_empty() {
+                    &self.origins
+                } else {
+                    &self.catalog_origins
+                },
+            ),
+            channel_enable: self.session.config.channel_enable,
             devices: self
                 .devices
                 .iter()
@@ -1330,13 +1377,78 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
             "a session needs at least one channel".into(),
         ));
     }
-    slot.devices = devices;
+        slot.devices = devices;
     slot.channel_names = names;
     slot.channel_colors = colors;
     slot.origins = origins;
+    remember_catalog(slot);
+    slot.session.config.channel_enable = 0;
     slot.decoders.clear();
     slot.annotations.clear();
     slot.session.store = LogicStore::new(slot.channel_names.len());
+    Ok(())
+}
+
+fn demo_waves_masked(
+    devices: &[BoundDevice],
+    mask: u32,
+) -> Result<Vec<fn(u64) -> bool>, EngineError> {
+    let waves = demo_waves(devices)?;
+    if mask == 0 {
+        return Ok(waves);
+    }
+    let kept: Vec<_> = waves
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index < 32 && mask & (1 << *index) != 0)
+        .map(|(_, wave)| wave)
+        .collect();
+    if kept.is_empty() {
+        return Err(EngineError::Device("no channels enabled".into()));
+    }
+    Ok(kept)
+}
+
+fn remember_catalog(slot: &mut Slot) {
+    slot.catalog_names = slot.channel_names.clone();
+    slot.catalog_colors = slot.channel_colors.clone();
+    slot.catalog_origins = slot.origins.clone();
+}
+
+fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError> {
+    if slot.catalog_names.is_empty() {
+        remember_catalog(slot);
+    }
+    if mask == 0 {
+        slot.channel_names = slot.catalog_names.clone();
+        slot.channel_colors = slot.catalog_colors.clone();
+        slot.origins = slot.catalog_origins.clone();
+        return Ok(());
+    }
+    let mut names = Vec::new();
+    let mut colors = Vec::new();
+    let mut origins = Vec::new();
+    for (index, name) in slot.catalog_names.iter().enumerate() {
+        if index < 32 && mask & (1 << index) != 0 {
+            names.push(name.clone());
+            colors.push(
+                slot.catalog_colors
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| "#d5dce6".into()),
+            );
+            origins.push(slot.catalog_origins.get(index).cloned().unwrap_or(ChannelOrigin {
+                device_id: "session".into(),
+                device_name: "Session".into(),
+            }));
+        }
+    }
+    if names.is_empty() {
+        return Err(EngineError::Device("no channels enabled".into()));
+    }
+    slot.channel_names = names;
+    slot.channel_colors = colors;
+    slot.origins = origins;
     Ok(())
 }
 

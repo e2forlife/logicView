@@ -644,8 +644,9 @@ async fn tile_frame(engine: &Engine, query: TileQuery<'_>) -> Result<Vec<u8>, Ap
 /// 12..16 column count u32 le
 /// 16..24 start f64 le
 /// 24..32 samples per pixel f64 le
-/// 32..   logic: first, last, toggled, edges (u8, saturated)
+/// 32..   logic: first, last, toggled, edges, valid (u8; edges saturated)
 ///        analog: min f32, max f32 (NaN when the column is past the capture)
+///        `valid` is 0 when the column starts after the last stored sample.
 /// ```
 pub fn encode_logic_frame(
     req: u32,
@@ -661,6 +662,7 @@ pub fn encode_logic_frame(
         out.push(u8::from(column.last));
         out.push(u8::from(column.toggled));
         out.push(u8::try_from(column.edges).unwrap_or(255));
+        out.push(u8::from(column.valid));
     }
     out
 }
@@ -992,6 +994,8 @@ mod tests {
         assert_eq!(frame[33], 0);
         assert_eq!(frame[34], 1);
         assert_eq!(frame[35], 255);
+        assert_eq!(frame[36], 1);
+        assert_eq!(frame.len(), 37);
     }
 
     #[tokio::test]
@@ -1019,6 +1023,9 @@ mod tests {
         assert!(html.contains("id=\"run\""));
         assert!(html.contains("id=\"stop\""));
         assert!(html.contains("id=\"device-select\""));
+        assert!(html.contains("id=\"device-name\""));
+        assert!(html.contains("id=\"cursor-mode\""));
+        assert!(!html.contains("DreamSourceLab"));
         assert!(!html.contains(">Instant<"));
         assert!(!html.contains("Use Demo"));
     }
