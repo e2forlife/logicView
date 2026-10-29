@@ -30,10 +30,15 @@ scripts\run-debug.cmd
 `crates\logicview-ui\assets`. `run-debug.cmd` starts the same app with
 `cargo run` (debug build).
 
-The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`) and listens
-for an MCP client on `/tmp/logicview.sock` (override with `LOGICVIEW_SOCKET`).
-`logicview mcp` attaches to that socket when the UI is already running, and
-otherwise starts its own demo engine. Press Start. Stack **Demo SPI** from the
+The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`). `logicview mcp`
+attaches to that running engine when the endpoint is up, and otherwise starts
+its own demo engine. On Unix the endpoint is a socket at `/tmp/logicview.sock`.
+On Windows the UI listens on TCP `127.0.0.1` (ephemeral port) and writes
+`127.0.0.1:<port>` into `%TEMP%\logicview.sock`; the MCP client reads that file
+and connects over TCP. `LOGICVIEW_SOCKET` overrides the socket path on Unix and
+the endpoint file path on Windows. When that value is a loopback
+`host:port` such as `127.0.0.1:4174`, Windows binds and connects to that
+TCP address. Press Start. Stack **Demo SPI** from the
 device drawer to see both pods. Hover a trace for width, period, frequency,
 and duty; the measure drawer keeps those readings. Add I2C or SPI from the
 analyzers drawer and read the rows in the bottom table. The trigger drawer
@@ -53,7 +58,7 @@ written for a pod and have not been run on hardware.
 | `logicview-capture` | 1 | Demo source, session phases, logic mipmap |
 | `logicview-store` | 1 | `.lvcap` directory or zip |
 | `logicview-engine` | 1 | Command facade, multi-pod channel list, live events |
-| `logicview-mcp` | 6 | stdio MCP and the UI attach socket |
+| `logicview-mcp` | 6 | stdio MCP and the UI attach endpoint |
 | `logicview-ui` | 2 | Axum routes, WebSocket tile frames, waveform shell |
 | `logicview-app` | 2 | `logicview` binary |
 

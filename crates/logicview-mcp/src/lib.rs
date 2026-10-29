@@ -1,9 +1,12 @@
 //! MCP for an agent driving the analyzer.
 //!
 //! `logicview mcp` speaks newline-delimited JSON-RPC on stdio (protocol
-//! 2024-11-05). If the UI already bound the local socket, the client attaches
-//! to that engine. A second start does not reset a capture that is still
-//! running unless the caller passes `force`.
+//! 2024-11-05). If the UI already published the local attach endpoint, the
+//! client attaches to that engine. Unix uses a Unix socket at the endpoint
+//! path. Windows listens on TCP `127.0.0.1` and writes `host:port` into that
+//! path, or binds the address directly when the path is already `host:port`.
+//! A second start does not reset a capture that is still running unless the
+//! caller passes `force`.
 //!
 //! Scope and data-acquisition tools are refused. This build does not implement
 //! them.
@@ -14,14 +17,66 @@ use std::time::Duration;
 use logicview_capture::{SessionConfig, StartMode};
 use logicview_engine::Engine;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+#[cfg(unix)]
+mod attach_unix;
+#[cfg(unix)]
+use attach_unix as transport;
+
+#[cfg(windows)]
+mod attach_windows;
+#[cfg(windows)]
+use attach_windows as transport;
+
+#[cfg(not(any(unix, windows)))]
+compile_error!("MCP attach is implemented for Unix sockets and Windows TCP localhost");
+
 pub fn default_socket_path() -> PathBuf {
-    std::env::var_os("LOGICVIEW_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/logicview.sock"))
+    if let Some(value) = std::env::var_os("LOGICVIEW_SOCKET") {
+        return PathBuf::from(value);
+    }
+    platform_default_socket_path()
+}
+
+#[cfg(unix)]
+fn platform_default_socket_path() -> PathBuf {
+    PathBuf::from("/tmp/logicview.sock")
+}
+
+#[cfg(windows)]
+fn platform_default_socket_path() -> PathBuf {
+    std::env::temp_dir().join("logicview.sock")
+}
+
+/// Startup description of where an MCP client attaches.
+pub fn attach_location() -> String {
+    let path = default_socket_path();
+    #[cfg(unix)]
+    {
+        return format!("unix socket {}", path.display());
+    }
+    #[cfg(windows)]
+    {
+        format!("TCP 127.0.0.1 via {}", path.display())
+    }
+}
+
+// The Windows transport reads this. Unix unit tests cover it; the Unix library
+// build has no caller, so the unused warning is limited to that build.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parse_loopback_endpoint(text: &str) -> Result<std::net::SocketAddr, String> {
+    let addr: std::net::SocketAddr = text.trim().parse().map_err(|_| {
+        "attach endpoint must be a loopback host:port".to_string()
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(format!("refusing non-loopback attach address {addr}"));
+    }
+    if addr.port() == 0 {
+        return Err("attach endpoint is missing a port".into());
+    }
+    Ok(addr)
 }
 
 pub async fn run_stdio(attach: Option<PathBuf>) -> i32 {
@@ -54,16 +109,10 @@ async fn open_session(attach: Option<PathBuf>) -> Result<McpSession, String> {
 }
 
 pub async fn serve_attach(engine: Engine, path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)?;
-    tracing::info!(path = %path.display(), "engine attach socket");
+    let listener = transport::bind(path).await?;
+    tracing::info!(endpoint = %listener.label(), "engine attach listening");
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let engine = engine.clone();
         tokio::spawn(async move {
             if let Err(err) = socket_client(engine, stream).await {
@@ -73,8 +122,11 @@ pub async fn serve_attach(engine: Engine, path: &Path) -> std::io::Result<()> {
     }
 }
 
-async fn socket_client(engine: Engine, stream: UnixStream) -> Result<(), String> {
-    let (read, mut write) = stream.into_split();
+async fn socket_client<S>(engine: Engine, stream: S) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await.map_err(|err| err.to_string())? {
         if line.trim().is_empty() {
@@ -100,7 +152,7 @@ async fn socket_client(engine: Engine, stream: UnixStream) -> Result<(), String>
 
 enum Backend {
     Local(Engine),
-    Remote(Mutex<UnixStream>),
+    Remote(Mutex<transport::Stream>),
 }
 
 pub struct McpSession {
@@ -115,9 +167,7 @@ impl McpSession {
     }
 
     pub async fn connect(path: &Path) -> Result<Self, String> {
-        let stream = UnixStream::connect(path)
-            .await
-            .map_err(|err| err.to_string())?;
+        let stream = transport::connect(path).await?;
         Ok(Self {
             backend: Backend::Remote(Mutex::new(stream)),
         })
@@ -244,7 +294,7 @@ impl McpSession {
 }
 
 async fn remote_call(
-    stream: &Mutex<UnixStream>,
+    stream: &Mutex<transport::Stream>,
     tool: &str,
     arguments: &Value,
 ) -> Result<Value, String> {
@@ -257,7 +307,7 @@ async fn remote_call(
     let mut line = String::new();
     let read = reader.read_line(&mut line).await.map_err(|err| err.to_string())?;
     if read == 0 {
-        return Err("attach socket closed".into());
+        return Err("attach connection closed".into());
     }
     let response: Value = serde_json::from_str(line.trim()).map_err(|err| err.to_string())?;
     if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
@@ -985,5 +1035,26 @@ mod tests {
         assert_ne!(after.phase, "idle");
         engine.stop(None).await.unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loopback_endpoint_rejects_other_hosts() {
+        let addr = parse_loopback_endpoint("127.0.0.1:4174\n").unwrap();
+        assert_eq!(addr.port(), 4174);
+        assert!(addr.ip().is_loopback());
+        assert!(parse_loopback_endpoint("[::1]:9").is_ok());
+        assert!(parse_loopback_endpoint("0.0.0.0:1").is_err());
+        assert!(parse_loopback_endpoint("192.168.0.2:9").is_err());
+        assert!(parse_loopback_endpoint("127.0.0.1:0").is_err());
+        assert!(parse_loopback_endpoint("/tmp/logicview.sock").is_err());
+    }
+
+    #[test]
+    fn attach_location_matches_this_platform() {
+        let text = attach_location();
+        #[cfg(unix)]
+        assert!(text.starts_with("unix socket "), "{text}");
+        #[cfg(windows)]
+        assert!(text.starts_with("TCP 127.0.0.1 via "), "{text}");
     }
 }
