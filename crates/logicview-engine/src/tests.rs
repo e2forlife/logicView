@@ -477,3 +477,61 @@ async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
         Some(50)
     );
 }
+
+#[tokio::test]
+async fn sample_rate_drops_when_more_channels_are_enabled() {
+    let engine = Engine::new();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 400_000_000,
+                duration_ms: 1,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.status(None).await.unwrap().sample_rate_hz, 400_000_000);
+    engine.attach_device(None, "demo:spi").await.unwrap();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 400_000_000,
+                duration_ms: 1,
+                channel_enable: 0,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let eight = engine.status(None).await.unwrap();
+    assert_eq!(eight.probes.len(), 8);
+    assert_eq!(eight.sample_rate_hz, 200_000_000);
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 400_000_000,
+                duration_ms: 1,
+                channel_enable: 0b0000_1111,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.status(None).await.unwrap().sample_rate_hz, 400_000_000);
+    let profiles = engine.list_profiles().await;
+    let plus = profiles
+        .iter()
+        .find(|profile| profile.product_id == 0x0020)
+        .unwrap();
+    let wide = profiles
+        .iter()
+        .find(|profile| profile.product_id == 0x002c)
+        .unwrap();
+    assert_eq!(plus.buffer_rates[0].max_hz, 400_000_000);
+    assert_eq!(wide.buffer_rates.last().unwrap().max_channels, 32);
+    assert_eq!(wide.stream_rates.last().unwrap().max_hz, 50_000_000);
+}

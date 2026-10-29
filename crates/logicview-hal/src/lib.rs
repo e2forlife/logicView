@@ -14,8 +14,9 @@ pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
 pub use catalog::{logic_profile, logic_profiles, LogicProfile};
 pub use device::{list_plus, list_pods, matches_plus, Pod};
 pub use profile::{
-    plan_clock, threshold_code, ClockPlan, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
-    HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, VENDOR_ID,
+    max_sample_hz, plan_clock, rate_limits, threshold_code, ClockPlan, RateLimit, BITSTREAM_NAME,
+    DEVICE_ID, HALF_RATE_HZ, HDL_VERSION, HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ,
+    U3PRO32_PID, VENDOR_ID,
 };
 
 use thiserror::Error;

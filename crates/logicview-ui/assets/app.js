@@ -55,6 +55,7 @@ const state = {
   planned: 0,
   waitKind: "",
   deviceList: [],
+  profiles: [],
 };
 
 const settings = {
@@ -1915,13 +1916,9 @@ function devicePanel() {
     <p id="profile-note" class="hint">Choose the source from the device menu. A plugged-in pod is listed above the demo devices. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
     <h3>Acquisition</h3>
     <label class="acq-row">Sample rate
-      <select id="set-rate" aria-label="Sample rate">
-        <option value="100000">100 kS/s</option>
-        <option value="1000000">1 MS/s</option>
-        <option value="20000000">20 MS/s</option>
-        <option value="100000000">100 MS/s</option>
-      </select>
+      <select id="set-rate" aria-label="Sample rate">${rateOptionsHtml()}</select>
     </label>
+    <p id="rate-note" class="hint">${rateNote()}</p>
     <label class="acq-row">Length
       <select id="set-duration" aria-label="Capture length">
         <option value="10">10 ms</option>
@@ -2021,6 +2018,13 @@ function bindPanel(name) {
     bindSelect("set-rate", "rate", true);
     bindSelect("set-duration", "duration", true);
     bindSelect("set-depth", "depth", false);
+    const depth = document.getElementById("set-depth");
+    if (depth) {
+      depth.addEventListener("change", () => {
+        clampSampleRate();
+        refillRateSelect();
+      });
+    }
     bindSelect("set-run", "run", false);
     const repeat = document.getElementById("set-repeat");
     const threshold = document.getElementById("set-threshold");
@@ -2092,6 +2096,7 @@ function bindPanel(name) {
         if (isOn) settings.channelEnable &= ~(1 << bit);
         else settings.channelEnable |= 1 << bit;
         writeSampleMask();
+        clampSampleRate();
         state.gutterSig = "";
         renderGutter();
         scheduleTiles();
@@ -2248,6 +2253,120 @@ function bindSelect(id, key, numeric) {
   });
 }
 
+const RATE_LADDER = [
+  10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
+  1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000, 25_000_000,
+  50_000_000, 100_000_000, 200_000_000, 250_000_000, 400_000_000,
+  500_000_000, 1_000_000_000,
+];
+
+const PLUS_BUFFER_RATES = [
+  { max_channels: 4, max_hz: 400_000_000 },
+  { max_channels: 8, max_hz: 200_000_000 },
+  { max_channels: 16, max_hz: 100_000_000 },
+];
+const PLUS_STREAM_RATES = [
+  { max_channels: 3, max_hz: 100_000_000 },
+  { max_channels: 6, max_hz: 50_000_000 },
+  { max_channels: 12, max_hz: 25_000_000 },
+  { max_channels: 16, max_hz: 20_000_000 },
+];
+
+function activeProductId() {
+  const usb = (state.devices || []).find((device) => String(device.id).startsWith("usb:"));
+  if (!usb) return 0x0020;
+  const pid = Number.parseInt(String(usb.id).split(":").pop(), 16);
+  return Number.isFinite(pid) ? pid : 0x0020;
+}
+
+function activeRateBands() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid)
+    || (state.profiles || []).find((item) => item.product_id === 0x0020);
+  const stream = settings.depth === "stream";
+  if (profile) {
+    const bands = stream ? profile.stream_rates : profile.buffer_rates;
+    if (bands && bands.length) return bands;
+  }
+  return stream ? PLUS_STREAM_RATES : PLUS_BUFFER_RATES;
+}
+
+function enabledChannelCount() {
+  const probes = state.probes.length ? state.probes : state.channels;
+  const width = Math.max(1, probes.length || 1);
+  if (!settings.channelEnable) return width;
+  let count = 0;
+  for (const probe of probes) {
+    if (channelIsEnabled(probe.index)) count += 1;
+  }
+  return Math.max(1, count);
+}
+
+function maxSampleHz(bands, channels) {
+  const band = bands.find((item) => channels <= item.max_channels) || bands[bands.length - 1];
+  return band ? band.max_hz : 100_000_000;
+}
+
+function legalSampleRates() {
+  const channels = enabledChannelCount();
+  const max = maxSampleHz(activeRateBands(), channels);
+  const rates = RATE_LADDER.filter((rate) => rate <= max);
+  if (max > 0 && !rates.includes(max)) rates.push(max);
+  rates.sort((a, b) => a - b);
+  return { channels, max, rates };
+}
+
+function clampSampleRate() {
+  const choice = legalSampleRates();
+  if (!choice.rates.length) return choice;
+  if (!choice.rates.includes(settings.rate) || settings.rate > choice.max) {
+    const under = choice.rates.filter((rate) => rate <= Math.min(settings.rate, choice.max));
+    settings.rate = under.length ? under[under.length - 1] : choice.rates[choice.rates.length - 1];
+  }
+  return choice;
+}
+
+function formatSampleRate(hz) {
+  const text = (value, unit) => {
+    const rounded = Math.round(value * 1000) / 1000;
+    return (Number.isInteger(rounded) ? String(rounded) : String(rounded)) + " " + unit;
+  };
+  if (hz >= 1e9) return text(hz / 1e9, "GS/s");
+  if (hz >= 1e6) return text(hz / 1e6, "MS/s");
+  if (hz >= 1e3) return text(hz / 1e3, "kS/s");
+  return hz + " S/s";
+}
+
+function rateProfileLabel() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid);
+  if (profile) return profile.name.replace(/^DSLogic /, "");
+  return pid === 0x002c ? "U3Pro32" : "Plus";
+}
+
+function rateNote() {
+  const choice = legalSampleRates();
+  const mode = settings.depth === "stream" ? "stream" : "buffer";
+  const noun = choice.channels === 1 ? "channel" : "channels";
+  return `${choice.channels} ${noun} enabled. ${rateProfileLabel()} ${mode} tops out at ${formatSampleRate(choice.max)}.`;
+}
+
+function rateOptionsHtml() {
+  clampSampleRate();
+  return legalSampleRates().rates.map((rate) => `<option value="${rate}">${formatSampleRate(rate)}</option>`).join("");
+}
+
+function refillRateSelect() {
+  const select = document.getElementById("set-rate");
+  const note = document.getElementById("rate-note");
+  const choice = clampSampleRate();
+  if (select) {
+    select.innerHTML = choice.rates.map((rate) => `<option value="${rate}">${formatSampleRate(rate)}</option>`).join("");
+    select.value = String(settings.rate);
+  }
+  if (note) note.textContent = rateNote();
+}
+
 function bindCheck(id, key) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -2349,11 +2468,14 @@ async function loadDeviceChoices() {
     }
     syncDeviceSelect();
     api({ cmd: "list_profiles" }).then((profiles) => {
+      state.profiles = profiles;
       const note = document.getElementById("profile-note");
-      if (!note) return;
-      const untested = profiles.filter((profile) => !profile.hardware_tested).length;
-      const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
-      note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
+      if (note) {
+        const untested = profiles.filter((profile) => !profile.hardware_tested).length;
+        const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
+        note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
+      }
+      if (state.tab === "device") refillRateSelect();
     }).catch(() => {});
   } catch (err) {
     statusEl.textContent = err.message;
