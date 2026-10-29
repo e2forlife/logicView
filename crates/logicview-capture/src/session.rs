@@ -358,6 +358,9 @@ impl Session {
     }
 
     pub fn finish(&mut self) {
+        // Alternating fill on every channel is not the captured signal.
+        // Drop it before the analog lane is cut to the logic length.
+        self.store.drop_shared_nyquist_tail();
         self.analog.truncate(self.store.len() as usize);
         self.locate_edge_trigger();
         if self.resolve_edges && self.config.trigger_enabled && !self.instant {

@@ -46,6 +46,11 @@ const state = {
   gutterSig: "",
   nextMarker: 1,
   nextMeasure: 1,
+  channelGroup: 0,
+  tileView: null,
+  planned: 0,
+  waitKind: "",
+  deviceList: [],
 };
 
 const settings = {
@@ -94,6 +99,8 @@ function view() {
       order,
       markers: [],
       measures: [],
+      buses: [],
+      nextBus: 1,
       selected: null,
     };
   }
@@ -137,7 +144,40 @@ function naturalRows() {
       device: "",
     });
   }
+  for (const bus of view().buses || []) {
+    rows.push({
+      key: "bus:" + bus.id,
+      kind: "bus",
+      channel: bus.channels[0] ?? 0,
+      name: bus.name,
+      color: "#d5deea",
+      device: "",
+      bus,
+    });
+  }
   return rows;
+}
+
+function probeForRow(row) {
+  return (state.probes || []).find((probe) => {
+    if (probe.name !== row.name) return false;
+    if (!row.device) return true;
+    return probe.device_id === row.device || probe.device_name === row.device;
+  });
+}
+
+function channelIsEnabled(index) {
+  if (!settings.channelEnable) return true;
+  return (settings.channelEnable & (1 << index)) !== 0;
+}
+
+function rowEnabled(row) {
+  if (row.kind === "bus") {
+    return row.bus.channels.some((index) => channelIsEnabled(index));
+  }
+  if (row.kind === "analog") return state.analog.length > 0;
+  const probe = probeForRow(row);
+  return channelIsEnabled(probe ? probe.index : row.channel);
 }
 
 function orderedRows() {
@@ -158,7 +198,22 @@ function orderedRows() {
 }
 
 function visibleRows() {
-  return orderedRows().filter((row) => !state.hidden.has(row.key));
+  return orderedRows().filter((row) => !state.hidden.has(row.key) && rowEnabled(row));
+}
+
+function triggerOrigin() {
+  if (!settings.trigger || state.total <= 0) return 0;
+  const percent = Number(settings.percent) || 0;
+  if (percent > 0) {
+    const raw = Math.floor(state.total * (percent / 100));
+    return raw - (raw % 64);
+  }
+  if (typeof state.triggerSample === "number" && state.triggerSample > 0) return state.triggerSample;
+  return 0;
+}
+
+function sampleSeconds(sample) {
+  return (sample - triggerOrigin()) / Math.max(1, state.rate);
 }
 
 function persistOrder(keys) {
@@ -202,6 +257,7 @@ function applyStatus(status, fromLive) {
     drawOverview();
   }
   if (status.phase === "stopped" && previous !== "stopped") loadAnnotations();
+  paintWait();
 }
 
 function fitView() {
@@ -365,7 +421,7 @@ function startChannelDrag(key, startY) {
 }
 
 function rowMetrics() {
-  const rows = orderedRows();
+  const rows = visibleRows();
   const stage = document.querySelector(".wave-stage");
   const viewport = Math.max(1, stage ? stage.clientHeight : 1);
   const v = view();
@@ -442,7 +498,7 @@ function renderGutter() {
     name.style.color = row.color;
     const kind = document.createElement("span");
     kind.className = "kind";
-    kind.textContent = row.kind === "analog" ? "Analog" : "Digital";
+    kind.textContent = row.kind === "analog" ? "Analog" : row.kind === "bus" ? (row.bus.analog ? "Analog" : "Bus") : "Digital";
     const eye = document.createElement("button");
     eye.type = "button";
     eye.className = "eye";
@@ -471,6 +527,12 @@ function renderGutter() {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize")) return;
       startChannelDrag(row.key, ev.clientY);
     });
+    if (row.kind === "bus") {
+      el.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        openBusMenu(row.bus, ev.clientX, ev.clientY);
+      });
+    }
     gutter.appendChild(el);
   }
 }
@@ -525,25 +587,28 @@ function drawRuler() {
   const span = (w * v.spp) / state.rate;
   const step = niceStep(span, w);
   if (step && isFinite(step)) {
-    const startSec = v.start / state.rate;
+    const startSec = sampleSeconds(v.start);
     const first = Math.ceil(startSec / step) * step;
     ctx.fillStyle = "#9aa6b8";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
+    let lastLabel = -Infinity;
     for (let t = first; t < startSec + span + step * 0.01; t += step) {
-      const x = (t * state.rate - v.start) / v.spp;
+      const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
       if (x < -20 || x > w + 20) continue;
       ctx.strokeStyle = "#3a4658";
       ctx.beginPath();
       ctx.moveTo(x + 0.5, h - 7);
       ctx.lineTo(x + 0.5, h);
       ctx.stroke();
-      ctx.fillText(formatSeconds(t), x, 3);
+      if (x - lastLabel < 72) continue;
+      ctx.fillText(formatRulerTick(t, step), x, 3);
+      lastLabel = x;
     }
   }
-  if (state.triggerSample != null) {
-    const x = (state.triggerSample - v.start) / v.spp;
+  if (settings.trigger && state.total > 0) {
+    const x = (triggerOrigin() - v.start) / v.spp;
     if (x >= -8 && x <= w + 8) drawDiamond(ctx, x, h / 2, "#f0c14d");
   }
   view().markers.forEach((marker, index) => {
@@ -590,8 +655,9 @@ function drawWave() {
     const cols = state.tiles[row.key];
     if (!cols) continue;
     if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
-    else drawDigital(ctx, cols, item.top, item.height, row.color);
+    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
   }
+  drawBuses(ctx, layout);
   drawAnnotations(ctx, w);
   ctx.restore();
   for (const item of layout) {
@@ -643,11 +709,11 @@ function drawGrid(ctx, w, h, layout) {
     const span = (w * v.spp) / state.rate;
     const step = niceStep(span, w);
     if (step && isFinite(step)) {
-      const startSec = v.start / state.rate;
+      const startSec = sampleSeconds(v.start);
       const first = Math.ceil(startSec / step) * step;
       ctx.strokeStyle = "rgba(86, 140, 190, 0.16)";
       for (let t = first; t < startSec + span + step * 0.01; t += step) {
-        const x = (t * state.rate - v.start) / v.spp;
+        const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
         ctx.beginPath();
         ctx.moveTo(x + 0.5, 0);
         ctx.lineTo(x + 0.5, h);
@@ -673,7 +739,7 @@ function drawGrid(ctx, w, h, layout) {
       ctx.moveTo(0, top + rowH - pad + 0.5);
       ctx.lineTo(w, top + rowH - pad + 0.5);
       ctx.stroke();
-    } else {
+    } else if (row.kind === "analog") {
       const mid = top + rowH / 2;
       ctx.strokeStyle = "rgba(140, 170, 200, 0.18)";
       ctx.beginPath();
@@ -687,6 +753,14 @@ function drawGrid(ctx, w, h, layout) {
       ctx.fillText("1 V", 6, top + 12);
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
+    } else if (row.kind === "bus" && row.bus && row.bus.analog) {
+      const max = Math.max(1, (1 << row.bus.channels.length) - 1);
+      ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("0x" + max.toString(16).toUpperCase(), 6, top + 12);
+      ctx.fillText("0", 6, top + rowH - 12);
     }
   }
   ctx.restore();
@@ -771,6 +845,19 @@ function drawAnnotations(ctx, w) {
   }
 }
 
+function tileSample(index) {
+  const tile = state.tileView;
+  if (!tile || !(tile.spp > 0)) return view().start + index * view().spp;
+  return tile.start + index * tile.spp;
+}
+
+function traceX(index) {
+  const v = view();
+  const tile = state.tileView;
+  const spp = tile && tile.spp > 0 ? tile.spp : v.spp;
+  return (tileSample(index) + spp * 0.5 - v.start) / Math.max(v.spp, 1e-9);
+}
+
 function drawDigital(ctx, cols, top, height, color) {
   const pad = Math.max(8, height * 0.22);
   const yTop = top + pad;
@@ -780,25 +867,26 @@ function drawDigital(ctx, cols, top, height, color) {
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.6;
   let prev = null;
-  for (let x = 0; x < cols.length; x++) {
-    if (pastCapture(x)) break;
-    const column = cols[x];
+  for (let i = 0; i < cols.length; i++) {
+    if (tileSample(i) >= state.total) break;
+    const column = cols[i];
     if (!column || column.valid === false) break;
+    const x = traceX(i);
     if (column.toggled) {
       const yLast = yOf(column.last);
-      if (prev == null) ctx.moveTo(x + 0.5, yOf(column.first));
-      ctx.lineTo(x + 0.5, yTop);
-      ctx.lineTo(x + 0.5, yBot);
-      ctx.lineTo(x + 0.5, yLast);
+      if (prev == null) ctx.moveTo(x, yOf(column.first));
+      ctx.lineTo(x, yTop);
+      ctx.lineTo(x, yBot);
+      ctx.lineTo(x, yLast);
       prev = yLast;
     } else {
       const y = yOf(column.last);
-      if (prev == null) ctx.moveTo(x + 0.5, y);
+      if (prev == null) ctx.moveTo(x, y);
       else if (prev !== y) {
-        ctx.lineTo(x + 0.5, prev);
-        ctx.lineTo(x + 0.5, y);
+        ctx.lineTo(x, prev);
+        ctx.lineTo(x, y);
       } else {
-        ctx.lineTo(x + 0.5, y);
+        ctx.lineTo(x, y);
       }
       prev = y;
     }
@@ -817,7 +905,7 @@ function drawAnalog(ctx, cols, top, height, color) {
     return y1 - t * (y1 - y0);
   };
   const usable = (column, index) => {
-    if (pastCapture(index) || !column || column.valid === false) return false;
+    if (tileSample(index) >= state.total || !column || column.valid === false) return false;
     if (!Number.isFinite(column.min) || !Number.isFinite(column.max)) return false;
     if (Math.abs(column.min) > 20 || Math.abs(column.max) > 20) return false;
     return true;
@@ -825,20 +913,20 @@ function drawAnalog(ctx, cols, top, height, color) {
   ctx.beginPath();
   let started = false;
   for (let i = 0; i < cols.length; i++) {
-    if (pastCapture(i)) break;
+    if (tileSample(i) >= state.total) break;
     const column = cols[i];
     if (!usable(column, i)) continue;
-    const x = i + 0.5;
+    const x = traceX(i);
     if (!started) {
       ctx.moveTo(x, yOf(column.max));
       started = true;
     } else ctx.lineTo(x, yOf(column.max));
   }
   for (let i = cols.length - 1; i >= 0; i--) {
-    if (pastCapture(i)) continue;
+    if (tileSample(i) >= state.total) continue;
     const column = cols[i];
     if (!usable(column, i)) continue;
-    ctx.lineTo(i + 0.5, yOf(column.min));
+    ctx.lineTo(traceX(i), yOf(column.min));
   }
   if (started) {
     ctx.closePath();
@@ -851,18 +939,77 @@ function drawAnalog(ctx, cols, top, height, color) {
   ctx.beginPath();
   started = false;
   for (let i = 0; i < cols.length; i++) {
-    if (pastCapture(i)) break;
+    if (tileSample(i) >= state.total) break;
     const column = cols[i];
     if (!usable(column, i)) continue;
     const y = yOf((column.min + column.max) / 2);
     if (!started) {
-      ctx.moveTo(i + 0.5, y);
+      ctx.moveTo(traceX(i), y);
       started = true;
-    } else ctx.lineTo(i + 0.5, y);
+    } else ctx.lineTo(traceX(i), y);
   }
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.4;
   ctx.stroke();
+}
+
+function busValueAt(bus, index) {
+  let value = 0;
+  for (let bit = 0; bit < bus.channels.length; bit++) {
+    const cols = state.tiles["logic:" + bus.channels[bit]];
+    const column = cols && cols[index];
+    if (column && column.valid !== false && column.last) value |= 1 << bit;
+  }
+  return value;
+}
+
+function drawBuses(ctx, layout) {
+  for (const item of layout) {
+    const row = item.row;
+    if (row.kind !== "bus" || state.hidden.has(row.key)) continue;
+    const bus = row.bus;
+    const cols = state.tiles["logic:" + bus.channels[0]];
+    if (!cols) continue;
+    const pad = Math.max(8, item.height * 0.22);
+    const top = item.top + pad;
+    const bot = item.top + item.height - pad;
+    const max = Math.max(1, (1 << bus.channels.length) - 1);
+    if (bus.analog) {
+      ctx.beginPath();
+      ctx.strokeStyle = "#7dcea0";
+      ctx.lineWidth = 1.4;
+      let started = false;
+      for (let i = 0; i < cols.length; i++) {
+        if (tileSample(i) >= state.total) break;
+        const y = bot - (busValueAt(bus, i) / max) * (bot - top);
+        const x = traceX(i);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      continue;
+    }
+    ctx.font = "12px sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#d5deea";
+    let prev = null;
+    let lastX = -100;
+    for (let i = 0; i < cols.length; i++) {
+      if (tileSample(i) >= state.total) break;
+      const value = busValueAt(bus, i);
+      const x = traceX(i);
+      if (prev == null) prev = value;
+      if (value !== prev || i === 0) {
+        if (x - lastX > 36) {
+          ctx.fillText("0x" + value.toString(16).toUpperCase(), x + 4, (top + bot) / 2);
+          lastX = x;
+        }
+        prev = value;
+      }
+    }
+  }
 }
 
 function drawOverview() {
@@ -922,7 +1069,7 @@ async function runTiles() {
 }
 
 async function fetchTiles() {
-  const rows = visibleRows();
+  const rows = visibleRows().filter((row) => row.kind === "logic" || row.kind === "analog");
   const width = Math.max(1, Math.floor(wave.clientWidth || 1));
   const v = view();
   const req = ++state.req;
@@ -981,6 +1128,7 @@ async function fetchTiles() {
   }
   if (Object.keys(pending.got).length) {
     state.tiles = pending.got;
+    state.tileView = { start, spp, width };
     drawWave();
     drawRuler();
   }
@@ -1097,6 +1245,8 @@ async function runCapture() {
   paintStatus();
   try {
     view().userNavigated = false;
+    state.planned = Math.floor(settings.rate * settings.duration / 1000);
+    state.planned -= state.planned % 64;
     const status = await api({
       cmd: "configure",
       session: state.active,
@@ -1149,7 +1299,7 @@ async function stopCapture() {
 
 function selectTab(name) {
   state.tab = name;
-  for (const button of document.querySelectorAll(".side-tabs button")) {
+  for (const button of document.querySelectorAll(".side-rail button[data-tab]")) {
     button.classList.toggle("active", button.dataset.tab === name);
   }
   sideBody.innerHTML = panelHtml(name);
@@ -1194,7 +1344,7 @@ function panelHtml(name) {
       <button class="block" id="download" type="button">Download .lvcap</button>
       <button class="block" id="download-dsl" type="button">Download .dsl</button>
       <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">CSV and Excel list one row per sample: time, logic levels, and the demo sine in volts. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
+      <p class="hint">CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -1224,15 +1374,18 @@ function devicePanel() {
     ? state.analog.map((channel) => channel.name).join(", ")
     : "none";
   const source = state.channels.map((channel) => `<option value="${channel.index}">${channel.name}</option>`).join("");
+  const analogRow = state.analog.length
+    ? `<div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>`
+    : "";
   return `<h2>Device</h2>
-    <div class="device-card">
+    <button type="button" class="device-card" id="device-card">
       <svg class="pod" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 6V4M12 6V4M17 6V4M7 20v-2M12 20v-2M17 20v-2"></path></svg>
       <div>
         <strong>${title}</strong>
         <span class="connected"><i class="dot"></i> Connected</span>
         <p class="hint">${hardware ? "Opened pod. The name is the one the engine reports." : "Software demo. No pod serial number."}</p>
       </div>
-    </div>
+    </button>
     <p id="profile-note" class="hint">Choose the source from the device menu. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
     <h3>Acquisition</h3>
     <label class="acq-row">Sample rate
@@ -1261,8 +1414,8 @@ function devicePanel() {
     <div class="acq-row"><span>Digital channels</span><span class="value">${state.channels.length} · ${logic}</span></div>
     <h3>Sample</h3>
     <div id="channel-enable">${channelChecks(state.probes.length ? state.probes : state.channels)}</div>
-    <p class="hint">Unchecked channels are left out of the next capture.</p>
-    <div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>
+    <p class="hint">Dim channels are left out of the next capture and hidden on the waveform.</p>
+    ${analogRow}
     <label class="acq-row">Input voltage
       <select id="set-threshold" aria-label="Input voltage">
         <option value="0.8">0.8 V</option>
@@ -1301,7 +1454,10 @@ function devicePanel() {
         </select>
       </label>
       <label class="acq-row">Repeat interval
-        <input id="set-repeat" type="number" min="0" step="100" aria-label="Repeat interval">
+        <span class="unit-field">
+          <input id="set-repeat" type="number" min="0" step="100" aria-label="Repeat interval in milliseconds">
+          <span>ms</span>
+        </span>
       </label>
       <label class="check"><input id="set-rle" type="checkbox"> RLE</label>
       <label class="check"><input id="set-filter" type="checkbox"> One-sample filter</label>
@@ -1316,10 +1472,21 @@ function devicePanel() {
 }
 
 function channelChecks(probes) {
-  return probes.map((probe) => {
-    const on = settings.channelEnable === 0 || (settings.channelEnable & (1 << probe.index)) !== 0;
-    return `<label class="check"><input type="checkbox" data-bit="${probe.index}"${on ? " checked" : ""}> ${probe.name}</label>`;
+  const groups = [];
+  for (let i = 0; i < probes.length; i += 8) groups.push(probes.slice(i, i + 8));
+  if (!groups.length) return "";
+  if (state.channelGroup >= groups.length) state.channelGroup = 0;
+  const tabs = groups.map((group, index) => {
+    const from = index * 8 + 1;
+    const to = index * 8 + group.length;
+    return `<button type="button" class="ch-tab${index === state.channelGroup ? " active" : ""}" data-group="${index}">${from}–${to}</button>`;
   }).join("");
+  const buttons = groups[state.channelGroup].map((probe) => {
+    const on = channelIsEnabled(probe.index);
+    const color = probe.color || "#8eb6ff";
+    return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}">${probe.name}</button>`;
+  }).join("");
+  return `<div class="ch-tabs">${tabs}</div><div class="ch-enables">${buttons}</div>`;
 }
 
 function bindPanel(name) {
@@ -1365,21 +1532,47 @@ function bindPanel(name) {
       const toolbar = document.getElementById("trig-percent");
       if (toolbar) toolbar.value = String(settings.percent);
     });
-    const sampleBoxes = [...document.querySelectorAll("#channel-enable input")];
+    const card = document.getElementById("device-card");
+    if (card) card.addEventListener("click", () => openDeviceMenu(card));
+    for (const tab of document.querySelectorAll("#channel-enable .ch-tab")) {
+      tab.addEventListener("click", () => {
+        state.channelGroup = Number(tab.dataset.group);
+        selectTab("device");
+      });
+    }
+    const sampleButtons = [...document.querySelectorAll("#channel-enable .ch-en")];
     const writeSampleMask = () => {
-      const checked = sampleBoxes.filter((box) => box.checked);
-      if (!checked.length && sampleBoxes[0]) sampleBoxes[0].checked = true;
-      if (sampleBoxes.every((box) => box.checked)) {
-        settings.channelEnable = 0;
-        return;
+      const probes = state.probes.length ? state.probes : state.channels;
+      const on = probes.filter((probe) => channelIsEnabled(probe.index));
+      if (on.length === probes.length) settings.channelEnable = 0;
+      else {
+        let mask = 0;
+        for (const probe of on) mask |= 1 << probe.index;
+        settings.channelEnable = mask || 1;
       }
-      let mask = 0;
-      for (const box of sampleBoxes) {
-        if (box.checked) mask |= 1 << Number(box.dataset.bit);
-      }
-      settings.channelEnable = mask;
     };
-    for (const box of sampleBoxes) box.addEventListener("change", writeSampleMask);
+    for (const button of sampleButtons) {
+      button.addEventListener("click", () => {
+        const bit = Number(button.dataset.bit);
+        const probes = state.probes.length ? state.probes : state.channels;
+        const enabled = probes.filter((probe) => channelIsEnabled(probe.index));
+        const isOn = channelIsEnabled(bit);
+        if (isOn && enabled.length <= 1) return;
+        if (settings.channelEnable === 0) {
+          let mask = 0;
+          for (const probe of probes) mask |= 1 << probe.index;
+          settings.channelEnable = mask;
+        }
+        if (isOn) settings.channelEnable &= ~(1 << bit);
+        else settings.channelEnable |= 1 << bit;
+        writeSampleMask();
+        state.gutterSig = "";
+        renderGutter();
+        scheduleTiles();
+        drawWave();
+        selectTab("device");
+      });
+    }
     bindCheck("set-rle", "rle");
     bindCheck("set-filter", "filter");
     bindCheck("set-ext", "extClock");
@@ -1458,7 +1651,7 @@ function renderMarkerList() {
     dot.className = "swatch-dot";
     dot.style.background = MARKER_COLORS[index % MARKER_COLORS.length];
     const label = document.createElement("span");
-    const seconds = marker.sample / Math.max(1, state.rate);
+    const seconds = sampleSeconds(marker.sample);
     label.textContent = `M${marker.n} · ${formatSeconds(seconds)} · sample ${marker.sample}`;
     const nameInput = document.createElement("input");
     nameInput.type = "text";
@@ -1531,45 +1724,92 @@ function bindCheck(id, key) {
   el.addEventListener("change", () => { settings[key] = el.checked; });
 }
 
+function deviceLabel(id) {
+  if (id === "demo+demo:spi") return "Demo + Demo SPI";
+  const found = state.deviceList.find((device) => device.id === id);
+  if (found) return found.name;
+  return (state.devices || []).map((device) => device.name).join(" + ") || settings.deviceName || "Demo";
+}
+
 function syncDeviceSelect() {
-  const select = document.getElementById("device-select");
-  if (!select || !select.options.length) return;
-  const key = (state.devices || []).map((device) => device.id).join("+");
-  if ([...select.options].some((option) => option.value === key)) select.value = key;
-  const chosen = [...select.options].find((option) => option.value === select.value);
   const name = document.getElementById("device-name");
-  if (name && chosen) name.textContent = chosen.textContent;
+  const key = (state.devices || []).map((device) => device.id).join("+");
+  if (name) name.textContent = deviceLabel(key);
+}
+
+function deviceMenuButton(id, label) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.device = id;
+  button.textContent = label;
+  button.addEventListener("click", () => {
+    closeDeviceMenu();
+    applyDeviceChoice(id);
+  });
+  return button;
+}
+
+function renderDeviceMenu() {
+  const menu = document.getElementById("device-menu");
+  if (!menu) return;
+  menu.replaceChildren();
+  const pods = state.deviceList.filter((device) => device.kind !== "demo");
+  const demos = state.deviceList.filter((device) => device.kind === "demo");
+  for (const pod of pods) menu.append(deviceMenuButton(pod.id, pod.name));
+  if (!demos.length) return;
+  const row = document.createElement("div");
+  row.className = "device-sub";
+  const label = document.createElement("button");
+  label.type = "button";
+  label.textContent = "Demo";
+  label.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    row.classList.toggle("open");
+  });
+  const sub = document.createElement("div");
+  sub.className = "device-submenu";
+  for (const demo of demos) sub.append(deviceMenuButton(demo.id, demo.name));
+  if (demos.some((device) => device.id === "demo") && demos.some((device) => device.id === "demo:spi")) {
+    sub.append(deviceMenuButton("demo+demo:spi", "Demo + Demo SPI"));
+  }
+  row.append(label, sub);
+  menu.append(row);
+}
+
+function closeDeviceMenu() {
+  const menu = document.getElementById("device-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function openDeviceMenu(anchor) {
+  const menu = document.getElementById("device-menu");
+  if (!menu) return;
+  if (!menu.classList.contains("hidden")) {
+    closeDeviceMenu();
+    return;
+  }
+  renderDeviceMenu();
+  menu.classList.remove("hidden");
+  const rect = anchor.getBoundingClientRect();
+  const below = rect.bottom + 6;
+  menu.style.left = Math.max(8, rect.left) + "px";
+  menu.style.top = below + "px";
+  placeDeviceSubmenu();
+}
+
+function placeDeviceSubmenu() {
+  const menu = document.getElementById("device-menu");
+  const row = menu && menu.querySelector(".device-sub");
+  if (!row) return;
+  const rect = menu.getBoundingClientRect();
+  row.classList.toggle("flip", rect.right + 196 > window.innerWidth);
 }
 
 async function loadDeviceChoices() {
-  const select = document.getElementById("device-select");
-  if (!select) return;
   try {
     const devices = await api({ cmd: "list_devices" });
-    const previous = select.value;
-    select.replaceChildren();
-    const demos = devices.filter((device) => device.kind === "demo");
-    for (const device of demos) {
-      const option = document.createElement("option");
-      option.value = device.id;
-      option.textContent = device.name;
-      select.append(option);
-    }
-    if (demos.some((device) => device.id === "demo") && demos.some((device) => device.id === "demo:spi")) {
-      const stacked = document.createElement("option");
-      stacked.value = "demo+demo:spi";
-      stacked.textContent = "Demo + Demo SPI";
-      select.append(stacked);
-    }
-    for (const device of devices) {
-      if (device.kind === "demo") continue;
-      const option = document.createElement("option");
-      option.value = device.id;
-      option.textContent = device.name;
-      select.append(option);
-    }
+    state.deviceList = devices;
     syncDeviceSelect();
-    if (!select.value && previous) select.value = previous;
     api({ cmd: "list_profiles" }).then((profiles) => {
       const note = document.getElementById("profile-note");
       if (!note) return;
@@ -2011,6 +2251,11 @@ function onEngineEvent(msg) {
       devices: state.devices,
     }, true);
   }
+  if (msg.type === "stopped") {
+    api({ cmd: "status", session: state.active }).then((status) => {
+      if (msg.session === state.active) applyStatus(status, false);
+    }).catch(() => {});
+  }
 }
 
 function markerAt(x) {
@@ -2070,34 +2315,44 @@ async function snapMarker(marker, clientX, clientY) {
 wave.addEventListener("wheel", (ev) => {
   ev.preventDefault();
   if (state.total <= 0) return;
-  const v = view();
-  const rect = wave.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
-  const sample = v.start + x * v.spp;
-  const factor = ev.deltaY > 0 ? 1.25 : 1 / 1.25;
-  zoomAt(sample, x, factor);
+  stepZoom(ev.deltaY > 0);
 }, { passive: false });
+
+function currentTimebaseIndex() {
+  syncTimebaseLabel();
+  const slider = document.getElementById("timebase");
+  const index = slider ? Number(slider.value) : 0;
+  if (!Number.isInteger(index) || index < 0 || index >= TIME_DIVS.length) return 0;
+  return index;
+}
+
+function stepZoom(out) {
+  const slider = document.getElementById("timebase");
+  if (!slider || state.total <= 0) return;
+  const current = currentTimebaseIndex();
+  const next = Math.max(0, Math.min(TIME_DIVS.length - 1, current + (out ? 1 : -1)));
+  if (next === current) return;
+  slider.value = String(next);
+  applyTimebase(next);
+  drawWave();
+}
 
 function zoomAt(sample, x, factor) {
   const v = view();
   const width = Math.max(1, wave.clientWidth);
   const minSpp = 1 / 32;
-  const maxSpp = Math.max(minSpp, (Math.max(state.total, 1) / width) * 8);
-  v.spp = Math.min(maxSpp, Math.max(minSpp, v.spp * factor));
+  const maxSpp = Math.max(minSpp, (Math.max(state.total, 1) / width) * 4);
+  const before = v.spp;
+  v.spp = Math.min(maxSpp, Math.max(minSpp, before * factor));
+  if (v.spp === before) return;
   v.start = sample - x * v.spp;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
+  drawWave();
   drawRuler();
   drawOverview();
   syncTimebaseLabel();
-}
-
-function zoomBy(factor) {
-  const width = Math.max(1, wave.clientWidth);
-  const x = width / 2;
-  const sample = view().start + x * view().spp;
-  zoomAt(sample, x, factor);
 }
 
 wave.addEventListener("pointerdown", (ev) => {
@@ -2368,7 +2623,8 @@ function formatDiv(seconds) {
 }
 
 function applyTimebase(index) {
-  const seconds = TIME_DIVS[index] || TIME_DIVS[0];
+  if (!Number.isInteger(index) || index < 0 || index >= TIME_DIVS.length) return;
+  const seconds = TIME_DIVS[index];
   const px = Math.max(40, (wave.clientWidth || 800) / 10);
   const v = view();
   const width = Math.max(1, wave.clientWidth);
@@ -2378,6 +2634,7 @@ function applyTimebase(index) {
   v.userNavigated = true;
   clampView();
   scheduleTiles();
+  drawWave();
   drawRuler();
   drawOverview();
   const label = document.getElementById("timebase-label");
@@ -2447,8 +2704,8 @@ const MENUS = {
     ["Stop", () => stopCapture()],
   ],
   view: [
-    ["Zoom in", () => zoomBy(1 / 1.4)],
-    ["Zoom out", () => zoomBy(1.4)],
+    ["Zoom in", () => stepZoom(false)],
+    ["Zoom out", () => stepZoom(true)],
   ],
   decode: [["Open decode", () => selectTab("decode")]],
   measure: [["Add measurement", () => setTool("measure")]],
@@ -2456,6 +2713,7 @@ const MENUS = {
     ["Previous edge", () => stepEdge(false)],
     ["Next edge", () => stepEdge(true)],
     ["Add marker", () => setTool("marker")],
+    ["Group channels as a bus", () => openBusDialog()],
   ],
   help: [["About this demo", () => { statusEl.textContent = "LogicView demo source. Run starts a capture. Stop ends it."; }]],
 };
@@ -2516,12 +2774,15 @@ renderTable();
 document.getElementById("run").addEventListener("click", () => runCapture());
 document.getElementById("stop").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
-document.getElementById("device-select").addEventListener("change", (ev) => applyDeviceChoice(ev.target.value));
-document.getElementById("channel-add").addEventListener("click", () => selectTab("device"));
+document.getElementById("device-select").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  openDeviceMenu(document.querySelector(".device-chip"));
+});
+document.getElementById("channel-add").addEventListener("click", () => openSidebar("device"));
 document.getElementById("tool-marker").addEventListener("click", () => setTool("marker"));
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
-document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1 / 1.4));
-document.getElementById("zoom-out").addEventListener("click", () => zoomBy(1.4));
+document.getElementById("zoom-in").addEventListener("click", () => stepZoom(false));
+document.getElementById("zoom-out").addEventListener("click", () => stepZoom(true));
 document.getElementById("edge-prev").addEventListener("click", (ev) => {
   ev.stopPropagation();
   stepEdge(false, state.edgeChannel);
@@ -2567,9 +2828,24 @@ trigPercent.addEventListener("change", () => {
   if (label) label.textContent = settings.percent + "%";
 });
 
-for (const button of document.querySelectorAll(".side-tabs button")) {
-  button.addEventListener("click", () => selectTab(button.dataset.tab));
+for (const button of document.querySelectorAll(".side-rail button[data-tab]")) {
+  button.addEventListener("click", () => openSidebar(button.dataset.tab));
 }
+const sidePanel = document.getElementById("side-panel");
+const sidePin = document.getElementById("side-pin");
+sidePin.addEventListener("click", () => {
+  const pinned = sidePanel.classList.toggle("pinned");
+  sidePin.classList.toggle("pinned", pinned);
+  sidePin.setAttribute("aria-pressed", pinned ? "true" : "false");
+  if (pinned) sidePanel.classList.add("open");
+});
+sidePanel.addEventListener("pointerleave", (ev) => {
+  if (sidePanel.classList.contains("pinned")) return;
+  if (ev.relatedTarget && sidePanel.contains(ev.relatedTarget)) return;
+  const menu = document.getElementById("device-menu");
+  if (menu && !menu.classList.contains("hidden")) return;
+  sidePanel.classList.remove("open");
+});
 for (const button of document.querySelectorAll(".menubar button")) {
   button.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -2578,6 +2854,10 @@ for (const button of document.querySelectorAll(".menubar button")) {
 }
 document.addEventListener("click", (ev) => {
   if (!ev.target.closest(".menu-pop") && !ev.target.closest(".menubar")) closeMenu();
+  if (!ev.target.closest("#device-menu") && !ev.target.closest("#device-select") && !ev.target.closest("#device-card")) {
+    closeDeviceMenu();
+  }
+  if (!ev.target.closest("#bus-menu")) closeBusMenu();
 });
 
 window.addEventListener("keydown", (ev) => {
@@ -2637,12 +2917,36 @@ setInterval(async () => {
 bindSplitters();
 
 function niceStep(span, px) {
-  const target = span / Math.max(1, px / 90);
+  const target = span / Math.max(1, px / 140);
   if (!(target > 0) || !isFinite(target)) return null;
   const pow = 10 ** Math.floor(Math.log10(target));
   const err = target / pow;
   const nice = err >= 5 ? 5 : err >= 2 ? 2 : 1;
   return nice * pow;
+}
+
+function formatRulerTick(seconds, step) {
+  const sign = seconds < 0 ? "-" : "";
+  const magnitude = Math.abs(seconds);
+  const basis = step > 0 && isFinite(step) ? step : magnitude || 1;
+  let scale = 1e9;
+  let unit = "ns";
+  if (basis >= 1) {
+    scale = 1;
+    unit = "s";
+  } else if (basis >= 1e-3) {
+    scale = 1e3;
+    unit = "ms";
+  } else if (basis >= 1e-6) {
+    scale = 1e6;
+    unit = "µs";
+  }
+  const quantum = basis * scale;
+  const snapped = Math.round((magnitude * scale) / quantum) * quantum;
+  const decimals = quantum >= 100 ? 0 : quantum >= 10 ? 1 : quantum >= 1 ? 2 : 3;
+  let text = snapped.toFixed(decimals).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  if (!text || text === "-0") text = "0";
+  return `${sign}${text} ${unit}`;
 }
 
 function formatSeconds(seconds) {
@@ -2662,6 +2966,116 @@ function formatHz(hz) {
   return hz.toFixed(2) + " Hz";
 }
 
+function openSidebar(name) {
+  document.getElementById("side-panel").classList.add("open");
+  selectTab(name);
+}
+
+let triggeredTimer = null;
+
+function paintWait() {
+  const dialog = document.getElementById("capture-wait");
+  const text = document.getElementById("wait-text");
+  const arc = document.getElementById("wait-arc");
+  if (!dialog || !text || !arc) return;
+  const buffer = settings.depth !== "stream";
+  const waiting = state.phase === "waiting_trigger";
+  const sampling = buffer && (state.phase === "running" || state.phase === "arming") && state.planned > 0 && state.total < state.planned;
+  if (state.waitKind === "waiting" && !waiting && (state.phase === "running" || state.phase === "stopped")) {
+    showTriggered();
+    return;
+  }
+  if (waiting) {
+    state.waitKind = "waiting";
+    dialog.className = "wait-dialog waiting";
+    text.textContent = "Waiting for trigger";
+    return;
+  }
+  if (sampling) {
+    state.waitKind = "sampling";
+    dialog.className = "wait-dialog sampling";
+    text.textContent = "Sampling";
+    const circ = 2 * Math.PI * 46;
+    const frac = Math.max(0, Math.min(1, state.total / state.planned));
+    arc.style.strokeDasharray = String(circ);
+    arc.style.strokeDashoffset = String(circ * (1 - frac));
+    return;
+  }
+  if (state.waitKind === "triggered") return;
+  state.waitKind = "";
+  dialog.className = "wait-dialog hidden";
+}
+
+function showTriggered() {
+  const dialog = document.getElementById("capture-wait");
+  const text = document.getElementById("wait-text");
+  state.waitKind = "triggered";
+  dialog.className = "wait-dialog triggered";
+  text.textContent = "Triggered";
+  clearTimeout(triggeredTimer);
+  triggeredTimer = setTimeout(() => {
+    if (state.waitKind !== "triggered") return;
+    state.waitKind = "";
+    dialog.className = "wait-dialog hidden";
+    paintWait();
+  }, 700);
+}
+
+function openBusDialog() {
+  const host = document.getElementById("bus-channels");
+  const probes = state.probes.length ? state.probes : state.channels;
+  host.replaceChildren();
+  for (const probe of probes) {
+    const label = document.createElement("label");
+    label.className = "check";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = String(probe.index);
+    label.append(box, document.createTextNode(" " + probe.name));
+    host.appendChild(label);
+  }
+  document.getElementById("bus-name").value = "Bus " + (view().nextBus || 1);
+  document.getElementById("bus-dialog").classList.remove("hidden");
+}
+
+function closeBusDialog() {
+  document.getElementById("bus-dialog").classList.add("hidden");
+}
+
+function closeBusMenu() {
+  const menu = document.getElementById("bus-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function openBusMenu(bus, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  const item = document.createElement("button");
+  item.type = "button";
+  item.textContent = bus.analog ? "Hex view" : "Analog view";
+  item.addEventListener("click", () => {
+    bus.analog = !bus.analog;
+    state.gutterSig = "";
+    closeBusMenu();
+    renderGutter();
+    drawWave();
+  });
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove bus";
+  remove.addEventListener("click", () => {
+    view().buses = view().buses.filter((entry) => entry.id !== bus.id);
+    state.gutterSig = "";
+    closeBusMenu();
+    renderGutter();
+    drawWave();
+  });
+  menu.append(item, remove);
+  menu.classList.remove("hidden");
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+}
+
 async function boot() {
   await refreshSessions();
   const listed = await api({ cmd: "list_sessions" });
@@ -2675,6 +3089,24 @@ async function boot() {
   drawWave();
   syncTimebaseLabel();
 }
+
+document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
+document.getElementById("bus-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const channels = [...document.querySelectorAll("#bus-channels input:checked")].map((box) => Number(box.value));
+  if (channels.length < 2) {
+    statusEl.textContent = "A bus needs at least two channels";
+    return;
+  }
+  const v = view();
+  const name = document.getElementById("bus-name").value.trim() || ("Bus " + v.nextBus);
+  v.buses.push({ id: v.nextBus, name, channels, analog: false });
+  v.nextBus += 1;
+  state.gutterSig = "";
+  closeBusDialog();
+  renderGutter();
+  drawWave();
+});
 
 boot().catch((err) => {
   statusEl.textContent = err.message;

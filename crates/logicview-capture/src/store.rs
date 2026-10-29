@@ -275,6 +275,61 @@ impl LogicStore {
         self.channels.iter().map(|ch| ch.bytes.clone()).collect()
     }
 
+    /// Drop samples from the end so at most `samples` remain.
+    ///
+    /// `samples` is aligned down to a whole byte. Summaries are rebuilt from
+    /// the bytes that are left, so a later tile cannot see the discarded tail.
+    pub fn truncate(&mut self, samples: u64) {
+        let keep = samples & !7;
+        if keep >= self.len() {
+            return;
+        }
+        let keep_bytes = (keep / 8) as usize;
+        for channel in &mut self.channels {
+            channel.bytes.truncate(keep_bytes);
+            channel.len = keep;
+            channel.rebuild();
+        }
+    }
+
+    /// Remove a suffix where every channel flips on every sample.
+    ///
+    /// A full-buffer upload can end in alternating fill (`0x55` / `0xAA` on
+    /// every channel at once). Drawn, that is a burst of edges after an
+    /// otherwise clean capture. It is not the stored signal: a clock on one
+    /// wire does not qualify, because the other channels stay still. The
+    /// kept prefix is the signal. Returns how many samples were dropped.
+    pub fn drop_shared_nyquist_tail(&mut self) -> u64 {
+        let len = self.len();
+        let width = self.channel_count();
+        if width < 2 || len < 128 {
+            return 0;
+        }
+        let mut index = len - 1;
+        let mut flips = 0u64;
+        let mut start = len;
+        while index > 0 {
+            let flipped = (0..width).all(|channel| {
+                self.level(channel, index) != self.level(channel, index - 1)
+            });
+            if !flipped {
+                break;
+            }
+            flips += 1;
+            start = index;
+            index -= 1;
+        }
+        if flips < 64 || start < 64 {
+            return 0;
+        }
+        let keep = start & !7;
+        if keep >= len || keep < 64 {
+            return 0;
+        }
+        self.truncate(keep);
+        len - keep
+    }
+
     /// Drop samples from the front so at most `samples` remain.
     pub fn retain_tail(&mut self, samples: u64) {
         let keep = samples & !7;
@@ -531,6 +586,63 @@ mod tests {
         assert!(!span.first);
         assert!(span.last);
         assert!(span.toggled);
+    }
+
+    fn push_levels(store: &mut LogicStore, channel: usize, samples: u64, high: impl Fn(u64) -> bool) {
+        let mut bytes = vec![0u8; (samples / 8) as usize];
+        for sample in 0..samples {
+            if high(sample) {
+                bytes[(sample / 8) as usize] |= 1 << (sample % 8);
+            }
+        }
+        store.append_channel(channel, &bytes, samples).unwrap();
+    }
+
+    #[test]
+    fn a_shared_oscillation_tail_is_not_the_stored_signal() {
+        let signal = 256u64;
+        let fill = 128u64;
+        let mut store = LogicStore::new(2);
+        // Channel 0 is a slow clock. Channel 1 stays low. Then both channels
+        // are 0x55, which flips every sample.
+        push_levels(&mut store, 0, signal, |sample| sample % 16 >= 8);
+        push_levels(&mut store, 1, signal, |_| false);
+        push_levels(&mut store, 0, fill, |sample| sample % 2 == 0);
+        push_levels(&mut store, 1, fill, |sample| sample % 2 == 0);
+        assert_eq!(store.len(), signal + fill);
+
+        let dropped = store.drop_shared_nyquist_tail();
+        assert_eq!(dropped, fill);
+        assert_eq!(store.len(), signal);
+        assert_eq!(store.level(1, signal - 1), Some(false));
+        assert_eq!(store.level(0, signal - 1), Some(true));
+
+        let end = store.tile(1, (signal - 32) as f64, 32, 1.0).unwrap();
+        assert!(
+            end.iter().all(|column| column.valid && !column.toggled && !column.last),
+            "the last samples must be the stored low signal, not the fill"
+        );
+        let clock = store.tile(0, (signal - 32) as f64, 32, 1.0).unwrap();
+        for (offset, column) in clock.iter().enumerate() {
+            let sample = signal - 32 + offset as u64;
+            let high = sample % 16 >= 8;
+            assert!(column.valid);
+            assert!(!column.toggled, "sample {sample} is one stored level");
+            assert_eq!(column.first, high);
+            assert_eq!(column.last, high);
+        }
+    }
+
+    #[test]
+    fn a_clock_next_to_a_still_channel_is_kept() {
+        let mut store = LogicStore::new(2);
+        push_levels(&mut store, 0, 512, |sample| sample % 16 >= 8);
+        push_levels(&mut store, 1, 512, |_| false);
+        assert_eq!(store.drop_shared_nyquist_tail(), 0);
+        assert_eq!(store.len(), 512);
+        let cols = store.tile(0, 480.0, 32, 1.0).unwrap();
+        assert!(cols.iter().any(|column| column.last));
+        assert!(cols.iter().all(|column| !column.toggled));
     }
 
     #[test]
