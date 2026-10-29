@@ -126,6 +126,49 @@ pub fn write_zip_bytes(data: &ArchiveData) -> Result<Vec<u8>, StoreError> {
     Ok(cursor.into_inner())
 }
 
+/// Wrap one worksheet in a minimal spreadsheet package.
+pub fn write_xlsx(sheet_xml: &str) -> Result<Vec<u8>, StoreError> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let files = [
+        ("[Content_Types].xml", CONTENT_TYPES),
+        ("_rels/.rels", ROOT_RELS),
+        ("xl/workbook.xml", WORKBOOK),
+        ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+    ];
+    for (name, body) in files {
+        zip.start_file(name, opts)?;
+        zip.write_all(body.as_bytes())?;
+    }
+    zip.start_file("xl/worksheets/sheet1.xml", opts)?;
+    zip.write_all(sheet_xml.as_bytes())?;
+    let cursor = zip.finish()?;
+    Ok(cursor.into_inner())
+}
+
+const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#;
+
+const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
+const WORKBOOK: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Capture" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+
+const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+
 pub fn read_zip(path: &Path) -> Result<ArchiveData, StoreError> {
     let file = File::open(path)?;
     read_zip_reader(file)
@@ -326,5 +369,23 @@ mod tests {
             .unwrap();
         assert!(header.contains("version=3"));
         assert_eq!(read_dsl_channel(&bytes, 0).unwrap(), vec![0xAA, 0x55]);
+    }
+
+    #[test]
+    fn xlsx_package_contains_the_worksheet() {
+        let bytes = write_xlsx(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c t="inlineStr" r="A1"><is><t>time_s</t></is></c></row></sheetData></worksheet>"#,
+        )
+        .unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        assert!(sheet.contains("time_s"));
+        assert!(archive.by_name("xl/workbook.xml").is_ok());
     }
 }

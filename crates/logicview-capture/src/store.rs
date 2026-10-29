@@ -177,6 +177,21 @@ pub struct Column {
     pub last: bool,
     pub toggled: bool,
     pub edges: u16,
+    /// False when this pixel starts at or after the last stored sample.
+    /// A low level with `valid == false` is empty time, not a sample.
+    pub valid: bool,
+}
+
+impl Column {
+    fn empty() -> Self {
+        Self {
+            first: false,
+            last: false,
+            toggled: false,
+            edges: 0,
+            valid: false,
+        }
+    }
 }
 
 /// Min and max of an analog column, in volts.
@@ -296,12 +311,7 @@ impl LogicStore {
             let s0 = start + col as f64 * spp;
             let s1 = start + (col + 1) as f64 * spp;
             if s1 <= 0.0 || s0 >= ch.len as f64 {
-                out.push(Column {
-                    first: false,
-                    last: false,
-                    toggled: false,
-                    edges: 0,
-                });
+                out.push(Column::empty());
                 continue;
             }
             let a = s0.max(0.0).floor() as u64;
@@ -309,14 +319,12 @@ impl LogicStore {
             if b <= a {
                 b = a + 1;
             }
+            // Do not scan bytes past the stored sample count. A partial last
+            // atom or a request that runs off the end would otherwise turn
+            // unread zeros into a falling edge and a noise tail.
             b = b.min(ch.len);
             if a >= ch.len {
-                out.push(Column {
-                    first: false,
-                    last: false,
-                    toggled: false,
-                    edges: 0,
-                });
+                out.push(Column::empty());
                 continue;
             }
             let summary = ch.summarize_range(a, b);
@@ -325,6 +333,7 @@ impl LogicStore {
                 last: summary.last,
                 toggled: summary.toggled,
                 edges: summary.edges,
+                valid: true,
             });
         }
         Ok(out)
@@ -352,6 +361,18 @@ impl AnalogStore {
 
     pub fn samples(&self) -> &[f32] {
         &self.samples
+    }
+
+    /// Drop samples past `len`. A capture that appended an unpacked tail
+    /// longer than the logic sample count must not keep those volts.
+    pub fn truncate(&mut self, len: usize) {
+        if self.samples.len() <= len {
+            return;
+        }
+        self.samples.truncate(len);
+        let blocks = len / Self::BLOCK;
+        self.block_min.truncate(blocks);
+        self.block_max.truncate(blocks);
     }
 
     pub fn append(&mut self, samples: &[f32]) -> Result<(), CaptureError> {
@@ -510,6 +531,25 @@ mod tests {
         assert!(!span.first);
         assert!(span.last);
         assert!(span.toggled);
+    }
+
+    #[test]
+    fn columns_past_the_last_sample_are_not_edges() {
+        let mut store = LogicStore::new(1);
+        let samples = 80u64;
+        let bytes = vec![0xFFu8; (samples / 8) as usize];
+        store.append_channel(0, &bytes, samples).unwrap();
+        // One column sits on the high tail and runs past the buffer. The next
+        // columns are entirely past the stored samples.
+        let cols = store.tile(0, 64.0, 3, 64.0).unwrap();
+        assert!(cols[0].valid);
+        assert!(cols[0].first && cols[0].last);
+        assert!(
+            !cols[0].toggled,
+            "unread samples past the buffer must not become a falling edge"
+        );
+        assert!(!cols[1].valid && !cols[1].toggled && !cols[1].first);
+        assert!(!cols[2].valid && !cols[2].toggled);
     }
 
     fn find_edge_mip(store: &LogicStore, channel: usize, from: u64, rising: bool) -> Option<u64> {

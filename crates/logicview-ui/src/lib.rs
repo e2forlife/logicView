@@ -56,6 +56,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/events", get(events))
         .route("/api/export/lvcap", get(export_lvcap))
         .route("/api/export/dsl", get(export_dsl))
+        .route("/api/export/csv", get(export_csv))
+        .route("/api/export/xlsx", get(export_xlsx))
         .route("/ws", get(ws_upgrade))
         .with_state(AppState { engine })
 }
@@ -167,6 +169,50 @@ async fn export_dsl(State(app): State<AppState>) -> Result<Response, ApiError> {
         bytes,
     )
         .into_response())
+}
+
+async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
+    let file = app.engine.export_samples_csv(None).await?;
+    Ok(sample_file_response(
+        file.body,
+        "text/csv; charset=utf-8",
+        "attachment; filename=\"capture.csv\"",
+        file.rows,
+        file.total,
+    ))
+}
+
+async fn export_xlsx(State(app): State<AppState>) -> Result<Response, ApiError> {
+    let file = app.engine.export_samples_xlsx(None).await?;
+    Ok(sample_file_response(
+        file.body,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "attachment; filename=\"capture.xlsx\"",
+        file.rows,
+        file.total,
+    ))
+}
+
+fn sample_file_response(
+    body: Vec<u8>,
+    content_type: &'static str,
+    disposition: &'static str,
+    rows: u64,
+    total: u64,
+) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(header::CONTENT_DISPOSITION, disposition.parse().unwrap());
+    headers.insert(
+        header::HeaderName::from_static("x-logicview-rows"),
+        rows.to_string().parse().unwrap(),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-logicview-total"),
+        total.to_string().parse().unwrap(),
+    );
+    response
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
@@ -372,9 +418,20 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             channel,
             from,
             rising,
+            forward,
         } => {
             let edge = engine
-                .search_edge(session.as_deref(), channel, from, rising)
+                .search_edge(session.as_deref(), channel, from, rising, forward)
+                .await?;
+            Ok(json!({"sample": edge}))
+        }
+        Command::NearestEdge {
+            session,
+            channel,
+            sample,
+        } => {
+            let edge = engine
+                .nearest_edge(session.as_deref(), channel, sample)
                 .await?;
             Ok(json!({"sample": edge}))
         }
@@ -436,16 +493,18 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
             };
-            Ok(json!(engine
-                .add_decoder(
-                    session.as_deref(),
-                    &protocol,
-                    &channels,
-                    &options,
-                    region,
-                    stack_on.as_deref(),
-                )
-                .await?))
+            Ok(json!(
+                engine
+                    .add_decoder(
+                        session.as_deref(),
+                        &protocol,
+                        &channels,
+                        &options,
+                        region,
+                        stack_on.as_deref(),
+                    )
+                    .await?
+            ))
         }
         Command::RemoveDecoder { session, id } => {
             engine.remove_decoder(session.as_deref(), &id).await?;
@@ -459,24 +518,28 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             end,
             offset,
             limit,
-        } => Ok(json!(engine
-            .read_annotations(
-                session.as_deref(),
-                decoder.as_deref(),
-                query.as_deref(),
-                start,
-                end,
-                offset.unwrap_or(0),
-                limit.unwrap_or(300),
-            )
-            .await?)),
+        } => Ok(json!(
+            engine
+                .read_annotations(
+                    session.as_deref(),
+                    decoder.as_deref(),
+                    query.as_deref(),
+                    start,
+                    end,
+                    offset.unwrap_or(0),
+                    limit.unwrap_or(300),
+                )
+                .await?
+        )),
         Command::ExportAnnotations {
             session,
             format,
             query,
-        } => Ok(json!(engine
-            .export_annotations(session.as_deref(), &format, query.as_deref())
-            .await?)),
+        } => Ok(json!(
+            engine
+                .export_annotations(session.as_deref(), &format, query.as_deref())
+                .await?
+        )),
         Command::Tile {
             session,
             channel,
@@ -648,6 +711,7 @@ fn column_json(column: &Column) -> Value {
         "last": column.last,
         "toggled": column.toggled,
         "edges": column.edges,
+        "valid": column.valid,
     })
 }
 
@@ -700,7 +764,9 @@ struct TriggerStepCmd {
 enum Command {
     ListDevices,
     ListProfiles,
-    Connect { id: String },
+    Connect {
+        id: String,
+    },
     AttachDevice {
         session: Option<String>,
         id: String,
@@ -844,6 +910,13 @@ enum Command {
         from: u64,
         #[serde(default = "default_true")]
         rising: bool,
+        #[serde(default = "default_true")]
+        forward: bool,
+    },
+    NearestEdge {
+        session: Option<String>,
+        channel: usize,
+        sample: u64,
     },
     Tile {
         session: Option<String>,
@@ -906,6 +979,7 @@ mod tests {
                 last: false,
                 toggled: true,
                 edges: 300,
+                valid: true,
             }],
         );
         assert_eq!(&frame[..4], b"LVT1");
@@ -942,7 +1016,11 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("LogicView"));
         assert!(html.contains("id=\"wave\""));
-        assert!(html.contains("id=\"start\""));
+        assert!(html.contains("id=\"run\""));
+        assert!(html.contains("id=\"stop\""));
+        assert!(html.contains("id=\"device-select\""));
+        assert!(!html.contains(">Instant<"));
+        assert!(!html.contains("Use Demo"));
     }
 
     #[tokio::test]
@@ -1143,6 +1221,214 @@ mod tests {
         }
         assert_eq!(stopped["phase"], "stopped");
         assert_eq!(stopped["trigger_sample"], 40);
+    }
+
+    #[tokio::test]
+    async fn stopped_capture_does_not_paint_a_tail_past_the_last_sample() {
+        let app = router(Engine::new());
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+        let count = status["sample_count"].as_u64().unwrap();
+        assert_eq!(count, 16_000);
+
+        let tail = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 80) as f64,
+                "columns": 80,
+                "samples_per_pixel": 1.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        let columns = tail["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 80);
+        for (offset, column) in columns.iter().enumerate() {
+            let sample = count - 80 + offset as u64;
+            let high = logicview_capture::clock_high(sample);
+            assert_eq!(column["valid"], true, "sample {sample}");
+            assert_eq!(column["toggled"], false, "sample {sample}");
+            assert_eq!(column["first"], high, "sample {sample}");
+            assert_eq!(column["last"], high, "sample {sample}");
+        }
+
+        let past = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": count as f64,
+                "columns": 6,
+                "samples_per_pixel": 8.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        for column in past["columns"].as_array().unwrap() {
+            assert_eq!(column["valid"], false);
+            assert_eq!(column["toggled"], false);
+            assert_eq!(column["first"], false);
+        }
+
+        let straddle = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 20) as f64,
+                "columns": 2,
+                "samples_per_pixel": 40.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        let cols = straddle["columns"].as_array().unwrap();
+        assert_eq!(cols[0]["valid"], true);
+        assert_eq!(
+            cols[0]["toggled"], false,
+            "a high tail must not pick up unread samples past the count"
+        );
+        assert_eq!(cols[1]["valid"], false);
+        assert_eq!(cols[1]["toggled"], false);
+
+        let analog = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 32) as f64,
+                "columns": 8,
+                "samples_per_pixel": 16.0,
+                "kind": "analog"
+            }),
+        )
+        .await;
+        for column in analog["columns"].as_array().unwrap() {
+            if column["valid"] == true {
+                let min = column["min"].as_f64().unwrap();
+                let max = column["max"].as_f64().unwrap();
+                assert!(min.is_finite() && max.is_finite());
+                assert!(
+                    (-1.3..1.3).contains(&min) && (-1.3..1.3).contains(&max),
+                    "analog tail {min}..{max}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_exports_csv_and_xlsx() {
+        let app = router(Engine::new());
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/csv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 1,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+        let count = status["sample_count"].as_u64().unwrap();
+        assert_eq!(count, 960);
+
+        let csv_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/csv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(csv_res.status().is_success());
+        assert_eq!(
+            csv_res
+                .headers()
+                .get("x-logicview-rows")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            count.to_string()
+        );
+        let csv_bytes = csv_res.into_body().collect().await.unwrap().to_bytes();
+        let csv = String::from_utf8(csv_bytes.to_vec()).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "time_s,CLK,UART,SDA,SCL,SINE (V)");
+        assert_eq!(lines.len() as u64, count + 1);
+        let first: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(first[0], "0.000000000");
+        assert_eq!(first[1], "0");
+        assert!(first[5].parse::<f64>().unwrap().abs() < 1.3);
+        let last_sample = count - 1;
+        let last: Vec<&str> = lines.last().unwrap().split(',').collect();
+        assert_eq!(
+            last[1],
+            if logicview_capture::clock_high(last_sample) {
+                "1"
+            } else {
+                "0"
+            }
+        );
+
+        let xlsx_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/xlsx")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(xlsx_res.status().is_success());
+        let xlsx = xlsx_res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&xlsx[..2], b"PK");
+        assert!(xlsx.windows(6).any(|window| window == b"time_s"));
+        assert!(xlsx.windows(3).any(|window| window == b"CLK"));
+        assert!(xlsx.windows(4).any(|window| window == b"SINE"));
     }
 
     #[tokio::test]

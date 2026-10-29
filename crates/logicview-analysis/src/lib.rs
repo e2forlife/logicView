@@ -52,6 +52,49 @@ pub fn find_edge(bytes: &[u8], len: u64, from: u64, rising: bool) -> Option<u64>
     None
 }
 
+/// Largest sample `i < from` where the level becomes `rising` (true) or low (false).
+pub fn find_edge_before(bytes: &[u8], len: u64, from: u64, rising: bool) -> Option<u64> {
+    if len < 2 || from == 0 {
+        return None;
+    }
+    let mut i = from.min(len);
+    while i > 1 {
+        i -= 1;
+        let level = bit_at(bytes, i);
+        let prev = bit_at(bytes, i - 1);
+        if prev != level && level == rising {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Edge closest to `sample`, rising or falling.
+pub fn nearest_edge(bytes: &[u8], len: u64, sample: u64) -> Option<u64> {
+    if len < 2 {
+        return None;
+    }
+    let sample = sample.min(len - 1);
+    let mut best: Option<u64> = None;
+    let mut consider = |hit: Option<u64>| {
+        if let Some(hit) = hit {
+            let replace = best
+                .map(|prev| hit.abs_diff(sample) < prev.abs_diff(sample))
+                .unwrap_or(true);
+            if replace {
+                best = Some(hit);
+            }
+        }
+    };
+    let origin = sample.saturating_sub(1);
+    consider(find_edge(bytes, len, origin, true));
+    consider(find_edge(bytes, len, origin, false));
+    let before = sample.saturating_add(1);
+    consider(find_edge_before(bytes, len, before, true));
+    consider(find_edge_before(bytes, len, before, false));
+    best
+}
+
 pub fn measure_pulse(bytes: &[u8], len: u64, sample: u64, rate_hz: u64) -> Option<PulseMetrics> {
     if sample >= len || rate_hz == 0 || bytes.is_empty() {
         return None;
@@ -139,7 +182,12 @@ pub fn find_edge_sequence(
     hit
 }
 
-fn next_level_edge(len: u64, from: u64, rising: bool, mut level: impl FnMut(u64) -> bool) -> Option<u64> {
+fn next_level_edge(
+    len: u64,
+    from: u64,
+    rising: bool,
+    mut level: impl FnMut(u64) -> bool,
+) -> Option<u64> {
     if from >= len {
         return None;
     }
@@ -263,11 +311,16 @@ mod tests {
     fn sequence_fires_on_the_later_edge() {
         let ch0 = [0xF0];
         let ch1 = [0xCC];
-        let level = |channel: usize, sample: u64| {
-            bit_at(if channel == 0 { &ch0 } else { &ch1 }, sample)
-        };
-        assert_eq!(find_edge_sequence(8, &[(0, true), (1, true)], level), Some(6));
-        assert_eq!(find_edge_sequence(8, &[(1, true), (0, true)], level), Some(4));
+        let level =
+            |channel: usize, sample: u64| bit_at(if channel == 0 { &ch0 } else { &ch1 }, sample);
+        assert_eq!(
+            find_edge_sequence(8, &[(0, true), (1, true)], level),
+            Some(6)
+        );
+        assert_eq!(
+            find_edge_sequence(8, &[(1, true), (0, true)], level),
+            Some(4)
+        );
         assert_eq!(find_edge_sequence(8, &[(0, true), (0, true)], level), None);
         assert_eq!(find_edge_sequence(8, &[], level), None);
     }
@@ -279,6 +332,17 @@ mod tests {
         assert_eq!(find_edge(&bytes, 1000, 50, true), Some(150));
         assert_eq!(find_edge(&bytes, 1000, 49, true), Some(50));
         assert_eq!(find_edge(&bytes, 1000, 0, false), Some(100));
+    }
+
+    #[test]
+    fn nearest_clock_edge_snaps_to_the_closer_transition() {
+        let bytes = clock_bytes(1_000);
+        assert_eq!(find_edge_before(&bytes, 1_000, 150, true), Some(50));
+        assert_eq!(find_edge_before(&bytes, 1_000, 100, false), None);
+        assert_eq!(nearest_edge(&bytes, 1_000, 40), Some(50));
+        assert_eq!(nearest_edge(&bytes, 1_000, 60), Some(50));
+        assert_eq!(nearest_edge(&bytes, 1_000, 90), Some(100));
+        assert_eq!(nearest_edge(&bytes, 1_000, 50), Some(50));
     }
 
     #[test]

@@ -30,9 +30,9 @@ async fn five_second_demo_edge_survives_save_and_load() {
     assert_eq!(status.phase, "stopped");
     assert_eq!(status.sample_count, 5_000_000);
 
-    let rising = engine.search_edge(None, 0, 0, true).await.unwrap();
+    let rising = engine.search_edge(None, 0, 0, true, true).await.unwrap();
     assert_eq!(rising, Some(50));
-    let falling = engine.search_edge(None, 0, 0, false).await.unwrap();
+    let falling = engine.search_edge(None, 0, 0, false, true).await.unwrap();
     assert_eq!(falling, Some(100));
     let analog = engine.analog_at(None, 250).await.unwrap();
     assert!(analog.is_some());
@@ -46,11 +46,11 @@ async fn five_second_demo_edge_survives_save_and_load() {
     assert_eq!(loaded.sample_count, 5_000_000);
     assert_eq!(loaded.sample_rate_hz, 1_000_000);
     assert_eq!(
-        reloaded.search_edge(None, 0, 0, true).await.unwrap(),
+        reloaded.search_edge(None, 0, 0, true, true).await.unwrap(),
         rising
     );
     assert_eq!(
-        reloaded.search_edge(None, 0, 50, true).await.unwrap(),
+        reloaded.search_edge(None, 0, 50, true, true).await.unwrap(),
         Some(150)
     );
     assert_eq!(reloaded.analog_at(None, 250).await.unwrap(), analog);
@@ -163,9 +163,9 @@ async fn usb_connect_is_refused() {
         "{text}"
     );
     let profiles = engine.list_profiles().await;
-    assert!(profiles.iter().any(|profile| {
-        profile.product_id == 0x0020 && profile.hardware_tested
-    }));
+    assert!(profiles
+        .iter()
+        .any(|profile| { profile.product_id == 0x0020 && profile.hardware_tested }));
     assert!(profiles
         .iter()
         .any(|profile| profile.product_id == 0x0034 && !profile.hardware_tested));
@@ -221,7 +221,14 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
         .await
         .unwrap();
     let eeprom = engine
-        .add_decoder(None, "eeprom24", &BTreeMap::new(), &BTreeMap::new(), None, Some(&i2c.id))
+        .add_decoder(
+            None,
+            "eeprom24",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            Some(&i2c.id),
+        )
         .await
         .unwrap();
     assert_eq!(eeprom.stack_on.as_deref(), Some(i2c.id.as_str()));
@@ -266,9 +273,15 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
 
     let found = engine.search_annotations(None, "A0-10-5A").await.unwrap();
     assert!(found.len() >= 3);
-    let csv = engine.export_annotations(None, "csv", Some("Read 0x10")).await.unwrap();
+    let csv = engine
+        .export_annotations(None, "csv", Some("Read 0x10"))
+        .await
+        .unwrap();
     assert!(csv.contains("Read 0x10 = 0x5A"));
-    let text = engine.export_annotations(None, "text", Some("MOSI 0xA5")).await.unwrap();
+    let text = engine
+        .export_annotations(None, "text", Some("MOSI 0xA5"))
+        .await
+        .unwrap();
     assert!(text.contains("MOSI 0xA5 MISO 0x3C"));
 }
 
