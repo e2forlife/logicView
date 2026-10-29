@@ -510,6 +510,23 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             engine.remove_decoder(session.as_deref(), &id).await?;
             Ok(json!({"removed": id}))
         }
+        Command::UpdateDecoder {
+            session,
+            id,
+            channels,
+            options,
+            stack_on,
+        } => Ok(json!(
+            engine
+                .update_decoder(
+                    session.as_deref(),
+                    &id,
+                    &channels,
+                    &options,
+                    stack_on.as_deref(),
+                )
+                .await?
+        )),
         Command::ReadAnnotations {
             session,
             decoder,
@@ -867,6 +884,16 @@ enum Command {
     RemoveDecoder {
         session: Option<String>,
         id: String,
+    },
+    UpdateDecoder {
+        session: Option<String>,
+        id: String,
+        #[serde(default)]
+        channels: BTreeMap<String, String>,
+        #[serde(default)]
+        options: BTreeMap<String, String>,
+        #[serde(default)]
+        stack_on: Option<String>,
     },
     ReadAnnotations {
         session: Option<String>,

@@ -106,16 +106,6 @@
           </div>
         </div>
         <canvas id="overview"></canvas>
-        <div id="split-bottom" class="h-split" role="separator" aria-orientation="horizontal" title="Resize decode panel"></div>
-        <div id="table-panel">
-          <div class="table-bar">
-            <button type="button" class="table-tab active" data-tab="decoded">Decoded</button>
-            <button type="button" class="table-tab" data-tab="edges">Edges</button>
-            <input id="table-search" type="search" placeholder="Search or A0-10-5A" aria-label="Search annotations">
-            <button id="table-export" type="button">Export</button>
-          </div>
-          <div id="table-body"></div>
-        </div>
         <div class="session-bar">
           <div id="tabs" class="tabs"></div>
           <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
@@ -163,6 +153,16 @@
       </svg>
       <p id="wait-text">Sampling</p>
     </div>
+  </div>
+  <div id="decode-config" class="wait-dialog hidden" role="dialog" aria-label="Decoder settings">
+    <form class="wait-card bus-card decode-card" id="decode-config-form">
+      <h2 id="decode-config-title">Decoder</h2>
+      <div id="decode-config-body"></div>
+      <div class="bus-actions">
+        <button type="button" id="decode-config-cancel">Cancel</button>
+        <button type="submit">Apply</button>
+      </div>
+    </form>
   </div>
   <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Group a bus">
     <form class="wait-card bus-card" id="bus-form">

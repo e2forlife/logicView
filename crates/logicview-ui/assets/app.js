@@ -42,7 +42,10 @@ const state = {
   probes: [],
   edgeChannel: null,
   annotations: [],
-  tableTab: "decoded",
+  decoders: [],
+  selectedDecoder: null,
+  decodeQuery: "",
+  spiView: {},
   gutterSig: "",
   nextMarker: 1,
   nextMeasure: 1,
@@ -102,6 +105,7 @@ function view() {
       buses: [],
       nextBus: 1,
       selected: null,
+      names: {},
     };
   }
   return views[id];
@@ -155,6 +159,26 @@ function naturalRows() {
       bus,
     });
   }
+  for (const decoder of state.decoders || []) {
+    if (decoder.protocol !== "spi") continue;
+    if (!state.spiView[decoder.id]) state.spiView[decoder.id] = { analog: false };
+    const analog = state.spiView[decoder.id].analog;
+    rows.push({
+      key: "decode:" + decoder.id,
+      kind: "bus",
+      channel: decoder.channels.mosi ?? 0,
+      name: "MOSI/MISO",
+      color: analog ? "#7dcea0" : "#d5deea",
+      device: "",
+      bus: {
+        id: "decode:" + decoder.id,
+        name: "MOSI/MISO",
+        channels: [],
+        analog,
+        decode: decoder.id,
+      },
+    });
+  }
   return rows;
 }
 
@@ -173,6 +197,7 @@ function channelIsEnabled(index) {
 
 function rowEnabled(row) {
   if (row.kind === "bus") {
+    if (row.bus && row.bus.decode) return true;
     return row.bus.channels.some((index) => channelIsEnabled(index));
   }
   if (row.kind === "analog") return state.analog.length > 0;
@@ -477,7 +502,7 @@ function renderGutter() {
   const rows = orderedRows();
   const metrics = rowMetrics();
   const selected = view().selected;
-  const sig = metrics.layout.map((item) => item.row.key + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
+  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
@@ -488,14 +513,23 @@ function renderGutter() {
     el.dataset.key = row.key;
     el.style.height = item.height + "px";
     el.style.flex = "none";
-    el.title = row.device ? `${row.name} · ${row.device} · drag to reorder` : "Drag to reorder";
+    el.title = row.device ? `${signalName(row)} · ${row.device}` : signalName(row);
     const bar = document.createElement("span");
     bar.className = "bar";
     bar.style.background = row.color;
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = row.name;
+    name.textContent = signalName(row);
     name.style.color = row.color;
+    if (row.kind === "logic") {
+      name.title = "Double-click to rename";
+      name.addEventListener("mousedown", (ev) => ev.stopPropagation());
+      name.addEventListener("dblclick", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startRename(row, name);
+      });
+    }
     const kind = document.createElement("span");
     kind.className = "kind";
     kind.textContent = row.kind === "analog" ? "Analog" : row.kind === "bus" ? (row.bus.analog ? "Analog" : "Bus") : "Digital";
@@ -535,6 +569,45 @@ function renderGutter() {
     }
     gutter.appendChild(el);
   }
+}
+
+function signalName(row) {
+  const names = view().names;
+  return (names && names[row.key]) || row.name;
+}
+
+function startRename(row, nameEl) {
+  const input = document.createElement("input");
+  input.className = "rename";
+  input.value = signalName(row);
+  input.setAttribute("aria-label", "Signal name");
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    if (commit) {
+      const next = input.value.trim();
+      const names = view().names || (view().names = {});
+      if (!next || next === row.name) delete names[row.key];
+      else names[row.key] = next;
+    }
+    state.gutterSig = "";
+    renderGutter();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      finish(true);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("mousedown", (ev) => ev.stopPropagation());
 }
 
 function eyeIcon(hidden) {
@@ -658,7 +731,6 @@ function drawWave() {
     else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
   }
   drawBuses(ctx, layout);
-  drawAnnotations(ctx, w);
   ctx.restore();
   for (const item of layout) {
     const row = item.row;
@@ -754,7 +826,7 @@ function drawGrid(ctx, w, h, layout) {
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
     } else if (row.kind === "bus" && row.bus && row.bus.analog) {
-      const max = Math.max(1, (1 << row.bus.channels.length) - 1);
+      const max = row.bus.decode ? 255 : Math.max(1, (1 << row.bus.channels.length) - 1);
       ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
@@ -822,27 +894,17 @@ function drawMeasureSpan(ctx, w, h) {
   ctx.restore();
 }
 
-function drawAnnotations(ctx, w) {
-  if (!state.annotations.length) return;
-  const v = view();
-  const viewEnd = v.start + w * v.spp;
-  ctx.font = "11px sans-serif";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  let labels = 0;
-  for (const row of state.annotations) {
-    if (!["address", "data", "word", "read", "write"].includes(row.class)) continue;
-    if (row.end_sample < v.start || row.start_sample > viewEnd) continue;
-    const x = Math.max(0, (row.start_sample - v.start) / v.spp);
-    const width = Math.max(2, (row.end_sample - row.start_sample) / v.spp);
-    ctx.fillStyle = "rgba(76, 141, 255, 0.22)";
-    ctx.fillRect(x, 2, Math.min(width, w - x), 16);
-    if (width > 48 && labels < 24) {
-      ctx.fillStyle = "#d5dbea";
-      ctx.fillText(row.text, x + 3, 3);
-      labels += 1;
-    }
-  }
+function spiWords(decoderId) {
+  return (state.annotations || []).filter((row) => row.decoder === decoderId && row.class === "word" && row.fields);
+}
+
+function hexByte(text) {
+  const value = parseInt(text, 16);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function sampleX(sample) {
+  return (sample - view().start) / view().spp;
 }
 
 function tileSample(index) {
@@ -963,11 +1025,56 @@ function busValueAt(bus, index) {
   return value;
 }
 
+function drawDecodeBus(ctx, item, bus) {
+  const words = spiWords(bus.decode);
+  const pad = Math.max(8, item.height * 0.22);
+  const top = item.top + pad;
+  const bot = item.top + item.height - pad;
+  const max = 255;
+  if (bus.analog) {
+    const stroke = (key, color) => {
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.4;
+      let started = false;
+      for (const word of words) {
+        const y = bot - (hexByte(word.fields[key]) / max) * (bot - top);
+        const x0 = sampleX(word.start_sample);
+        const x1 = sampleX(word.end_sample);
+        if (!started) {
+          ctx.moveTo(x0, y);
+          started = true;
+        } else ctx.lineTo(x0, y);
+        ctx.lineTo(x1, y);
+      }
+      ctx.stroke();
+    };
+    stroke("mosi", "#ff6b8a");
+    stroke("miso", "#7dcea0");
+    return;
+  }
+  ctx.font = "12px sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#d5deea";
+  let lastX = -80;
+  for (const word of words) {
+    const x = sampleX(word.start_sample);
+    if (x < -8 || x - lastX < 72) continue;
+    const label = "0x" + (word.fields.mosi || "00") + "/0x" + (word.fields.miso || "00");
+    ctx.fillText(label, x + 4, (top + bot) / 2);
+    lastX = x;
+  }
+}
+
 function drawBuses(ctx, layout) {
   for (const item of layout) {
     const row = item.row;
     if (row.kind !== "bus" || state.hidden.has(row.key)) continue;
     const bus = row.bus;
+    if (bus.decode) {
+      drawDecodeBus(ctx, item, bus);
+      continue;
+    }
     const cols = state.tiles["logic:" + bus.channels[0]];
     if (!cols) continue;
     const pad = Math.max(8, item.height * 0.22);
@@ -1309,6 +1416,7 @@ function selectTab(name) {
 function panelHtml(name) {
   if (name === "device") return devicePanel();
   if (name === "decode") {
+    const query = escapeHtml(state.decodeQuery || "");
     return `<h2>Decode</h2>
       <label class="field">Protocol
         <select id="decoder-kind">
@@ -1319,8 +1427,12 @@ function panelHtml(name) {
         </select>
       </label>
       <button class="block" id="add-decoder" type="button">Add decoder</button>
-      <div id="decoder-list"></div>
-      <p class="hint">I2C maps SDA/SCL. SPI maps SCK/MOSI/MISO/CS, including demo:spi/ names when both pods are stacked. EEPROM reads the I2C rows.</p>`;
+      <ul id="decoder-list" class="decoder-list"></ul>
+      <label class="field">Search
+        <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
+      </label>
+      <div id="decode-table" class="decode-scroll"></div>
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -1414,7 +1526,7 @@ function devicePanel() {
     <div class="acq-row"><span>Digital channels</span><span class="value">${state.channels.length} · ${logic}</span></div>
     <h3>Sample</h3>
     <div id="channel-enable">${channelChecks(state.probes.length ? state.probes : state.channels)}</div>
-    <p class="hint">Dim channels are left out of the next capture and hidden on the waveform.</p>
+    <p class="hint">Each button is a channel number. A dim number is left out of the next capture and hidden on the waveform.</p>
     ${analogRow}
     <label class="acq-row">Input voltage
       <select id="set-threshold" aria-label="Input voltage">
@@ -1477,14 +1589,14 @@ function channelChecks(probes) {
   if (!groups.length) return "";
   if (state.channelGroup >= groups.length) state.channelGroup = 0;
   const tabs = groups.map((group, index) => {
-    const from = index * 8 + 1;
-    const to = index * 8 + group.length;
+    const from = index * 8;
+    const to = from + group.length - 1;
     return `<button type="button" class="ch-tab${index === state.channelGroup ? " active" : ""}" data-group="${index}">${from}–${to}</button>`;
   }).join("");
   const buttons = groups[state.channelGroup].map((probe) => {
     const on = channelIsEnabled(probe.index);
     const color = probe.color || "#8eb6ff";
-    return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}">${probe.name}</button>`;
+    return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${probe.index}">${probe.index}</button>`;
   }).join("");
   return `<div class="ch-tabs">${tabs}</div><div class="ch-enables">${buttons}</div>`;
 }
@@ -1609,7 +1721,12 @@ function bindPanel(name) {
   }
   if (name === "decode") {
     document.getElementById("add-decoder").addEventListener("click", addDecoder);
-    refreshDecoders();
+    const search = document.getElementById("decode-search");
+    search.addEventListener("input", () => {
+      state.decodeQuery = search.value;
+      renderDecodeTable();
+    });
+    refreshDecoders().then(() => loadAnnotations());
   }
   if (name === "cursors") {
     document.getElementById("cur-a").addEventListener("click", () => dropCursor(0));
@@ -1859,15 +1976,28 @@ function decoderChannels(protocol) {
   return {};
 }
 
+const PROTOCOL_LABEL = { i2c: "I2C", spi: "SPI", uart: "UART", eeprom24: "EEPROM 24xx" };
+const GEAR_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"></path></svg>`;
+const TRASH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M8 7l1 13h6l1-13"></path></svg>`;
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[ch]);
+}
+
+function protocolLabel(protocol) {
+  return PROTOCOL_LABEL[protocol] || protocol;
+}
+
 async function addDecoder() {
   const protocol = document.getElementById("decoder-kind").value;
   try {
-    await api({
+    const created = await api({
       cmd: "add_decoder",
       session: state.active,
       protocol,
       channels: decoderChannels(protocol),
     });
+    state.selectedDecoder = created.id;
     await refreshDecoders();
     await loadAnnotations();
   } catch (err) {
@@ -1876,71 +2006,121 @@ async function addDecoder() {
 }
 
 async function refreshDecoders() {
+  if (!state.active) return;
+  state.decoders = await api({ cmd: "list_decoders", session: state.active });
+  if (!state.selectedDecoder || !state.decoders.some((row) => row.id === state.selectedDecoder)) {
+    state.selectedDecoder = state.decoders.length ? state.decoders[0].id : null;
+  }
+  renderDecoderList();
+  state.gutterSig = "";
+  renderGutter();
+}
+
+function renderDecoderList() {
   const host = document.getElementById("decoder-list");
   if (!host) return;
-  const rows = await api({ cmd: "list_decoders", session: state.active });
   host.replaceChildren();
-  for (const row of rows) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "block";
-    button.textContent = `Remove ${row.protocol} ${row.id}`;
-    button.addEventListener("click", async () => {
+  for (const row of state.decoders) {
+    const item = document.createElement("li");
+    item.className = "decoder-row" + (row.id === state.selectedDecoder ? " selected" : "");
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "decoder-pick";
+    pick.textContent = protocolLabel(row.protocol);
+    pick.addEventListener("click", () => {
+      state.selectedDecoder = row.id;
+      renderDecoderList();
+      renderDecodeTable();
+    });
+    const gear = document.createElement("button");
+    gear.type = "button";
+    gear.className = "decoder-icon";
+    gear.title = "Configure";
+    gear.setAttribute("aria-label", "Configure " + protocolLabel(row.protocol));
+    gear.innerHTML = GEAR_ICON;
+    gear.addEventListener("click", () => openDecodeConfig(row));
+    const trash = document.createElement("button");
+    trash.type = "button";
+    trash.className = "decoder-icon";
+    trash.title = "Remove";
+    trash.setAttribute("aria-label", "Remove " + protocolLabel(row.protocol));
+    trash.innerHTML = TRASH_ICON;
+    trash.addEventListener("click", async () => {
       await api({ cmd: "remove_decoder", session: state.active, id: row.id });
+      delete state.spiView[row.id];
+      if (state.selectedDecoder === row.id) state.selectedDecoder = null;
       await refreshDecoders();
       await loadAnnotations();
     });
-    host.append(button);
+    item.append(pick, gear, trash);
+    host.append(item);
   }
 }
 
 async function loadAnnotations() {
   if (!state.active) return;
-  const query = document.getElementById("table-search");
-  const text = query ? query.value.trim() : "";
   try {
+    if (!state.decoders.length) {
+      state.decoders = await api({ cmd: "list_decoders", session: state.active });
+    }
     state.annotations = await api({
       cmd: "read_annotations",
       session: state.active,
-      query: text || null,
-      limit: 300,
+      limit: 2000,
     });
   } catch (err) {
     state.annotations = [];
     statusEl.textContent = err.message;
   }
-  renderTable();
+  renderDecodeTable();
+  state.gutterSig = "";
+  renderGutter();
   drawWave();
 }
 
-function renderTable() {
-  const body = document.getElementById("table-body");
+function renderDecodeTable() {
+  const body = document.getElementById("decode-table");
   if (!body) return;
-  if (state.tableTab === "edges") {
-    body.innerHTML = `<div class="table-empty">
-      <p>Pattern search uses 0, 1, and x on the hovered logic channel.</p>
-      <button type="button" id="edge-next-table">Next match</button>
-      <button type="button" id="edge-prev-table">Previous match</button>
-      <p id="edge-hit"></p>
-    </div>`;
-    document.getElementById("edge-next-table").addEventListener("click", () => searchFromTable(true));
-    document.getElementById("edge-prev-table").addEventListener("click", () => searchFromTable(false));
+  const decoder = (state.decoders || []).find((row) => row.id === state.selectedDecoder);
+  const rows = tableRows();
+  if (!decoder) {
+    body.innerHTML = `<div class="table-empty">Add a decoder to see its data here.</div>`;
     return;
   }
-  if (!state.annotations.length) {
-    body.innerHTML = `<div class="table-empty">No decoded rows yet. Add I2C or SPI, then capture.</div>`;
+  if (!rows.length) {
+    body.innerHTML = `<div class="table-empty">No rows for ${escapeHtml(protocolLabel(decoder.protocol))} yet.</div>`;
     return;
   }
   const table = document.createElement("table");
   table.className = "ann";
-  for (const row of state.annotations) {
+  const head = document.createElement("tr");
+  const spi = decoder.protocol === "spi";
+  head.innerHTML = spi ? "<td>Time</td><td>MOSI</td><td>MISO</td><td>Text</td>" : "<td>Time</td><td>Class</td><td>Text</td>";
+  table.append(head);
+  for (const row of rows) {
     const tr = document.createElement("tr");
-    const time = (row.start_sample / Math.max(1, state.rate)).toFixed(6);
-    tr.innerHTML = `<td>${time}s</td><td>${row.protocol}</td><td>${row.class}</td><td>${row.text}</td>`;
+    const time = formatSeconds(sampleSeconds(row.start_sample));
+    const fields = row.fields || {};
+    if (spi) {
+      tr.innerHTML = `<td>${time}</td><td>${escapeHtml(fields.mosi || "")}</td><td>${escapeHtml(fields.miso || "")}</td><td>${escapeHtml(row.text)}</td>`;
+    } else {
+      tr.innerHTML = `<td>${time}</td><td>${escapeHtml(row.class)}</td><td>${escapeHtml(row.text)}</td>`;
+    }
     tr.addEventListener("click", () => centerOn(row.start_sample));
     table.append(tr);
   }
   body.replaceChildren(table);
+}
+
+function tableRows() {
+  const id = state.selectedDecoder;
+  const query = (state.decodeQuery || "").trim().toLowerCase();
+  return (state.annotations || []).filter((row) => {
+    if (id && row.decoder !== id) return false;
+    if (!query) return true;
+    const fields = row.fields ? Object.values(row.fields).join(" ") : "";
+    return `${row.class} ${row.text} ${fields}`.toLowerCase().includes(query);
+  });
 }
 
 function centerOn(sample) {
@@ -2031,40 +2211,14 @@ function activeLogicChannel() {
   return first ? first.channel : 0;
 }
 
-async function searchFromTable(forward) {
-  const field = document.getElementById("table-search");
-  const pattern = field && field.value ? field.value : settings.pattern;
-  settings.pattern = pattern;
-  const from = state.hoverX == null ? Math.floor(view().start) : hoverSample();
-  try {
-    const data = await api({
-      cmd: "search_pattern",
-      session: state.active,
-      channel: activeLogicChannel(),
-      from,
-      pattern,
-      forward,
-    });
-    const hit = document.getElementById("edge-hit");
-    if (data.sample == null) {
-      if (hit) hit.textContent = "no match";
-      return;
-    }
-    if (hit) hit.textContent = `match at ${data.sample}`;
-    centerOn(data.sample);
-  } catch (err) {
-    statusEl.textContent = err.message;
-  }
-}
-
 async function exportAnnotations() {
   try {
-    const query = document.getElementById("table-search");
+    const query = (state.decodeQuery || "").trim();
     const data = await api({
       cmd: "export_annotations",
       session: state.active,
       format: "csv",
-      query: query && query.value.trim() ? query.value.trim() : null,
+      query: query || null,
     });
     const blob = new Blob([data], { type: "text/csv" });
     const link = document.createElement("a");
@@ -2311,6 +2465,13 @@ async function snapMarker(marker, clientX, clientY) {
     statusEl.textContent = err.message;
   }
 }
+
+wave.addEventListener("contextmenu", (ev) => {
+  const row = state.total > 0 ? rowAt(ev.clientY) : null;
+  if (!row || row.kind !== "bus" || !row.bus) return;
+  ev.preventDefault();
+  openBusMenu(row.bus, ev.clientX, ev.clientY);
+});
 
 wave.addEventListener("wheel", (ev) => {
   ev.preventDefault();
@@ -2643,7 +2804,6 @@ function applyTimebase(index) {
 
 function bindSplitters() {
   const side = document.getElementById("split-side");
-  const bottom = document.getElementById("split-bottom");
   side.addEventListener("pointerdown", (ev) => {
     ev.preventDefault();
     const startX = ev.clientX;
@@ -2657,26 +2817,6 @@ function bindSplitters() {
     };
     const up = () => {
       side.classList.remove("drag");
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      refreshOverview();
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  });
-  bottom.addEventListener("pointerdown", (ev) => {
-    ev.preventDefault();
-    const startY = ev.clientY;
-    const start = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--bottom")) || 168;
-    bottom.classList.add("drag");
-    const move = (e) => {
-      const next = Math.max(80, Math.min(window.innerHeight * 0.55, start - (e.clientY - startY)));
-      document.documentElement.style.setProperty("--bottom", next + "px");
-      scheduleTiles();
-      drawRuler();
-    };
-    const up = () => {
-      bottom.classList.remove("drag");
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       refreshOverview();
@@ -2751,25 +2891,6 @@ function openMenu(button) {
     other.classList.toggle("open", other === button);
   }
 }
-
-for (const button of document.querySelectorAll(".table-tab")) {
-  button.addEventListener("click", () => {
-    state.tableTab = button.dataset.tab;
-    for (const tab of document.querySelectorAll(".table-tab")) {
-      tab.classList.toggle("active", tab === button);
-    }
-    renderTable();
-  });
-}
-
-document.getElementById("table-search").addEventListener("keydown", (ev) => {
-  if (ev.key !== "Enter") return;
-  ev.preventDefault();
-  if (state.tableTab === "edges") searchFromTable(true);
-  else loadAnnotations();
-});
-document.getElementById("table-export").addEventListener("click", exportAnnotations);
-renderTable();
 
 document.getElementById("run").addEventListener("click", () => runCapture());
 document.getElementById("stop").addEventListener("click", () => stopCapture());
@@ -2876,7 +2997,7 @@ window.addEventListener("keydown", (ev) => {
   if (key === "m" || key === "M") { selectTab("measure"); return; }
   if (key === "r" || key === "R") {
     ev.preventDefault();
-    const search = document.getElementById("table-search");
+    const search = document.getElementById("decode-search");
     if (search) search.focus();
     return;
   }
@@ -3054,26 +3175,110 @@ function openBusMenu(bus, x, y) {
   item.type = "button";
   item.textContent = bus.analog ? "Hex view" : "Analog view";
   item.addEventListener("click", () => {
-    bus.analog = !bus.analog;
+    if (bus.decode) {
+      if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
+      state.spiView[bus.decode].analog = !state.spiView[bus.decode].analog;
+    } else {
+      bus.analog = !bus.analog;
+    }
     state.gutterSig = "";
     closeBusMenu();
     renderGutter();
     drawWave();
   });
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.textContent = "Remove bus";
-  remove.addEventListener("click", () => {
-    view().buses = view().buses.filter((entry) => entry.id !== bus.id);
-    state.gutterSig = "";
-    closeBusMenu();
-    renderGutter();
-    drawWave();
-  });
-  menu.append(item, remove);
+  menu.append(item);
+  if (!bus.decode) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove bus";
+    remove.addEventListener("click", () => {
+      view().buses = view().buses.filter((entry) => entry.id !== bus.id);
+      state.gutterSig = "";
+      closeBusMenu();
+      renderGutter();
+      drawWave();
+    });
+    menu.append(remove);
+  }
   menu.classList.remove("hidden");
   menu.style.left = x + "px";
   menu.style.top = y + "px";
+}
+
+function channelSpec(channel) {
+  return channel.device_id ? channel.device_id + "/" + channel.name : channel.name;
+}
+
+function channelOptions(selectedIndex) {
+  return state.channels.map((channel) => {
+    const label = channel.device_name ? channel.device_name + " / " + channel.name : channel.name;
+    const selected = channel.index === selectedIndex ? " selected" : "";
+    return `<option value="${escapeHtml(channelSpec(channel))}"${selected}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
+function signalField(name, index) {
+  return `<label class="field">${name.toUpperCase()}
+    <select data-signal="${name}">${channelOptions(index)}</select>
+  </label>`;
+}
+
+function openDecodeConfig(decoder) {
+  const title = document.getElementById("decode-config-title");
+  const body = document.getElementById("decode-config-body");
+  title.textContent = protocolLabel(decoder.protocol);
+  const options = decoder.options || {};
+  const channels = decoder.channels || {};
+  const parts = Object.keys(channels).map((name) => signalField(name, channels[name]));
+  if (decoder.protocol === "spi") {
+    const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
+    const cpha = options.cpha === "1" || options.cpha === "true" || options.cpha === "high";
+    const mode = (cpol ? 2 : 0) + (cpha ? 1 : 0);
+    parts.push(`<label class="field">SPI mode
+      <select id="decode-mode">
+        <option value="0"${mode === 0 ? " selected" : ""}>Mode 0</option>
+        <option value="1"${mode === 1 ? " selected" : ""}>Mode 1</option>
+        <option value="2"${mode === 2 ? " selected" : ""}>Mode 2</option>
+        <option value="3"${mode === 3 ? " selected" : ""}>Mode 3</option>
+      </select>
+    </label>
+    <label class="field">Bit order
+      <select id="decode-order">
+        <option value="msb"${options.order === "lsb" ? "" : " selected"}>MSB first</option>
+        <option value="lsb"${options.order === "lsb" ? " selected" : ""}>LSB first</option>
+      </select>
+    </label>
+    <label class="field">Bits per word
+      <input id="decode-bits" type="number" min="1" max="8" value="${escapeHtml(options.bits || "8")}">
+    </label>
+    <label class="field">Chip select
+      <select id="decode-cs">
+        <option value="low"${options.cs === "high" ? "" : " selected"}>Active low</option>
+        <option value="high"${options.cs === "high" ? " selected" : ""}>Active high</option>
+      </select>
+    </label>`);
+  } else if (decoder.protocol === "i2c") {
+    parts.push(`<label class="field">Address
+      <input id="decode-address" type="text" value="${escapeHtml(options.address && options.address !== "any" ? options.address : "")}" placeholder="any, or 50">
+    </label>`);
+  } else if (decoder.protocol === "uart") {
+    parts.push(`<label class="field">Samples per bit
+      <input id="decode-bit-samples" type="number" min="1" max="10000" value="${escapeHtml(options.bit_samples || "10")}">
+    </label>`);
+  } else if (decoder.protocol === "eeprom24") {
+    const parents = state.decoders.filter((row) => row.protocol === "i2c");
+    const choices = parents.map((row) => `<option value="${escapeHtml(row.id)}"${row.id === decoder.stack_on ? " selected" : ""}>${escapeHtml(protocolLabel(row.protocol) + " " + row.id)}</option>`).join("");
+    parts.push(`<label class="field">Stacks on
+      <select id="decode-stack">${choices}</select>
+    </label>`);
+  }
+  body.innerHTML = parts.join("");
+  document.getElementById("decode-config").classList.remove("hidden");
+  document.getElementById("decode-config-form").dataset.id = decoder.id;
+}
+
+function closeDecodeConfig() {
+  document.getElementById("decode-config").classList.add("hidden");
 }
 
 async function boot() {
@@ -3106,6 +3311,48 @@ document.getElementById("bus-form").addEventListener("submit", (ev) => {
   closeBusDialog();
   renderGutter();
   drawWave();
+});
+
+document.getElementById("decode-config-cancel").addEventListener("click", closeDecodeConfig);
+document.getElementById("decode-config-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const id = ev.target.dataset.id;
+  const decoder = state.decoders.find((row) => row.id === id);
+  if (!decoder) return;
+  const channels = {};
+  for (const select of ev.target.querySelectorAll("[data-signal]")) {
+    channels[select.dataset.signal] = select.value;
+  }
+  const options = {};
+  if (decoder.protocol === "spi") {
+    const mode = Number(document.getElementById("decode-mode").value);
+    options.cpol = mode >= 2 ? "1" : "0";
+    options.cpha = mode % 2 ? "1" : "0";
+    options.order = document.getElementById("decode-order").value;
+    options.bits = document.getElementById("decode-bits").value;
+    options.cs = document.getElementById("decode-cs").value;
+  } else if (decoder.protocol === "i2c") {
+    const address = document.getElementById("decode-address").value.trim();
+    options.address = address || "any";
+  } else if (decoder.protocol === "uart") {
+    options.bit_samples = document.getElementById("decode-bit-samples").value;
+  }
+  const stack = document.getElementById("decode-stack");
+  try {
+    await api({
+      cmd: "update_decoder",
+      session: state.active,
+      id,
+      channels,
+      options,
+      stack_on: stack ? stack.value : null,
+    });
+    closeDecodeConfig();
+    await refreshDecoders();
+    await loadAnnotations();
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
 });
 
 boot().catch((err) => {

@@ -506,6 +506,39 @@ table.ann tr { cursor: pointer; }
 table.ann tr:hover { background: #222733; }
 .table-empty { color: var(--muted); padding: 10px 12px; font-size: 12px; }
 
+.decoder-list { list-style: none; margin: 10px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.decoder-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+}
+.decoder-row.selected { background: #243044; }
+.decoder-pick {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 6px 8px;
+  color: var(--text);
+}
+.decoder-icon {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px;
+}
+.decoder-icon svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.decoder-icon:hover { background: #2a3648; color: white; }
+.decode-scroll { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.decode-card { width: 320px; }
+.decode-card select, .decode-card input { width: 100%; margin-top: 4px; }
+
 .session-bar {
   display: flex;
   align-items: center;
@@ -848,13 +881,30 @@ details.advanced summary {
 
 .ch-enables { display: flex; flex-wrap: wrap; gap: 6px; }
 .ch-en {
+  box-sizing: border-box;
+  width: 36px;
+  height: 28px;
+  padding: 0;
   border: 1px solid #2a3342;
   background: #121820;
   color: #6d7686;
   border-radius: 6px;
-  padding: 6px 10px;
   font-size: 12px;
-  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.ch .rename {
+  width: 72px;
+  margin: 0;
+  padding: 1px 4px;
+  font-size: 12px;
+  color: var(--text);
+  background: #0e131a;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
 }
 .ch-en.on {
   color: white;

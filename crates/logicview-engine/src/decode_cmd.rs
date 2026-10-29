@@ -88,6 +88,71 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn update_decoder(
+        &self,
+        session: Option<&str>,
+        decoder_id: &str,
+        channels: &BTreeMap<String, String>,
+        options: &BTreeMap<String, String>,
+        stack_on: Option<&str>,
+    ) -> Result<DecoderInfo, EngineError> {
+        let mut state = self.shared.state.lock().await;
+        let id = self.resolve(&state, session)?;
+        let slot = state.slot_mut(&id)?;
+        let protocol = slot
+            .decoders
+            .iter()
+            .find(|decoder| decoder.id == decoder_id)
+            .map(|decoder| decoder.protocol.clone())
+            .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?;
+        let schema = catalog()
+            .into_iter()
+            .find(|item| item.id == protocol)
+            .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
+        let mut resolved = BTreeMap::new();
+        for name in schema.channels {
+            let spec = channels.get(*name).ok_or_else(|| {
+                EngineError::Decode(format!("{protocol} needs a {name} channel"))
+            })?;
+            resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+        }
+        let stack = if schema.stack_on.is_some() {
+            Some(if stack_on.is_some() {
+                resolve_stack(slot, stack_on)?
+            } else {
+                slot.decoders
+                    .iter()
+                    .find(|decoder| decoder.id == decoder_id)
+                    .and_then(|decoder| decoder.stack_on.clone())
+                    .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?
+            })
+        } else if stack_on.is_some() {
+            return Err(EngineError::Decode(format!(
+                "{protocol} does not stack on another decoder"
+            )));
+        } else {
+            None
+        };
+        if let Some(decoder) = slot
+            .decoders
+            .iter_mut()
+            .find(|decoder| decoder.id == decoder_id)
+        {
+            decoder.channels = resolved;
+            decoder.options = options.clone();
+            decoder.stack_on = stack;
+        } else {
+            return Err(EngineError::Decode(format!("unknown decoder {decoder_id}")));
+        }
+        rerun(slot);
+        Ok(slot
+            .decoders
+            .iter()
+            .find(|decoder| decoder.id == decoder_id)
+            .map(info_of)
+            .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?)
+    }
+
     pub async fn list_decoders(&self, session: Option<&str>) -> Result<Vec<DecoderInfo>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, session)?;
