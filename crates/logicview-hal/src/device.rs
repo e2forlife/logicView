@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nusb::transfer::{Bulk, Buffer, ControlIn, ControlOut, ControlType, Out, Recipient};
-use nusb::MaybeFuture;
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Out, Recipient};
+use nusb::{MaybeFuture, Speed};
 
 use crate::profile::{BITSTREAM_NAME, HDL_VERSION, PLUS_PID, VENDOR_ID};
 use crate::HalError;
@@ -60,25 +60,69 @@ pub fn matches_plus(vendor_id: u16, product_id: u16) -> bool {
     vendor_id == VENDOR_ID && product_id == PLUS_PID
 }
 
-pub fn list_plus() -> Result<Vec<ListedPod>, HalError> {
+/// Every DreamSourceLab device on the bus, whether or not this build can open it.
+pub fn list_pods() -> Result<Vec<ListedPod>, HalError> {
     let devices = nusb::list_devices()
         .wait()
         .map_err(|err| HalError::Usb(err.to_string()))?;
     let mut found = Vec::new();
     for dev in devices {
-        if matches_plus(dev.vendor_id(), dev.product_id()) {
-            let product = dev
-                .product_string()
-                .filter(|name| !name.is_empty())
-                .unwrap_or("DSLogic Plus");
-            found.push(ListedPod {
-                id: crate::DEVICE_ID.to_string(),
-                name: format!("{product} ({:04x}:{:04x})", dev.vendor_id(), dev.product_id()),
-                product_id: dev.product_id(),
-            });
+        if let Some(pod) = describe_listed(
+            dev.vendor_id(),
+            dev.product_id(),
+            dev.speed(),
+            dev.product_string(),
+        ) {
+            found.push(pod);
         }
     }
     Ok(found)
+}
+
+/// Plus pods only. Prefer [`list_pods`] when the caller wants the whole scan.
+pub fn list_plus() -> Result<Vec<ListedPod>, HalError> {
+    let mut pods = list_pods()?;
+    pods.retain(|pod| matches_plus(VENDOR_ID, pod.product_id));
+    Ok(pods)
+}
+
+pub(crate) fn describe_listed(
+    vendor_id: u16,
+    product_id: u16,
+    speed: Option<Speed>,
+    product_string: Option<&str>,
+) -> Option<ListedPod> {
+    if vendor_id != VENDOR_ID {
+        return None;
+    }
+    let profile_name = crate::logic_profile(product_id)
+        .map(|profile| profile.name)
+        .unwrap_or("DreamSourceLab");
+    let link = speed_label(speed);
+    let extra = product_string
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != profile_name);
+    let name = match extra {
+        Some(text) => {
+            format!("{profile_name} · {link} · {vendor_id:04x}:{product_id:04x} · {text}")
+        }
+        None => format!("{profile_name} · {link} · {vendor_id:04x}:{product_id:04x}"),
+    };
+    Some(ListedPod {
+        id: format!("usb:{vendor_id:04x}:{product_id:04x}"),
+        name,
+        product_id,
+    })
+}
+
+fn speed_label(speed: Option<Speed>) -> &'static str {
+    match speed {
+        Some(Speed::High) => "USB 2",
+        Some(Speed::Super | Speed::SuperPlus) => "USB 3",
+        Some(Speed::Full) => "full speed",
+        Some(Speed::Low) => "low speed",
+        _ => "USB",
+    }
 }
 
 impl Pod {
@@ -162,7 +206,9 @@ impl Pod {
                 break;
             }
             if start.elapsed() > Duration::from_millis(500) {
-                return Err(HalError::Message("the pod did not clear before the arm image".into()));
+                return Err(HalError::Message(
+                    "the pod did not clear before the arm image".into(),
+                ));
             }
         }
         self.bulk_out(image)?;
@@ -261,7 +307,9 @@ impl Pod {
 
     fn write_at(&self, dest: u8, offset: u16, payload: &[u8]) -> Result<(), HalError> {
         if payload.len() > 60 {
-            return Err(HalError::Message("control write is longer than 60 bytes".into()));
+            return Err(HalError::Message(
+                "control write is longer than 60 bytes".into(),
+            ));
         }
         let mut body = vec![dest, offset as u8, (offset >> 8) as u8, payload.len() as u8];
         body.extend_from_slice(payload);
@@ -343,21 +391,73 @@ fn bitstream_path() -> Result<PathBuf, HalError> {
 }
 
 fn candidate_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+    let mut dirs = dsview_res_dirs(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        std::env::var("ProgramFiles(x86)").ok().as_deref(),
+    );
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         dirs.push(Path::new(&local).join("Temp").join("lv-fw"));
     }
     dirs
 }
 
+/// DreamSourceLab installs keep bitstreams in `res`. Nothing from that folder
+/// is copied into this repo; open reads the file in place.
+fn dsview_res_dirs(program_files: Option<&str>, program_files_x86: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in [program_files, program_files_x86].into_iter().flatten() {
+        if root.is_empty() {
+            continue;
+        }
+        let path = Path::new(root).join("DSView").join("res");
+        if !dirs.contains(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
-    use super::matches_plus;
+    use super::{describe_listed, dsview_res_dirs, matches_plus};
+    use nusb::Speed;
 
     #[test]
     fn plus_identity_is_the_tested_high_speed_pod() {
         assert!(matches_plus(0x2A0E, 0x0020));
         assert!(!matches_plus(0x2A0E, 0x0034));
         assert!(!matches_plus(0x1234, 0x0020));
+    }
+
+    #[test]
+    fn scan_names_the_plugged_in_plus_and_a_u3pro32() {
+        let plus = describe_listed(
+            0x2A0E,
+            0x0020,
+            Some(Speed::High),
+            Some("USB-based DSL Instrument v2"),
+        )
+        .unwrap();
+        assert_eq!(plus.id, "usb:2a0e:0020");
+        assert_eq!(plus.product_id, 0x0020);
+        assert_eq!(
+            plus.name,
+            "DSLogic Plus · USB 2 · 2a0e:0020 · USB-based DSL Instrument v2"
+        );
+
+        let wide = describe_listed(0x2A0E, 0x002C, Some(Speed::Super), None).unwrap();
+        assert_eq!(wide.id, "usb:2a0e:002c");
+        assert!(wide.name.starts_with("DSLogic U3Pro32 · USB 3 · 2a0e:002c"));
+        assert!(describe_listed(0x1234, 0x0020, None, None).is_none());
+    }
+
+    #[test]
+    fn firmware_search_includes_a_dsview_install() {
+        let dirs = dsview_res_dirs(Some(r"C:\Program Files"), Some(r"C:\Program Files (x86)"));
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].file_name().unwrap(), "res");
+        assert_eq!(dirs[0].parent().unwrap().file_name().unwrap(), "DSView");
+        assert!(dirs[1].parent().unwrap().ends_with("DSView"));
+        assert!(dsview_res_dirs(Some(""), None).is_empty());
     }
 }

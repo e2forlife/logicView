@@ -1,8 +1,9 @@
-//! USB capture for the one pod this build supports.
+//! USB capture for DreamSourceLab logic pods.
 //!
-//! High-speed DSLogic Plus, vendor `0x2A0E`, product `0x0020`. Firmware and
-//! the FPGA bitstream stay on disk outside the repo. `LOGICVIEW_FIRMWARE_DIR`
-//! points at the folder that contains `DSLogicPlus.bin`.
+//! Scan lists every vendor `0x2A0E` device. This build opens the high-speed
+//! DSLogic Plus, product `0x0020`. Firmware and the FPGA bitstream stay on
+//! disk outside the repo. `LOGICVIEW_FIRMWARE_DIR`, a DSView `res` folder, or
+//! `%LOCALAPPDATA%\Temp\lv-fw` can supply `DSLogicPlus.bin`.
 
 mod capture;
 mod catalog;
@@ -10,8 +11,8 @@ mod device;
 mod profile;
 
 pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
-pub use device::{list_plus, matches_plus, Pod};
 pub use catalog::{logic_profile, logic_profiles, LogicProfile};
+pub use device::{list_plus, list_pods, matches_plus, Pod};
 pub use profile::{
     plan_clock, threshold_code, ClockPlan, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
     HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, VENDOR_ID,

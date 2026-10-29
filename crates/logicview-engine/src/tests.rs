@@ -3,7 +3,7 @@ use std::time::Duration;
 use logicview_capture::{SessionConfig, TriggerStep};
 use logicview_proto::{decode_arm, ModeFlags};
 
-use super::{Engine, StartMode};
+use super::{hardware_before_demo, DeviceInfo, Engine, StartMode};
 
 #[tokio::test]
 async fn five_second_demo_edge_survives_save_and_load() {
@@ -151,6 +151,37 @@ async fn pattern_cursors_and_dsl_round_trip_on_the_demo() {
     assert_eq!(&dsl[..2], b"PK");
     let channel = logicview_store::read_dsl_channel(&dsl, 0).unwrap();
     assert!(!channel.is_empty());
+}
+
+#[test]
+fn plugged_in_pods_are_listed_before_demo_devices() {
+    let ordered = hardware_before_demo(vec![
+        DeviceInfo {
+            id: "demo".into(),
+            name: "Demo".into(),
+            kind: "demo".into(),
+            connected: true,
+        },
+        DeviceInfo {
+            id: "usb:2a0e:0020".into(),
+            name: "DSLogic Plus".into(),
+            kind: "usb".into(),
+            connected: true,
+        },
+        DeviceInfo {
+            id: "demo:spi".into(),
+            name: "Demo SPI".into(),
+            kind: "demo".into(),
+            connected: true,
+        },
+    ]);
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|device| device.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["usb:2a0e:0020", "demo", "demo:spi"]
+    );
 }
 
 #[tokio::test]
@@ -433,7 +464,11 @@ async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
         .wait_until_settled("ses-1", Duration::from_secs(5))
         .await
         .unwrap();
-    let names: Vec<_> = status.channels.iter().map(|channel| channel.name.as_str()).collect();
+    let names: Vec<_> = status
+        .channels
+        .iter()
+        .map(|channel| channel.name.as_str())
+        .collect();
     assert_eq!(names, ["CLK", "SDA", "SCL"]);
     assert_eq!(status.probes[1].name, "UART");
     assert_eq!(status.channel_enable, 0b1101);
