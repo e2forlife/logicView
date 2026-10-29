@@ -61,6 +61,12 @@ pub enum EngineError {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct RateBandInfo {
+    pub max_channels: u32,
+    pub max_hz: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ProfileInfo {
     pub id: String,
     pub product_id: u16,
@@ -68,6 +74,9 @@ pub struct ProfileInfo {
     pub channels: u8,
     pub hardware_tested: bool,
     pub note: String,
+    /// Inclusive channel ceilings. Enabling more channels moves to a lower band.
+    pub buffer_rates: Vec<RateBandInfo>,
+    pub stream_rates: Vec<RateBandInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -277,6 +286,8 @@ impl Engine {
                 channels: profile.channels,
                 hardware_tested: profile.hardware_tested,
                 note: profile.note.to_string(),
+                buffer_rates: rate_bands(profile.product_id, false),
+                stream_rates: rate_bands(profile.product_id, true),
             })
             .collect()
     }
@@ -487,8 +498,6 @@ impl Engine {
         } else {
             0.0
         };
-        planned_samples(&config)?;
-        logicview_capture::check_trigger(&config)?;
         let id = {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
@@ -498,6 +507,9 @@ impl Engine {
         if slot.session.phase.is_active() {
             return Err(logicview_capture::CaptureError::Busy.into());
         }
+        clamp_sample_rate(slot, &mut config);
+        planned_samples(&config)?;
+        logicview_capture::check_trigger(&config)?;
         slot.session.config = config;
         Ok(())
     }
@@ -990,6 +1002,21 @@ impl Engine {
         Ok(logicview_store::write_zip_bytes(&data)?)
     }
 
+    /// Replace the session with a `.lvcap` or `.dsl` zip. The name picks the
+    /// container when it has a known extension.
+    pub async fn import_capture(
+        &self,
+        id: Option<&str>,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Status, EngineError> {
+        if bytes.len() < 4 || &bytes[..2] != b"PK" {
+            return Err(EngineError::Device("capture file is not a zip".into()));
+        }
+        let data = decode_capture_bytes(name, bytes)?;
+        self.install_archive(id, data).await
+    }
+
     pub async fn export_samples_csv(
         &self,
         id: Option<&str>,
@@ -1336,6 +1363,57 @@ fn demo_device_info(id: &str) -> DeviceInfo {
     }
 }
 
+fn rate_bands(product_id: u16, stream: bool) -> Vec<RateBandInfo> {
+    logicview_hal::rate_limits(product_id, stream)
+        .iter()
+        .map(|band| RateBandInfo {
+            max_channels: band.max_channels,
+            max_hz: band.max_hz,
+        })
+        .collect()
+}
+
+fn probe_count(slot: &Slot) -> usize {
+    if slot.catalog_names.is_empty() {
+        slot.channel_names.len()
+    } else {
+        slot.catalog_names.len()
+    }
+}
+
+fn enabled_channel_count(mask: u32, probes: usize) -> u32 {
+    let width = probes.max(1).min(32);
+    let all = if width == 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
+    let bits = if mask == 0 { all } else { mask & all };
+    bits.count_ones().max(1)
+}
+
+fn rate_product(devices: &[BoundDevice]) -> u16 {
+    devices
+        .iter()
+        .find_map(|device| usb_product_id(&device.id))
+        .unwrap_or(logicview_hal::PLUS_PID)
+}
+
+fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
+    if config.sample_rate_hz == 0 {
+        return;
+    }
+    let channels = enabled_channel_count(config.channel_enable, probe_count(slot));
+    let stream = config.depth == DepthMode::Stream;
+    let max = logicview_hal::max_sample_hz(
+        logicview_hal::rate_limits(rate_product(&slot.devices), stream),
+        channels,
+    );
+    if config.sample_rate_hz > max {
+        config.sample_rate_hz = max;
+    }
+}
+
 fn usb_product_id(id: &str) -> Option<u16> {
     let rest = id.strip_prefix("usb:2a0e:")?;
     let hex = rest.split([':', '#', '/']).next().unwrap_or(rest);
@@ -1484,6 +1562,23 @@ fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineErr
         return Err(EngineError::Device("session has no demo channels".into()));
     }
     Ok(waves)
+}
+
+fn decode_capture_bytes(name: &str, bytes: &[u8]) -> Result<ArchiveData, EngineError> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".dsl") {
+        return Ok(logicview_store::read_dsl_bytes(bytes)?);
+    }
+    if lower.ends_with(".lvcap") || lower.ends_with(".zip") {
+        return Ok(logicview_store::read_zip_bytes(bytes)?);
+    }
+    match logicview_store::read_zip_bytes(bytes) {
+        Ok(data) => Ok(data),
+        Err(zip_err) => match logicview_store::read_dsl_bytes(bytes) {
+            Ok(data) => Ok(data),
+            Err(_) => Err(zip_err.into()),
+        },
+    }
 }
 
 fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {

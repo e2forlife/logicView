@@ -1,10 +1,11 @@
-//! Native `.lvcap` captures.
+//! Native `.lvcap` captures and the `.dsl` zip this tool writes.
 //!
 //! A capture is either a directory or a zip file the tool owns:
 //! `manifest.json`, `logic/<channel>.bin` (LSB-first bits), and `analog/0.f32`.
-//! This is not a `.dsl` container. The text header for that format lives in
-//! `logicview-proto` until the zip container is implemented.
+//! A `.dsl` zip is a separate container: header text, session JSON, and
+//! `L-<n>/0` blocks. The header text itself is rendered by `logicview-proto`.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -30,6 +31,8 @@ pub enum StoreError {
     MissingChannel(u32),
     #[error("analog samples are not a whole number of f32 values")]
     BadAnalog,
+    #[error("not a capture file")]
+    NotCapture,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -270,6 +273,123 @@ pub fn write_dsl_bytes(parts: &DslParts) -> Result<Vec<u8>, StoreError> {
     Ok(cursor.into_inner())
 }
 
+/// Read a `.dsl` zip written by this tool back into a capture archive.
+///
+/// The container has no analog block, so `analog` is empty. Channel colors
+/// are a display palette because the header only stores names.
+pub fn read_dsl_bytes(bytes: &[u8]) -> Result<ArchiveData, StoreError> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec()))?;
+    let header = {
+        let mut file = archive
+            .by_name("header")
+            .map_err(|_| StoreError::NotCapture)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        text
+    };
+    let (fields, probe_names) = parse_dsl_header(&header);
+    let samples: u64 = fields
+        .get("samples")
+        .and_then(|value| value.parse().ok())
+        .ok_or(StoreError::NotCapture)?;
+    let rate = fields
+        .get("samplerate")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let trigger_pos: u64 = fields
+        .get("trigger_pos")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let probes: usize = fields
+        .get("probes")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(probe_names.len());
+    if probes == 0 || samples == 0 || !samples.is_multiple_of(8) {
+        return Err(StoreError::NotCapture);
+    }
+    let expect = (samples / 8) as usize;
+    let mut logic = Vec::with_capacity(probes);
+    for index in 0..probes {
+        let mut file = archive
+            .by_name(&format!("L-{index}/0"))
+            .map_err(|_| StoreError::MissingChannel(index as u32))?;
+        let mut packed = Vec::new();
+        file.read_to_end(&mut packed)?;
+        if packed.len() != expect {
+            return Err(StoreError::NotCapture);
+        }
+        logic.push(packed);
+    }
+    const PALETTE: [&str; 8] = [
+        "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2", "#7dcea0", "#f1948a",
+    ];
+    let channels = (0..probes)
+        .map(|index| ChannelManifest {
+            index: index as u32,
+            name: probe_names
+                .get(&(index as u32))
+                .cloned()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("D{index}")),
+            color: PALETTE[index % PALETTE.len()].to_string(),
+        })
+        .collect();
+    Ok(ArchiveData {
+        manifest: Manifest {
+            version: MANIFEST_VERSION,
+            software: "logicview".into(),
+            device: "file".into(),
+            mode: fields
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "logic".into()),
+            sample_rate_hz: rate,
+            sample_count: samples,
+            duration_secs: samples as f64 / rate as f64,
+            threshold_volts: 1.6,
+            trigger: TriggerManifest {
+                enabled: trigger_pos > 0,
+                position_samples: (trigger_pos > 0).then_some(trigger_pos),
+                instant: false,
+            },
+            channels,
+            analog_channels: 0,
+        },
+        logic,
+        analog: Vec::new(),
+    })
+}
+
+fn parse_dsl_header(text: &str) -> (BTreeMap<String, String>, BTreeMap<u32, String>) {
+    let mut fields = BTreeMap::new();
+    let mut probes = BTreeMap::new();
+    let mut section = String::new();
+    let mut probe_index: Option<u32> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = name.to_string();
+            probe_index = section.strip_prefix("probe").and_then(|n| n.parse().ok());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if section == "header" {
+            fields.insert(key.to_string(), value.to_string());
+        } else if key == "name" {
+            if let Some(index) = probe_index {
+                probes.insert(index, value.to_string());
+            }
+        }
+    }
+    (fields, probes)
+}
+
 pub fn read_dsl_channel(bytes: &[u8], channel: usize) -> Result<Vec<u8>, StoreError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec()))?;
     let mut file = archive
@@ -369,6 +489,38 @@ mod tests {
             .unwrap();
         assert!(header.contains("version=3"));
         assert_eq!(read_dsl_channel(&bytes, 0).unwrap(), vec![0xAA, 0x55]);
+    }
+
+    #[test]
+    fn dsl_zip_round_trips_into_an_archive() {
+        let header = "\
+[header]
+version=3
+driver=logicview
+mode=logic
+samples=16
+probes=1
+blocks=1
+samplerate=1000000
+trigger_pos=0
+trigger_time=0.000000
+
+[probe0]
+name=CLK
+trigger=
+";
+        let bytes = write_dsl_bytes(&DslParts {
+            header: header.into(),
+            session_json: "{}".into(),
+            channels: vec![vec![0x0F, 0xF0]],
+        })
+        .unwrap();
+        let data = read_dsl_bytes(&bytes).unwrap();
+        assert_eq!(data.manifest.sample_count, 16);
+        assert_eq!(data.manifest.sample_rate_hz, 1_000_000);
+        assert_eq!(data.manifest.channels[0].name, "CLK");
+        assert_eq!(data.logic, vec![vec![0x0F, 0xF0]]);
+        assert!(data.analog.is_empty());
     }
 
     #[test]

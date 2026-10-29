@@ -10,8 +10,9 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -58,6 +59,10 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/export/dsl", get(export_dsl))
         .route("/api/export/csv", get(export_csv))
         .route("/api/export/xlsx", get(export_xlsx))
+        .route(
+            "/api/import",
+            post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/ws", get(ws_upgrade))
         .with_state(AppState { engine })
 }
@@ -145,6 +150,24 @@ fn event_name(event: &EngineEvent) -> &'static str {
         EngineEvent::Stopped { .. } => "stopped",
         EngineEvent::Error { .. } => "error",
     }
+}
+
+#[derive(Deserialize)]
+struct ImportQuery {
+    #[serde(default)]
+    name: String,
+}
+
+async fn import_capture(
+    State(app): State<AppState>,
+    Query(query): Query<ImportQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let status = app
+        .engine
+        .import_capture(None, &query.name, &body)
+        .await?;
+    Ok(Json(json!({"ok": true, "data": status})))
 }
 
 async fn export_lvcap(State(app): State<AppState>) -> Result<Response, ApiError> {
@@ -1185,6 +1208,23 @@ mod tests {
         assert!(export.status().is_success());
         let bytes = export.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..2], b"PK");
+
+        let created = post(&app, json!({"cmd": "create_session", "name": "Opened"})).await;
+        assert_eq!(created["sample_count"], 0);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/import?name=capture.lvcap")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes.to_vec()))
+            .unwrap();
+        let imported = app.clone().oneshot(req).await.unwrap();
+        assert!(imported.status().is_success());
+        let imported_bytes = imported.into_body().collect().await.unwrap().to_bytes();
+        let imported: Value = serde_json::from_slice(&imported_bytes).unwrap();
+        assert_eq!(imported["ok"], true);
+        assert_eq!(imported["data"]["sample_count"], 16_000);
+        assert_eq!(imported["data"]["devices"][0]["id"], "file");
+        assert_eq!(imported["data"]["channels"][0]["name"], "CLK");
     }
 
     #[tokio::test]
