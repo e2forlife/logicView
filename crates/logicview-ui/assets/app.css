@@ -143,8 +143,18 @@ button:disabled { cursor: default; }
   stroke-width: 1.4;
 }
 
-.device-meta { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
-.device-meta strong { font-size: 12px; font-weight: 650; }
+.device-meta { position: relative; display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
+.device-chip select {
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  padding: 0 16px 0 0;
+  font-size: 12px;
+  font-weight: 650;
+  max-width: 168px;
+  appearance: none;
+}
+.device-chip .chev { position: absolute; right: 0; top: 1px; pointer-events: none; }
 .connected { display: inline-flex; align-items: center; gap: 4px; color: #3dcc8e; font-size: 10px; }
 .dot {
   width: 7px;
@@ -185,6 +195,18 @@ button:disabled { cursor: default; }
   gap: 6px;
   padding-left: 4px;
 }
+
+.trig-mark {
+  width: 18px;
+  height: 16px;
+  fill: none;
+  stroke: #8eb6ff;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+#timebase { accent-color: var(--accent); width: 120px; }
 
 .tiny, .check {
   display: inline-flex;
@@ -584,6 +606,63 @@ table.ann tr:hover { background: #222733; }
 }
 
 .side-body button.block { width: 100%; margin-top: 8px; }
+
+.device-card {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  background: #10161e;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.device-card .pod {
+  width: 56px;
+  height: 44px;
+  flex: none;
+  fill: none;
+  stroke: #9aa6b8;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+
+.device-card strong { display: block; font-size: 14px; margin-bottom: 2px; }
+.device-card .hint { margin: 4px 0 0; }
+
+.acq-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  border-bottom: 1px solid #222a36;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.acq-row select,
+.acq-row input[type="number"],
+.acq-row input[type="range"] {
+  margin: 0;
+  max-width: 158px;
+}
+
+.acq-row .value {
+  color: var(--text);
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+details.advanced { margin-top: 14px; }
+details.advanced summary {
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
 
 .marker-row, .measure-row {
   display: flex;

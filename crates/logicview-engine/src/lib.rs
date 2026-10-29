@@ -5,6 +5,7 @@
 
 mod decode_cmd;
 mod run;
+mod samples_export;
 mod usb;
 
 #[cfg(test)]
@@ -969,6 +970,43 @@ impl Engine {
     pub async fn export_zip(&self, id: Option<&str>) -> Result<Vec<u8>, EngineError> {
         let data = self.archive(id).await?;
         Ok(logicview_store::write_zip_bytes(&data)?)
+    }
+
+    pub async fn export_samples_csv(
+        &self,
+        id: Option<&str>,
+    ) -> Result<samples_export::SampleFile, EngineError> {
+        let snap = self.sample_snapshot(id).await?;
+        Ok(samples_export::render_csv(&snap))
+    }
+
+    pub async fn export_samples_xlsx(
+        &self,
+        id: Option<&str>,
+    ) -> Result<samples_export::SampleFile, EngineError> {
+        let snap = self.sample_snapshot(id).await?;
+        Ok(samples_export::render_xlsx(&snap)?)
+    }
+
+    async fn sample_snapshot(
+        &self,
+        id: Option<&str>,
+    ) -> Result<samples_export::SampleSnapshot, EngineError> {
+        let state = self.shared.state.lock().await;
+        let id = self.resolve(&state, id)?;
+        let slot = state.slot(&id)?;
+        let len = slot.session.store.len();
+        if len == 0 {
+            return Err(EngineError::Device("nothing captured yet".into()));
+        }
+        Ok(samples_export::SampleSnapshot {
+            rate: slot.session.config.sample_rate_hz.max(1),
+            names: slot.channel_names.clone(),
+            packed: slot.session.store.to_channels(),
+            len,
+            analog_name: ANALOG_NAME.into(),
+            analog: slot.session.analog.samples().to_vec(),
+        })
     }
 
     async fn archive(&self, id: Option<&str>) -> Result<ArchiveData, EngineError> {

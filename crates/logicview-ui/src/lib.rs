@@ -56,6 +56,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/api/events", get(events))
         .route("/api/export/lvcap", get(export_lvcap))
         .route("/api/export/dsl", get(export_dsl))
+        .route("/api/export/csv", get(export_csv))
+        .route("/api/export/xlsx", get(export_xlsx))
         .route("/ws", get(ws_upgrade))
         .with_state(AppState { engine })
 }
@@ -167,6 +169,50 @@ async fn export_dsl(State(app): State<AppState>) -> Result<Response, ApiError> {
         bytes,
     )
         .into_response())
+}
+
+async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
+    let file = app.engine.export_samples_csv(None).await?;
+    Ok(sample_file_response(
+        file.body,
+        "text/csv; charset=utf-8",
+        "attachment; filename=\"capture.csv\"",
+        file.rows,
+        file.total,
+    ))
+}
+
+async fn export_xlsx(State(app): State<AppState>) -> Result<Response, ApiError> {
+    let file = app.engine.export_samples_xlsx(None).await?;
+    Ok(sample_file_response(
+        file.body,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "attachment; filename=\"capture.xlsx\"",
+        file.rows,
+        file.total,
+    ))
+}
+
+fn sample_file_response(
+    body: Vec<u8>,
+    content_type: &'static str,
+    disposition: &'static str,
+    rows: u64,
+    total: u64,
+) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(header::CONTENT_DISPOSITION, disposition.parse().unwrap());
+    headers.insert(
+        header::HeaderName::from_static("x-logicview-rows"),
+        rows.to_string().parse().unwrap(),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-logicview-total"),
+        total.to_string().parse().unwrap(),
+    );
+    response
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
@@ -972,7 +1018,9 @@ mod tests {
         assert!(html.contains("id=\"wave\""));
         assert!(html.contains("id=\"run\""));
         assert!(html.contains("id=\"stop\""));
+        assert!(html.contains("id=\"device-select\""));
         assert!(!html.contains(">Instant<"));
+        assert!(!html.contains("Use Demo"));
     }
 
     #[tokio::test]
@@ -1286,6 +1334,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn capture_exports_csv_and_xlsx() {
+        let app = router(Engine::new());
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/csv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 1,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+        let count = status["sample_count"].as_u64().unwrap();
+        assert_eq!(count, 960);
+
+        let csv_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/csv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(csv_res.status().is_success());
+        assert_eq!(
+            csv_res
+                .headers()
+                .get("x-logicview-rows")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            count.to_string()
+        );
+        let csv_bytes = csv_res.into_body().collect().await.unwrap().to_bytes();
+        let csv = String::from_utf8(csv_bytes.to_vec()).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "time_s,CLK,UART,SDA,SCL,SINE (V)");
+        assert_eq!(lines.len() as u64, count + 1);
+        let first: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(first[0], "0.000000000");
+        assert_eq!(first[1], "0");
+        assert!(first[5].parse::<f64>().unwrap().abs() < 1.3);
+        let last_sample = count - 1;
+        let last: Vec<&str> = lines.last().unwrap().split(',').collect();
+        assert_eq!(
+            last[1],
+            if logicview_capture::clock_high(last_sample) {
+                "1"
+            } else {
+                "0"
+            }
+        );
+
+        let xlsx_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/export/xlsx")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(xlsx_res.status().is_success());
+        let xlsx = xlsx_res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&xlsx[..2], b"PK");
+        assert!(xlsx.windows(6).any(|window| window == b"time_s"));
+        assert!(xlsx.windows(3).any(|window| window == b"CLK"));
+        assert!(xlsx.windows(4).any(|window| window == b"SINE"));
     }
 
     #[tokio::test]

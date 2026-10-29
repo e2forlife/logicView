@@ -175,6 +175,7 @@ function applyStatus(status, fromLive) {
   if (status.devices) {
     state.devices = status.devices;
     settings.deviceName = status.devices.map((device) => device.name).join(" + ") || settings.deviceName;
+    syncDeviceSelect();
   }
   if ("trigger_sample" in status) state.triggerSample = status.trigger_sample;
   const grew = status.sample_count !== state.total;
@@ -272,7 +273,7 @@ function renderTriggerChoices() {
   if (select.dataset.sig === sig) return;
   select.dataset.sig = sig;
   select.replaceChildren();
-  const rows = state.channels.length ? state.channels : [{ index: 0, name: "D0" }];
+  const rows = state.channels.length ? state.channels : [{ index: 0, name: "0" }];
   for (const channel of rows) {
     const option = document.createElement("option");
     option.value = String(channel.index);
@@ -1073,10 +1074,12 @@ function panelHtml(name) {
   }
   if (name === "export") {
     return `<h2>Export</h2>
+      <button class="block" id="export-csv" type="button">Download CSV</button>
+      <button class="block" id="export-xlsx" type="button">Download Excel</button>
       <button class="block" id="download" type="button">Download .lvcap</button>
       <button class="block" id="download-dsl" type="button">Download .dsl</button>
       <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">Firmware stays outside this repo.</p>`;
+      <p class="hint">CSV and Excel list one row per sample: time, logic levels, and the demo sine in volts. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -1098,20 +1101,35 @@ function devicePanel() {
         <button type="button" data-remove="${index}">Remove</button>
       </div>`)
     .join("");
+  const devices = state.devices || [];
+  const title = devices.map((device) => device.name).join(" + ") || settings.deviceName || "Demo";
+  const hardware = devices.some((device) => device.kind === "usb");
+  const logic = state.channels.map((channel) => channel.name).join(", ") || "—";
+  const analog = state.analog.length
+    ? state.analog.map((channel) => channel.name).join(", ")
+    : "none";
+  const source = state.channels.map((channel) => `<option value="${channel.index}">${channel.name}</option>`).join("");
   return `<h2>Device</h2>
-    <div id="device-list"><p>Looking for pods…</p></div>
-    <p class="hint">Stack Demo and Demo SPI to put both pods on one waveform. Other product ids are listed as untested and are not opened.</p>
+    <div class="device-card">
+      <svg class="pod" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 6V4M12 6V4M17 6V4M7 20v-2M12 20v-2M17 20v-2"></path></svg>
+      <div>
+        <strong>${title}</strong>
+        <span class="connected"><i class="dot"></i> Connected</span>
+        <p class="hint">${hardware ? "Opened pod. The name is the one the engine reports." : "Software demo. No pod serial number."}</p>
+      </div>
+    </div>
+    <p id="profile-note" class="hint">Choose the source from the device menu. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
     <h3>Acquisition</h3>
-    <label class="field">Sample rate
-      <select id="set-rate">
-        <option value="100000">100 kHz</option>
-        <option value="1000000">1 MHz</option>
-        <option value="20000000">20 MHz</option>
-        <option value="100000000">100 MHz</option>
+    <label class="acq-row">Sample rate
+      <select id="set-rate" aria-label="Sample rate">
+        <option value="100000">100 kS/s</option>
+        <option value="1000000">1 MS/s</option>
+        <option value="20000000">20 MS/s</option>
+        <option value="100000000">100 MS/s</option>
       </select>
     </label>
-    <label class="field">Duration
-      <select id="set-duration">
+    <label class="acq-row">Length
+      <select id="set-duration" aria-label="Capture length">
         <option value="10">10 ms</option>
         <option value="100">100 ms</option>
         <option value="1000">1.0 s</option>
@@ -1119,39 +1137,69 @@ function devicePanel() {
         <option value="5000">5.0 s</option>
       </select>
     </label>
-    <label class="field">Depth
-      <select id="set-depth">
+    <label class="acq-row">Buffer
+      <select id="set-depth" aria-label="Buffer mode">
         <option value="buffer">Buffer</option>
         <option value="stream">Stream</option>
       </select>
     </label>
-    <label class="field">Run
-      <select id="set-run">
-        <option value="single">Single</option>
-        <option value="repeat">Repeat</option>
-        <option value="loop">Loop</option>
+    <div class="acq-row"><span>Digital channels</span><span class="value">${state.channels.length} · ${logic}</span></div>
+    <div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>
+    <label class="acq-row">Input voltage
+      <select id="set-threshold" aria-label="Input voltage">
+        <option value="0.8">0.8 V</option>
+        <option value="1.2">1.2 V</option>
+        <option value="1.6">1.6 V</option>
+        <option value="2.5">2.5 V</option>
+        <option value="3.3">3.3 V</option>
+        <option value="5">5.0 V</option>
       </select>
     </label>
-    <label class="field">Repeat interval (ms)
-      <input id="set-repeat" type="number" min="0" step="100">
+    <h3>Trigger</h3>
+    <label class="acq-row">Source
+      <select id="panel-trig-channel" aria-label="Trigger source">${source}</select>
     </label>
-    <label class="field">Threshold (V)
-      <input id="set-threshold" type="number" min="0" max="5" step="0.1">
+    <label class="acq-row">Type
+      <select id="panel-trig-edge" aria-label="Trigger type">
+        <option value="rising">Rising edge</option>
+        <option value="falling">Falling edge</option>
+        <option value="high">High</option>
+        <option value="low">Low</option>
+      </select>
     </label>
-    <label class="check"><input id="set-rle" type="checkbox"> RLE</label>
-    <label class="check"><input id="set-filter" type="checkbox"> One-sample filter</label>
-    <label class="check"><input id="set-ext" type="checkbox"> External clock</label>
-    <label class="check"><input id="set-fall" type="checkbox"> Clock falling edge</label>
-    <label class="check"><input id="set-discard" type="checkbox"> Discard on stop</label>
-    <h3>Trigger sequence</h3>
-    <p class="hint">A sequence replaces the toolbar edge. Steps run in order and the mark is the last one. Each step is one arm-record stage, up to 16.</p>
-    <div id="trigger-steps">${steps}</div>
-    <button class="block" id="add-step" type="button"${settings.triggerSteps.length >= 16 ? " disabled" : ""}>Add edge step</button>`;
+    <label class="acq-row">Position
+      <span>
+        <input id="set-position" type="range" min="0" max="90" step="10" aria-label="Pre-trigger position">
+        <span id="set-position-label"></span>
+      </span>
+    </label>
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <label class="acq-row">Run
+        <select id="set-run" aria-label="Run mode">
+          <option value="single">Single</option>
+          <option value="repeat">Repeat</option>
+          <option value="loop">Loop</option>
+        </select>
+      </label>
+      <label class="acq-row">Repeat interval
+        <input id="set-repeat" type="number" min="0" step="100" aria-label="Repeat interval">
+      </label>
+      <label class="check"><input id="set-rle" type="checkbox"> RLE</label>
+      <label class="check"><input id="set-filter" type="checkbox"> One-sample filter</label>
+      <label class="check"><input id="set-ext" type="checkbox"> External clock</label>
+      <label class="check"><input id="set-fall" type="checkbox"> Clock falling edge</label>
+      <label class="check"><input id="set-discard" type="checkbox"> Discard on stop</label>
+      <h3>Trigger sequence</h3>
+      <p class="hint">A sequence replaces the toolbar edge. Steps run in order and the mark is the last one. Each step is one arm-record stage, up to 16.</p>
+      <div id="trigger-steps">${steps}</div>
+      <button class="block" id="add-step" type="button"${settings.triggerSteps.length >= 16 ? " disabled" : ""}>Add edge step</button>
+    </details>`;
 }
 
 function bindPanel(name) {
   if (name === "device") {
-    loadDevices();
+    loadDeviceChoices();
     bindSelect("set-rate", "rate", true);
     bindSelect("set-duration", "duration", true);
     bindSelect("set-depth", "depth", false);
@@ -1159,9 +1207,39 @@ function bindPanel(name) {
     const repeat = document.getElementById("set-repeat");
     const threshold = document.getElementById("set-threshold");
     repeat.value = String(settings.repeatMs);
+    if (![...threshold.options].some((option) => option.value === String(settings.threshold))) {
+      const extra = document.createElement("option");
+      extra.value = String(settings.threshold);
+      extra.textContent = settings.threshold + " V";
+      threshold.append(extra);
+    }
     threshold.value = String(settings.threshold);
     repeat.addEventListener("change", () => { settings.repeatMs = Number(repeat.value); });
     threshold.addEventListener("change", () => { settings.threshold = Number(threshold.value); });
+    const source = document.getElementById("panel-trig-channel");
+    const edge = document.getElementById("panel-trig-edge");
+    const position = document.getElementById("set-position");
+    const positionLabel = document.getElementById("set-position-label");
+    source.value = String(settings.triggerChannel);
+    edge.value = settings.triggerKind;
+    position.value = String(settings.percent);
+    positionLabel.textContent = settings.percent + "%";
+    source.addEventListener("change", () => {
+      settings.triggerChannel = Number(source.value);
+      const toolbar = document.getElementById("trig-channel");
+      if (toolbar) toolbar.value = source.value;
+    });
+    edge.addEventListener("change", () => {
+      settings.triggerKind = edge.value;
+      const toolbar = document.getElementById("trig-edge");
+      if (toolbar) toolbar.value = edge.value;
+    });
+    position.addEventListener("input", () => {
+      settings.percent = Number(position.value);
+      positionLabel.textContent = settings.percent + "%";
+      const toolbar = document.getElementById("trig-percent");
+      if (toolbar) toolbar.value = String(settings.percent);
+    });
     bindCheck("set-rle", "rle");
     bindCheck("set-filter", "filter");
     bindCheck("set-ext", "extClock");
@@ -1213,6 +1291,8 @@ function bindPanel(name) {
     renderMeasureList();
   }
   if (name === "export") {
+    document.getElementById("export-csv").addEventListener("click", () => downloadCapture("/api/export/csv", "capture.csv"));
+    document.getElementById("export-xlsx").addEventListener("click", () => downloadCapture("/api/export/xlsx", "capture.xlsx"));
     document.getElementById("download").addEventListener("click", () => downloadCapture("/api/export/lvcap", "capture.lvcap"));
     document.getElementById("download-dsl").addEventListener("click", () => downloadCapture("/api/export/dsl", "capture.dsl"));
     document.getElementById("export-ann").addEventListener("click", exportAnnotations);
@@ -1305,71 +1385,79 @@ function bindCheck(id, key) {
   el.addEventListener("change", () => { settings[key] = el.checked; });
 }
 
-async function loadDevices() {
-  const list = document.getElementById("device-list");
-  if (!list) return;
+function syncDeviceSelect() {
+  const select = document.getElementById("device-select");
+  if (!select || !select.options.length) return;
+  const key = (state.devices || []).map((device) => device.id).join("+");
+  if ([...select.options].some((option) => option.value === key)) select.value = key;
+}
+
+async function loadDeviceChoices() {
+  const select = document.getElementById("device-select");
+  if (!select) return;
   try {
     const devices = await api({ cmd: "list_devices" });
-    list.replaceChildren();
-    const attached = new Set((state.devices || []).map((device) => device.id));
-    for (const device of devices) {
-      const row = document.createElement("div");
-      const use = document.createElement("button");
-      use.type = "button";
-      use.className = "block";
-      use.textContent = attached.has(device.id) ? `${device.name} (in session)` : `Use ${device.name}`;
-      use.addEventListener("click", () => useDevice(device.id));
-      row.append(use);
-      if (device.kind === "demo") {
-        const stack = document.createElement("button");
-        stack.type = "button";
-        stack.className = "block";
-        stack.textContent = attached.has(device.id) ? `Remove ${device.name}` : `Stack ${device.name}`;
-        stack.addEventListener("click", () => stackDevice(device, attached.has(device.id)));
-        row.append(stack);
-      }
-      list.append(row);
+    const previous = select.value;
+    select.replaceChildren();
+    const demos = devices.filter((device) => device.kind === "demo");
+    for (const device of demos) {
+      const option = document.createElement("option");
+      option.value = device.id;
+      option.textContent = device.name;
+      select.append(option);
     }
+    if (demos.some((device) => device.id === "demo") && demos.some((device) => device.id === "demo:spi")) {
+      const stacked = document.createElement("option");
+      stacked.value = "demo+demo:spi";
+      stacked.textContent = "Demo + Demo SPI";
+      select.append(stacked);
+    }
+    for (const device of devices) {
+      if (device.kind === "demo") continue;
+      const option = document.createElement("option");
+      option.value = device.id;
+      option.textContent = device.name;
+      select.append(option);
+    }
+    syncDeviceSelect();
+    if (!select.value && previous) select.value = previous;
     api({ cmd: "list_profiles" }).then((profiles) => {
-      const note = document.createElement("p");
-      note.className = "hint";
+      const note = document.getElementById("profile-note");
+      if (!note) return;
       const untested = profiles.filter((profile) => !profile.hardware_tested).length;
       const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
       note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
-      list.append(note);
     }).catch(() => {});
   } catch (err) {
-    list.textContent = err.message;
+    statusEl.textContent = err.message;
+  }
+}
+
+async function applyDeviceChoice(value) {
+  const ids = value.split("+").filter(Boolean);
+  if (!ids.length) return;
+  try {
+    await useDevice(ids[0]);
+    for (const id of ids.slice(1)) {
+      const status = await api({ cmd: "attach_device", id, session: state.active });
+      state.gutterSig = "";
+      applyStatus(status, false);
+    }
+    await loadDeviceChoices();
+    if (state.tab === "device") selectTab("device");
+  } catch (err) {
+    statusEl.textContent = err.message;
+    syncDeviceSelect();
   }
 }
 
 async function useDevice(id) {
-  try {
-    const connected = await api({ cmd: "connect", id });
-    settings.device = connected.id;
-    settings.deviceName = connected.name;
-    const status = await api({ cmd: "status", session: state.active });
-    state.gutterSig = "";
-    applyStatus(status, false);
-    loadDevices();
-  } catch (err) {
-    statusEl.textContent = err.message;
-  }
-}
-
-async function stackDevice(device, remove) {
-  try {
-    const status = await api({
-      cmd: remove ? "detach_device" : "attach_device",
-      id: device.id,
-      session: state.active,
-    });
-    state.gutterSig = "";
-    applyStatus(status, false);
-    loadDevices();
-  } catch (err) {
-    statusEl.textContent = err.message;
-  }
+  const connected = await api({ cmd: "connect", id });
+  settings.device = connected.id;
+  settings.deviceName = connected.name;
+  const status = await api({ cmd: "status", session: state.active });
+  state.gutterSig = "";
+  applyStatus(status, false);
 }
 
 function decoderChannels(protocol) {
@@ -1677,6 +1765,11 @@ async function downloadCapture(path, filename) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(link.href);
+  const rows = res.headers.get("x-logicview-rows");
+  const total = res.headers.get("x-logicview-total");
+  if (rows && total && rows !== total) {
+    statusEl.textContent = `exported ${Number(rows).toLocaleString()} of ${Number(total).toLocaleString()} samples`;
+  }
 }
 
 function connectSocket() {
@@ -2114,6 +2207,8 @@ function bindSplitters() {
 
 const MENUS = {
   file: [
+    ["Export CSV", () => downloadCapture("/api/export/csv", "capture.csv")],
+    ["Export Excel", () => downloadCapture("/api/export/xlsx", "capture.xlsx")],
     ["Download .lvcap", () => downloadCapture("/api/export/lvcap", "capture.lvcap")],
     ["Download .dsl", () => downloadCapture("/api/export/dsl", "capture.dsl")],
   ],
@@ -2197,7 +2292,7 @@ renderTable();
 document.getElementById("run").addEventListener("click", () => runCapture());
 document.getElementById("stop").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
-document.getElementById("device-chip").addEventListener("click", () => selectTab("device"));
+document.getElementById("device-select").addEventListener("change", (ev) => applyDeviceChoice(ev.target.value));
 document.getElementById("channel-add").addEventListener("click", () => selectTab("device"));
 document.getElementById("tool-marker").addEventListener("click", () => setTool("marker"));
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
@@ -2217,7 +2312,13 @@ trigPercent.value = String(settings.percent);
 trigEnable.addEventListener("change", () => { settings.trigger = trigEnable.checked; });
 trigEdge.addEventListener("change", () => { settings.triggerKind = trigEdge.value; });
 trigChannel.addEventListener("change", () => { settings.triggerChannel = Number(trigChannel.value); });
-trigPercent.addEventListener("change", () => { settings.percent = Number(trigPercent.value); });
+trigPercent.addEventListener("change", () => {
+  settings.percent = Number(trigPercent.value);
+  const slider = document.getElementById("set-position");
+  const label = document.getElementById("set-position-label");
+  if (slider) slider.value = trigPercent.value;
+  if (label) label.textContent = settings.percent + "%";
+});
 
 for (const button of document.querySelectorAll(".side-tabs button")) {
   button.addEventListener("click", () => selectTab(button.dataset.tab));
@@ -2322,6 +2423,7 @@ async function boot() {
   const status = await api({ cmd: "status" });
   applyStatus(status, false);
   selectTab("device");
+  loadDeviceChoices();
   connectSocket();
   drawWave();
   syncTimebaseLabel();

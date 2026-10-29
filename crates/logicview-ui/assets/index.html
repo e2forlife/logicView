@@ -26,14 +26,16 @@
       <button type="button" data-menu="help">Help</button>
     </nav>
     <div class="toolbar">
-      <button id="device-chip" class="device-chip" type="button" title="Device">
+      <div class="device-chip" title="Device">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
         <span class="device-meta">
-          <strong id="device-name">Demo</strong>
+          <select id="device-select" aria-label="Device">
+            <option value="demo">Demo</option>
+          </select>
           <span class="connected"><i class="dot"></i> Connected</span>
         </span>
         <span class="chev" aria-hidden="true">▾</span>
-      </button>
+      </div>
       <button id="run" class="run" type="button" title="Run capture">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
         Run
@@ -43,6 +45,7 @@
         Stop
       </button>
       <div class="tool-group" aria-label="Trigger">
+        <svg class="trig-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 16h4l2-8 3 10 2-6h7"></path></svg>
         <label class="check tight"><input id="trig-enable" type="checkbox"> Trigger</label>
         <select id="trig-channel" aria-label="Trigger channel"></select>
         <select id="trig-edge" aria-label="Trigger edge">
