@@ -538,6 +538,17 @@ table.ann tr:hover { background: #222733; }
 .decode-scroll { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
 .decode-card { width: 320px; }
 .decode-card select, .decode-card input { width: 100%; margin-top: 4px; }
+.decode-card .check { display: flex; margin: 2px 0 12px; color: var(--text); }
+.decode-card .check input { width: auto; margin: 0; }
+.decode-lane {
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 12px;
+  color: #8eb6ff;
+  font-size: 11px;
+  font-weight: 700;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
 
 .session-bar {
   display: flex;

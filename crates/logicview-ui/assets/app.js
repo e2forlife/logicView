@@ -46,6 +46,7 @@ const state = {
   selectedDecoder: null,
   decodeQuery: "",
   spiView: {},
+  decodeView: {},
   gutterSig: "",
   nextMarker: 1,
   nextMeasure: 1,
@@ -450,13 +451,17 @@ function rowMetrics() {
   const stage = document.querySelector(".wave-stage");
   const viewport = Math.max(1, stage ? stage.clientHeight : 1);
   const v = view();
+  const lanes = overlayLanes();
+  const laneH = 26;
+  const laneBlock = lanes.length * laneH;
   if (!v.heights) v.heights = {};
   if (!v.customHeights) {
     const count = Math.max(1, rows.length);
-    const base = Math.floor(viewport / count);
+    const room = Math.max(28, viewport - laneBlock);
+    const base = Math.floor(room / count);
     let used = 0;
     rows.forEach((row, index) => {
-      const height = index === rows.length - 1 ? Math.max(28, viewport - used) : Math.max(28, base);
+      const height = index === rows.length - 1 ? Math.max(28, room - used) : Math.max(28, base);
       v.heights[row.key] = height;
       used += Math.max(28, base);
     });
@@ -465,14 +470,14 @@ function rowMetrics() {
       if (!v.heights[row.key]) v.heights[row.key] = 64;
     }
   }
-  let top = 0;
+  let top = laneBlock;
   const layout = rows.map((row) => {
     const height = Math.max(28, v.heights[row.key] || 64);
     const item = { row, top, height };
     top += height;
     return item;
   });
-  return { layout, total: Math.max(1, top), viewport };
+  return { layout, total: Math.max(1, top), viewport, lanes, laneH, laneBlock };
 }
 
 function startRowResize(key, startY) {
@@ -502,10 +507,19 @@ function renderGutter() {
   const rows = orderedRows();
   const metrics = rowMetrics();
   const selected = view().selected;
-  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
+  const laneSig = (metrics.lanes || []).map((decoder) => decoder.id).join(",");
+  const sig = laneSig + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
+  for (const decoder of metrics.lanes || []) {
+    const lane = document.createElement("div");
+    lane.className = "decode-lane";
+    lane.style.height = metrics.laneH + "px";
+    lane.style.flex = "none";
+    lane.textContent = protocolLabel(decoder.protocol);
+    gutter.appendChild(lane);
+  }
   for (const item of metrics.layout) {
     const row = item.row;
     const el = document.createElement("div");
@@ -731,6 +745,7 @@ function drawWave() {
     else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
   }
   drawBuses(ctx, layout);
+  drawDecodeOverlay(ctx, w, metrics);
   ctx.restore();
   for (const item of layout) {
     const row = item.row;
@@ -890,6 +905,110 @@ function drawMeasureSpan(ctx, w, h) {
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
     ctx.fillText(formatSeconds(seconds), Math.max(4, x0 + 4), 16);
+  }
+  ctx.restore();
+}
+
+const FRAME_CLASS = new Set(["select", "start", "stop", "ack", "nack"]);
+
+function overlayEnabled(id) {
+  const pref = state.decodeView[id];
+  return !pref || pref.overlay !== false;
+}
+
+function overlayLanes() {
+  return (state.decoders || []).filter((decoder) => !overlayEnabled(decoder.id));
+}
+
+function valueAnnotations(decoder) {
+  const rows = (state.annotations || []).filter((row) => row.decoder === decoder.id);
+  const values = rows.filter((row) => !FRAME_CLASS.has(row.class));
+  return values.length ? values : rows;
+}
+
+function annotationLabel(row) {
+  if (row.protocol === "spi" && row.fields && (row.fields.mosi || row.fields.miso)) {
+    return "0x" + (row.fields.mosi || "00") + "/0x" + (row.fields.miso || "00");
+  }
+  return row.text || row.class || "";
+}
+
+function decoderTraceSpan(decoder, layout) {
+  const indexes = new Set(Object.values(decoder.channels || {}).map((index) => Number(index)));
+  const hits = layout.filter((item) => item.row.kind === "logic" && indexes.has(item.row.channel));
+  const used = hits.length ? hits : layout.filter((item) => item.row.kind === "logic");
+  if (!used.length) return null;
+  return {
+    top: Math.min(...used.map((item) => item.top)),
+    bottom: Math.max(...used.map((item) => item.top + item.height)),
+  };
+}
+
+function traceRoundRect(ctx, x, y, w, h, r) {
+  const radius = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+
+function drawValueBoxes(ctx, rows, top, bottom, translucent, canvasW) {
+  const height = Math.max(10, bottom - top);
+  let lastLabel = -1;
+  ctx.lineWidth = 1;
+  for (const row of rows) {
+    const x0 = sampleX(row.start_sample);
+    const x1 = Math.max(x0 + 1, sampleX(row.end_sample));
+    if (x1 < 0 || x0 > canvasW) continue;
+    const width = x1 - x0;
+    traceRoundRect(ctx, x0, top, width, height, 4);
+    ctx.fillStyle = translucent ? "rgba(61, 141, 253, 0.34)" : "rgba(61, 141, 253, 0.72)";
+    ctx.fill();
+    ctx.strokeStyle = translucent ? "rgba(198, 220, 255, 0.8)" : "rgba(214, 230, 255, 0.95)";
+    ctx.stroke();
+    const label = annotationLabel(row);
+    if (width < 36 || x0 < lastLabel) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0 + 2, top, Math.max(0, width - 4), height);
+    ctx.clip();
+    ctx.fillStyle = "#f4f7fb";
+    ctx.fillText(label, x0 + 6, translucent ? top + 14 : top + height / 2);
+    ctx.restore();
+    lastLabel = x0 + Math.min(width, ctx.measureText(label).width + 12);
+  }
+}
+
+function drawDecodeOverlay(ctx, canvasW, metrics) {
+  const layout = metrics.layout;
+  ctx.save();
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  let laneIndex = 0;
+  for (const decoder of state.decoders || []) {
+    const rows = valueAnnotations(decoder);
+    if (!rows.length) continue;
+    if (overlayEnabled(decoder.id)) {
+      const span = decoderTraceSpan(decoder, layout);
+      if (!span) continue;
+      const pad = 6;
+      drawValueBoxes(ctx, rows, span.top + pad, span.bottom - pad, true, canvasW);
+    } else {
+      const top = laneIndex * metrics.laneH + 3;
+      drawValueBoxes(ctx, rows, top, top + metrics.laneH - 6, false, canvasW);
+      laneIndex += 1;
+    }
+  }
+  if (metrics.laneBlock > 0) {
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.beginPath();
+    ctx.moveTo(0, metrics.laneBlock + 0.5);
+    ctx.lineTo(canvasW, metrics.laneBlock + 0.5);
+    ctx.stroke();
   }
   ctx.restore();
 }
@@ -1432,7 +1551,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode, and can lay the decoded values on the traces. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -2048,6 +2167,7 @@ function renderDecoderList() {
     trash.addEventListener("click", async () => {
       await api({ cmd: "remove_decoder", session: state.active, id: row.id });
       delete state.spiView[row.id];
+      delete state.decodeView[row.id];
       if (state.selectedDecoder === row.id) state.selectedDecoder = null;
       await refreshDecoders();
       await loadAnnotations();
@@ -2151,6 +2271,7 @@ function rowAt(clientY) {
   const y = clientY - rect.top;
   const { layout } = rowMetrics();
   if (!layout.length) return null;
+  if (y < layout[0].top) return null;
   for (const item of layout) {
     if (y >= item.top && y < item.top + item.height) return item.row;
   }
@@ -3229,7 +3350,9 @@ function openDecodeConfig(decoder) {
   title.textContent = protocolLabel(decoder.protocol);
   const options = decoder.options || {};
   const channels = decoder.channels || {};
-  const parts = Object.keys(channels).map((name) => signalField(name, channels[name]));
+  const overlayOn = overlayEnabled(decoder.id);
+  const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the waveform</label>`];
+  parts.push(...Object.keys(channels).map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
     const cpha = options.cpha === "1" || options.cpha === "true" || options.cpha === "high";
@@ -3338,6 +3461,11 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     options.bit_samples = document.getElementById("decode-bit-samples").value;
   }
   const stack = document.getElementById("decode-stack");
+  const overlayBox = document.getElementById("decode-overlay");
+  if (overlayBox) {
+    state.decodeView[id] = state.decodeView[id] || {};
+    state.decodeView[id].overlay = overlayBox.checked;
+  }
   try {
     await api({
       cmd: "update_decoder",
