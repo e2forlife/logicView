@@ -1002,6 +1002,21 @@ impl Engine {
         Ok(logicview_store::write_zip_bytes(&data)?)
     }
 
+    /// Replace the session with a `.lvcap` or `.dsl` zip. The name picks the
+    /// container when it has a known extension.
+    pub async fn import_capture(
+        &self,
+        id: Option<&str>,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Status, EngineError> {
+        if bytes.len() < 4 || &bytes[..2] != b"PK" {
+            return Err(EngineError::Device("capture file is not a zip".into()));
+        }
+        let data = decode_capture_bytes(name, bytes)?;
+        self.install_archive(id, data).await
+    }
+
     pub async fn export_samples_csv(
         &self,
         id: Option<&str>,
@@ -1547,6 +1562,23 @@ fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineErr
         return Err(EngineError::Device("session has no demo channels".into()));
     }
     Ok(waves)
+}
+
+fn decode_capture_bytes(name: &str, bytes: &[u8]) -> Result<ArchiveData, EngineError> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".dsl") {
+        return Ok(logicview_store::read_dsl_bytes(bytes)?);
+    }
+    if lower.ends_with(".lvcap") || lower.ends_with(".zip") {
+        return Ok(logicview_store::read_zip_bytes(bytes)?);
+    }
+    match logicview_store::read_zip_bytes(bytes) {
+        Ok(data) => Ok(data),
+        Err(zip_err) => match logicview_store::read_dsl_bytes(bytes) {
+            Ok(data) => Ok(data),
+            Err(_) => Err(zip_err.into()),
+        },
+    }
 }
 
 fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {

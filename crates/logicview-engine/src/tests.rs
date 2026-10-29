@@ -535,3 +535,77 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
     assert_eq!(wide.buffer_rates.last().unwrap().max_channels, 32);
     assert_eq!(wide.stream_rates.last().unwrap().max_hz, 50_000_000);
 }
+
+#[tokio::test]
+async fn imported_capture_bytes_replace_the_open_session() {
+    let engine = Engine::new();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 1,
+                realtime: false,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let original = engine
+        .wait_until_settled("ses-1", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(original.sample_count > 0);
+    let edge = engine.search_edge(None, 0, 0, true, true).await.unwrap();
+    let zip = engine.export_zip(None).await.unwrap();
+    let dsl = engine.export_dsl(None).await.unwrap();
+
+    let loaded_engine = Engine::new();
+    let mut channels = std::collections::BTreeMap::new();
+    channels.insert("scl".to_string(), "SCL".to_string());
+    channels.insert("sda".to_string(), "SDA".to_string());
+    loaded_engine
+        .add_decoder(
+            None,
+            "i2c",
+            &channels,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(loaded_engine.list_decoders(None).await.unwrap().len(), 1);
+    let loaded = loaded_engine
+        .import_capture(None, "capture.lvcap", &zip)
+        .await
+        .unwrap();
+    assert_eq!(loaded.sample_count, original.sample_count);
+    assert_eq!(loaded.sample_rate_hz, original.sample_rate_hz);
+    assert_eq!(loaded.channels[0].name, "CLK");
+    assert_eq!(loaded.devices[0].id, "file");
+    assert!(loaded_engine.list_decoders(None).await.unwrap().is_empty());
+    assert_eq!(
+        loaded_engine
+            .search_edge(None, 0, 0, true, true)
+            .await
+            .unwrap(),
+        edge
+    );
+
+    let from_dsl = Engine::new();
+    let loaded = from_dsl
+        .import_capture(None, "capture.dsl", &dsl)
+        .await
+        .unwrap();
+    assert_eq!(loaded.sample_count, original.sample_count);
+    assert_eq!(loaded.channels[0].name, "CLK");
+    assert_eq!(
+        from_dsl
+            .search_edge(None, 0, 0, true, true)
+            .await
+            .unwrap(),
+        edge
+    );
+}

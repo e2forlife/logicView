@@ -14,6 +14,10 @@ const TIME_DIVS = [
   1e-3, 2e-3, 5e-3, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
 ];
 const MARKER_COLORS = ["#5aa2ff", "#ff8a5b", "#3dcc8e", "#e2b340", "#c58bff", "#ff6b8a"];
+const CHANNEL_COLORS = [
+  "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2",
+  "#7dcea0", "#f1948a", "#ff5c8a", "#46d6c8", "#f0d060", "#8b9cff",
+];
 
 const state = {
   sessions: [],
@@ -93,10 +97,13 @@ function view() {
   const id = state.active || "pending";
   if (!views[id]) {
     let order = null;
+    let colors = {};
     try {
       const raw = sessionStorage.getItem("lv-order:" + id);
       if (raw) order = JSON.parse(raw);
-    } catch (_) { /* keep the natural order */ }
+      const storedColors = sessionStorage.getItem("lv-colors:" + id);
+      if (storedColors) colors = JSON.parse(storedColors);
+    } catch (_) { /* keep the natural order and server colors */ }
     views[id] = {
       start: 0,
       spp: 1,
@@ -108,6 +115,7 @@ function view() {
       nextBus: 1,
       selected: null,
       names: {},
+      colors,
     };
   }
   return views[id];
@@ -130,16 +138,34 @@ async function api(body) {
 
 function logicRowModel(channel, decoderId) {
   const index = channel.index;
+  const tileKey = "logic:" + index;
   return {
-    key: decoderId ? "logic:" + index + "@" + decoderId : "logic:" + index,
-    tileKey: "logic:" + index,
+    key: decoderId ? "logic:" + index + "@" + decoderId : tileKey,
+    tileKey,
     kind: "logic",
     channel: index,
     name: channel.name,
-    color: channel.color,
+    color: storedColor(tileKey, channel.color),
     device: channel.device_name || "",
     decoderId: decoderId || "",
   };
+}
+
+function storedColor(key, fallback) {
+  const colors = view().colors;
+  return (colors && colors[key]) || fallback;
+}
+
+function colorKey(row) {
+  if (row.kind === "logic") return row.tileKey || ("logic:" + row.channel);
+  if (row.kind === "analog") return "analog:" + row.channel;
+  return row.key;
+}
+
+function persistColors() {
+  try {
+    sessionStorage.setItem("lv-colors:" + (state.active || "pending"), JSON.stringify(view().colors || {}));
+  } catch (_) { /* the in-memory color still lasts for this session */ }
 }
 
 function sourceRows() {
@@ -152,7 +178,7 @@ function sourceRows() {
       kind: "analog",
       channel: channel.index,
       name: channel.name,
-      color: channel.color,
+      color: storedColor("analog:" + channel.index, channel.color),
       device: "",
     });
   }
@@ -162,7 +188,7 @@ function sourceRows() {
       kind: "bus",
       channel: bus.channels[0] ?? 0,
       name: bus.name,
-      color: "#d5deea",
+      color: storedColor("bus:" + bus.id, "#d5deea"),
       device: "",
       bus,
     });
@@ -634,6 +660,16 @@ function renderGutter() {
     const bar = document.createElement("span");
     bar.className = "bar";
     bar.style.background = row.color;
+    bar.title = "Channel color";
+    bar.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+    bar.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openColorFlyout(row, bar);
+    });
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = signalName(row);
@@ -675,7 +711,7 @@ function renderGutter() {
     });
     el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
-      if (ev.button !== 0 || ev.target.closest("button, .row-resize")) return;
+      if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
       startChannelDrag(row.key, ev.clientY);
     });
     if (row.kind === "bus") {
@@ -1865,12 +1901,12 @@ function panelHtml(name) {
   }
   if (name === "export") {
     return `<h2>Export</h2>
-      <button class="block" id="export-csv" type="button">Download CSV</button>
-      <button class="block" id="export-xlsx" type="button">Download Excel</button>
-      <button class="block" id="download" type="button">Download .lvcap</button>
-      <button class="block" id="download-dsl" type="button">Download .dsl</button>
+      <button class="block" id="export-csv" type="button">Save CSV…</button>
+      <button class="block" id="export-xlsx" type="button">Save Excel…</button>
+      <button class="block" id="download" type="button">Save .lvcap…</button>
+      <button class="block" id="download-dsl" type="button">Save .dsl…</button>
       <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
+      <p class="hint">Saving a capture asks where to put the file. CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -2006,7 +2042,7 @@ function channelChecks(probes) {
   }).join("");
   const buttons = groups[state.channelGroup].map((probe) => {
     const on = channelIsEnabled(probe.index);
-    const color = probe.color || "#8eb6ff";
+    const color = storedColor("logic:" + probe.index, probe.color || "#8eb6ff");
     return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${probe.index}">${probe.index}</button>`;
   }).join("");
   return `<div class="ch-tabs">${tabs}</div><div class="ch-enables">${buttons}</div>`;
@@ -2160,10 +2196,10 @@ function bindPanel(name) {
     renderMeasureList();
   }
   if (name === "export") {
-    document.getElementById("export-csv").addEventListener("click", () => downloadCapture("/api/export/csv", "capture.csv"));
-    document.getElementById("export-xlsx").addEventListener("click", () => downloadCapture("/api/export/xlsx", "capture.xlsx"));
-    document.getElementById("download").addEventListener("click", () => downloadCapture("/api/export/lvcap", "capture.lvcap"));
-    document.getElementById("download-dsl").addEventListener("click", () => downloadCapture("/api/export/dsl", "capture.dsl"));
+    document.getElementById("export-csv").addEventListener("click", () => saveCaptureExport("csv"));
+    document.getElementById("export-xlsx").addEventListener("click", () => saveCaptureExport("xlsx"));
+    document.getElementById("download").addEventListener("click", () => saveCaptureExport("lvcap"));
+    document.getElementById("download-dsl").addEventListener("click", () => saveCaptureExport("dsl"));
     document.getElementById("export-ann").addEventListener("click", exportAnnotations);
   }
 }
@@ -2886,24 +2922,423 @@ async function refreshMeasurements() {
   }
 }
 
-async function downloadCapture(path, filename) {
+const SAVE_KINDS = {
+  csv: {
+    title: "Save CSV",
+    filename: "capture.csv",
+    ext: ".csv",
+    mime: "text/csv",
+    path: "/api/export/csv",
+    note: "One row per sample: time and logic levels.",
+    picker: { description: "CSV", accept: { "text/csv": [".csv"] } },
+  },
+  xlsx: {
+    title: "Save Excel",
+    filename: "capture.xlsx",
+    ext: ".xlsx",
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    path: "/api/export/xlsx",
+    note: "One row per sample. A long capture is cut at Excel's row limit.",
+    picker: { description: "Excel workbook", accept: { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"] } },
+  },
+  lvcap: {
+    title: "Save capture",
+    filename: "capture.lvcap",
+    ext: ".lvcap",
+    mime: "application/zip",
+    path: "/api/export/lvcap",
+    note: "LogicView capture, including the samples.",
+    picker: { description: "LogicView capture", accept: { "application/zip": [".lvcap"] } },
+  },
+  dsl: {
+    title: "Save capture",
+    filename: "capture.dsl",
+    ext: ".dsl",
+    mime: "application/zip",
+    path: "/api/export/dsl",
+    note: "Capture container with the sample blocks.",
+    picker: { description: "Capture", accept: { "application/zip": [".dsl"] } },
+  },
+};
+
+let saveJob = null;
+
+function saveCaptureExport(kind) {
+  const spec = SAVE_KINDS[kind];
+  if (!spec) return;
+  openSaveDialog({
+    title: spec.title,
+    note: spec.note,
+    filename: spec.filename,
+    ext: spec.ext,
+    mime: spec.mime,
+    picker: spec.picker,
+    produce: () => fetchCaptureBlob(spec.path),
+  });
+}
+
+async function fetchCaptureBlob(path) {
   const res = await fetch(path);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    statusEl.textContent = body.error || "export failed";
-    return;
+    throw new Error(body.error || "export failed");
   }
-  const blob = await res.blob();
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(link.href);
   const rows = res.headers.get("x-logicview-rows");
   const total = res.headers.get("x-logicview-total");
   if (rows && total && rows !== total) {
     statusEl.textContent = `exported ${Number(rows).toLocaleString()} of ${Number(total).toLocaleString()} samples`;
   }
+  return res.blob();
+}
+
+function openSaveDialog(job) {
+  saveJob = job;
+  document.getElementById("save-title").textContent = job.title;
+  document.getElementById("save-note").textContent = job.note || "";
+  const input = document.getElementById("save-name");
+  input.value = job.filename;
+  document.getElementById("save-dialog").classList.remove("hidden");
+  input.focus();
+  input.select();
+}
+
+function closeSaveDialog() {
+  saveJob = null;
+  document.getElementById("save-dialog").classList.add("hidden");
+}
+
+async function confirmSave(ev) {
+  ev.preventDefault();
+  const job = saveJob;
+  if (!job) return;
+  const button = document.getElementById("save-confirm");
+  button.disabled = true;
+  try {
+    let name = document.getElementById("save-name").value.trim() || job.filename;
+    name = name.replace(/[\\/]/g, "");
+    if (job.ext && !name.toLowerCase().endsWith(job.ext)) name += job.ext;
+    const produced = await job.produce();
+    const blob = produced instanceof Blob ? produced : new Blob([produced], { type: job.mime || "application/octet-stream" });
+    closeSaveDialog();
+    const wrote = await writeChosenFile(name, blob, job.picker);
+    if (wrote === "cancel") statusEl.textContent = "save cancelled";
+    else statusEl.textContent = "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function writeChosenFile(name, blob, pickerType) {
+  if (typeof window.showSaveFilePicker === "function") {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: pickerType ? [pickerType] : undefined,
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return handle.name || name;
+    } catch (err) {
+      if (err && err.name === "AbortError") return "cancel";
+    }
+  }
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1500);
+  return name;
+}
+
+function setupDocument() {
+  const v = view();
+  const mode = document.getElementById("cursor-mode");
+  const decoders = state.decoders || [];
+  return {
+    kind: "logicview-setup",
+    version: 1,
+    order: v.order || orderedRows().map((row) => row.key),
+    heights: v.heights || {},
+    customHeights: !!v.customHeights,
+    names: v.names || {},
+    hidden: [...state.hidden],
+    buses: v.buses || [],
+    nextBus: v.nextBus || 1,
+    selected: v.selected || null,
+    colors: v.colors || {},
+    markers: (v.markers || []).map((marker) => ({
+      id: marker.id,
+      n: marker.n,
+      sample: marker.sample,
+      channel: marker.channel,
+      name: marker.name || "",
+    })),
+    cursors: {
+      a: state.cursors ? state.cursors[0] : null,
+      b: state.cursors ? state.cursors[1] : null,
+      mode: mode ? mode.value : "single",
+    },
+    decoders: decoders.map((decoder) => ({
+      protocol: decoder.protocol,
+      channels: Object.fromEntries(Object.entries(decoder.channels || {}).map(([name, index]) => [name, channelSpecByIndex(index)])),
+      options: decoder.options || {},
+      stackIndex: decoder.stack_on ? decoders.findIndex((row) => row.id === decoder.stack_on) : null,
+      view: Object.assign({ overlay: true, condensed: false, format: "hex" }, state.decodeView[decoder.id] || {}),
+    })),
+  };
+}
+
+function channelSpecByIndex(index) {
+  const channel = state.channels.find((row) => row.index === index);
+  return channel ? channelSpec(channel) : String(index);
+}
+
+function saveSetup() {
+  openSaveDialog({
+    title: "Save setup",
+    note: "Channel layout, colors, cursors, and decoders. This file does not include samples.",
+    filename: "setup.lvsetup",
+    ext: ".lvsetup",
+    mime: "application/json",
+    picker: { description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] } },
+    produce: () => JSON.stringify(setupDocument(), null, 2),
+  });
+}
+
+async function openSetupFile(file) {
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch (_) {
+    statusEl.textContent = "setup file is not JSON";
+    return;
+  }
+  try {
+    await applySetup(doc);
+    statusEl.textContent = "opened " + file.name;
+  } catch (err) {
+    statusEl.textContent = err.message || "could not open setup";
+  }
+}
+
+async function applySetup(doc) {
+  if (!doc || doc.kind !== "logicview-setup") throw new Error("not a LogicView setup");
+  const v = view();
+  v.order = Array.isArray(doc.order) ? doc.order : v.order;
+  v.heights = doc.heights && typeof doc.heights === "object" ? doc.heights : {};
+  v.customHeights = !!doc.customHeights;
+  v.names = doc.names && typeof doc.names === "object" ? doc.names : {};
+  v.colors = doc.colors && typeof doc.colors === "object" ? doc.colors : {};
+  v.buses = Array.isArray(doc.buses) ? doc.buses : [];
+  v.nextBus = Number(doc.nextBus) || v.nextBus || 1;
+  v.selected = doc.selected || null;
+  v.markers = Array.isArray(doc.markers) ? doc.markers : [];
+  const maxMarker = v.markers.reduce((max, marker) => Math.max(max, Number(marker.id) || 0), 0);
+  state.nextMarker = Math.max(state.nextMarker, maxMarker + 1);
+  state.hidden = new Set(Array.isArray(doc.hidden) ? doc.hidden : []);
+  if (v.order) persistOrder(v.order);
+  persistColors();
+  const mode = document.getElementById("cursor-mode");
+  if (mode && doc.cursors && doc.cursors.mode) mode.value = doc.cursors.mode;
+  if (doc.cursors) {
+    state.cursors = [doc.cursors.a ?? null, doc.cursors.b ?? null];
+    if (doc.cursors.a != null) await api({ cmd: "set_cursor", session: state.active, which: 0, sample: doc.cursors.a });
+    if (doc.cursors.b != null) await api({ cmd: "set_cursor", session: state.active, which: 1, sample: doc.cursors.b });
+  }
+  const existing = [...await api({ cmd: "list_decoders", session: state.active })].reverse();
+  for (const row of existing) {
+    try { await api({ cmd: "remove_decoder", session: state.active, id: row.id }); } catch (_) { /* already removed with its parent */ }
+  }
+  state.decodeView = {};
+  state.spiView = {};
+  const created = [];
+  for (const decoder of doc.decoders || []) {
+    const stack = Number.isInteger(decoder.stackIndex) ? created[decoder.stackIndex] : null;
+    const info = await api({
+      cmd: "add_decoder",
+      session: state.active,
+      protocol: decoder.protocol,
+      channels: decoder.channels || {},
+      options: decoder.options || {},
+      stack_on: stack || null,
+    });
+    created.push(info.id);
+    if (decoder.view) state.decodeView[info.id] = Object.assign({ overlay: true, condensed: false, format: "hex" }, decoder.view);
+  }
+  state.gutterSig = "";
+  await refreshDecoders();
+  await loadAnnotations();
+  renderMarkerList();
+  drawWave();
+  drawRuler();
+}
+
+function openColorFlyout(row, anchor) {
+  const fly = document.getElementById("color-flyout");
+  const key = colorKey(row);
+  if (!fly.classList.contains("hidden") && fly.dataset.key === key) {
+    closeColorFlyout();
+    return;
+  }
+  fly.dataset.key = key;
+  fly.dataset.row = row.key;
+  const current = normalizeHex(row.color);
+  document.getElementById("color-custom").value = current;
+  for (const swatch of fly.querySelectorAll(".swatch")) {
+    swatch.classList.toggle("picked", swatch.dataset.color === current);
+  }
+  placeColorFlyout(anchor);
+}
+
+function closeColorFlyout() {
+  const fly = document.getElementById("color-flyout");
+  fly.classList.add("hidden");
+  delete fly.dataset.key;
+  delete fly.dataset.row;
+}
+
+function placeColorFlyout(anchor) {
+  const fly = document.getElementById("color-flyout");
+  fly.classList.remove("hidden");
+  const rect = anchor.getBoundingClientRect();
+  const width = fly.offsetWidth;
+  const height = fly.offsetHeight;
+  let left = rect.right + 8;
+  let top = rect.top;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, rect.left - width - 8);
+  if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - height);
+  fly.style.left = left + "px";
+  fly.style.top = top + "px";
+}
+
+function normalizeHex(color) {
+  const text = String(color || "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(text) ? text.toLowerCase() : "#e2b340";
+}
+
+function setChannelColor(rowKey, color) {
+  const row = orderedRows().find((item) => item.key === rowKey);
+  if (!row) return;
+  const colors = view().colors || (view().colors = {});
+  colors[colorKey(row)] = color;
+  persistColors();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  if (row.kind === "logic") {
+    const button = document.querySelector(`.ch-en[data-bit="${row.channel}"]`);
+    if (button) button.style.setProperty("--ch", color);
+  }
+  const fly = document.getElementById("color-flyout");
+  if (!fly.classList.contains("hidden")) {
+    const current = normalizeHex(color);
+    document.getElementById("color-custom").value = current;
+    for (const swatch of fly.querySelectorAll(".swatch")) {
+      swatch.classList.toggle("picked", swatch.dataset.color === current);
+    }
+    const anchor = gutter.querySelector(`.ch[data-key="${CSS.escape(rowKey)}"] .bar`);
+    if (anchor) placeColorFlyout(anchor);
+  }
+}
+
+function fillColorSwatches() {
+  const host = document.getElementById("color-swatches");
+  if (!host || host.childElementCount) return;
+  for (const color of CHANNEL_COLORS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "swatch";
+    button.dataset.color = color;
+    button.style.background = color;
+    button.title = color;
+    button.setAttribute("aria-label", color);
+    button.addEventListener("click", () => {
+      const fly = document.getElementById("color-flyout");
+      if (fly.dataset.row) setChannelColor(fly.dataset.row, color);
+    });
+    host.appendChild(button);
+  }
+}
+
+function isCaptureName(name) {
+  const lower = String(name || "").toLowerCase();
+  return lower.endsWith(".lvcap") || lower.endsWith(".dsl");
+}
+
+async function openCaptureFile(file) {
+  statusEl.textContent = "opening " + file.name;
+  const bytes = await file.arrayBuffer();
+  const res = await fetch("/api/import?name=" + encodeURIComponent(file.name), {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: bytes,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) {
+    statusEl.textContent = json.error || "could not open capture";
+    return;
+  }
+  state.tiles = {};
+  state.annotations = [];
+  state.decoders = [];
+  state.selectedDecoder = null;
+  state.decodeView = {};
+  view().userNavigated = false;
+  state.gutterSig = "";
+  applyStatus(json.data, false);
+  await refreshDecoders();
+  await loadAnnotations();
+  const count = Number(json.data.sample_count || 0).toLocaleString();
+  statusEl.textContent = `opened ${file.name} · ${count} samples`;
+}
+
+function dragHasFile(ev) {
+  const types = ev.dataTransfer && ev.dataTransfer.types;
+  return !!types && [...types].includes("Files");
+}
+
+function bindCaptureDrop() {
+  const stage = document.querySelector(".wave-stage");
+  stage.addEventListener("dragenter", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    stage.classList.add("drop-capture");
+  });
+  stage.addEventListener("dragover", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+    stage.classList.add("drop-capture");
+  });
+  stage.addEventListener("dragleave", (ev) => {
+    if (ev.relatedTarget && stage.contains(ev.relatedTarget)) return;
+    stage.classList.remove("drop-capture");
+  });
+  stage.addEventListener("drop", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    stage.classList.remove("drop-capture");
+    const file = [...ev.dataTransfer.files].find((item) => isCaptureName(item.name));
+    if (!file) {
+      statusEl.textContent = "Drop a .lvcap or .dsl capture";
+      return;
+    }
+    openCaptureFile(file);
+  });
+  window.addEventListener("dragover", (ev) => {
+    if (dragHasFile(ev)) ev.preventDefault();
+  });
+  window.addEventListener("drop", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    if (ev.target.closest && ev.target.closest(".wave-stage")) return;
+    statusEl.textContent = "Drop the capture on the waveform";
+  });
 }
 
 function connectSocket() {
@@ -3373,10 +3808,12 @@ function bindSplitters() {
 
 const MENUS = {
   file: [
-    ["Export CSV", () => downloadCapture("/api/export/csv", "capture.csv")],
-    ["Export Excel", () => downloadCapture("/api/export/xlsx", "capture.xlsx")],
-    ["Download .lvcap", () => downloadCapture("/api/export/lvcap", "capture.lvcap")],
-    ["Download .dsl", () => downloadCapture("/api/export/dsl", "capture.dsl")],
+    ["Save setup…", () => saveSetup()],
+    ["Open setup…", () => document.getElementById("setup-file").click()],
+    ["Export CSV…", () => saveCaptureExport("csv")],
+    ["Export Excel…", () => saveCaptureExport("xlsx")],
+    ["Save .lvcap…", () => saveCaptureExport("lvcap")],
+    ["Save .dsl…", () => saveCaptureExport("dsl")],
   ],
   edit: [["Clear markers", () => {
     view().markers = [];
@@ -3527,6 +3964,7 @@ document.addEventListener("click", (ev) => {
     closeDeviceMenu();
   }
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
+  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
 });
 
 window.addEventListener("keydown", (ev) => {
@@ -3550,7 +3988,11 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (key === "Escape") {
-    if (state.menu) closeMenu();
+    const save = document.getElementById("save-dialog");
+    const fly = document.getElementById("color-flyout");
+    if (save && !save.classList.contains("hidden")) closeSaveDialog();
+    else if (fly && !fly.classList.contains("hidden")) closeColorFlyout();
+    else if (state.menu) closeMenu();
     else if (state.tool) setTool(state.tool);
     return;
   }
@@ -3854,6 +4296,26 @@ async function boot() {
   syncTimebaseLabel();
 }
 
+fillColorSwatches();
+bindCaptureDrop();
+document.getElementById("save-cancel").addEventListener("click", closeSaveDialog);
+document.getElementById("save-form").addEventListener("submit", (ev) => confirmSave(ev));
+document.getElementById("save-form").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    ev.stopPropagation();
+    closeSaveDialog();
+  }
+});
+document.getElementById("color-custom").addEventListener("input", (ev) => {
+  const fly = document.getElementById("color-flyout");
+  if (fly.dataset.row) setChannelColor(fly.dataset.row, ev.target.value);
+});
+document.getElementById("setup-file").addEventListener("change", (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (file) openSetupFile(file);
+});
 document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
 document.getElementById("bus-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
