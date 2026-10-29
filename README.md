@@ -17,7 +17,8 @@ cargo run -p logicview-app
 cargo run -p logicview-app -- mcp
 ```
 
-On Windows, from this directory:
+`cargo run -p logicview-app` opens LogicView in its own window. That window
+hosts the Axum UI. On Windows, from this directory:
 
 ```
 scripts\package-release.cmd
@@ -27,12 +28,16 @@ scripts\run-debug.cmd
 `package-release.cmd` runs `cargo build --release -p logicview-app` and writes
 `dist\logicview-<version>-windows.zip`. The archive holds a
 `logicview-<version>` folder with `logicview.exe` and the files from
-`crates\logicview-ui\assets`. `run-debug.cmd` starts the same app with
-`cargo run` (debug build).
+`crates\logicview-ui\assets`. Unzip it and launch `logicview.exe`. The
+release binary is a Windows GUI program: the LogicView window opens and no
+console window appears. The window uses WebView2, which current Windows 10
+and Windows 11 already include. `run-debug.cmd` is the debug build. It keeps
+a console for logs and opens the same window. A Linux build uses WebKitGTK 4.1.
 
-The UI binds to `127.0.0.1:4173` (override with `LOGICVIEW_PORT`). `logicview mcp`
-attaches to that running engine when the endpoint is up, and otherwise starts
-its own demo engine. On Unix the endpoint is a socket at `/tmp/logicview.sock`.
+The window talks to the engine on loopback port 4173. Set `LOGICVIEW_PORT`
+to use another port. `logicview mcp` attaches to that running engine when
+the endpoint is up, and otherwise starts its own demo engine. On Unix the
+endpoint is a socket at `/tmp/logicview.sock`.
 On Windows the UI listens on TCP `127.0.0.1` (ephemeral port) and writes
 `127.0.0.1:<port>` into `%TEMP%\logicview.sock`; the MCP client reads that file
 and connects over TCP. `LOGICVIEW_SOCKET` overrides the socket path on Unix and
