@@ -16,6 +16,9 @@ pub struct I2cDecoder {
     prev_sda: bool,
     in_frame: bool,
     expect_address: bool,
+    /// 7-bit address filter. `None` keeps every transaction.
+    address: Option<u8>,
+    shown: bool,
     acc: u8,
     bits: u8,
     byte_start: u64,
@@ -29,6 +32,8 @@ impl Default for I2cDecoder {
             prev_sda: true,
             in_frame: false,
             expect_address: false,
+            address: None,
+            shown: false,
             acc: 0,
             bits: 0,
             byte_start: 0,
@@ -50,7 +55,11 @@ impl Decoder for I2cDecoder {
     }
 
     fn reset(&mut self) {
-        *self = Self::default();
+        let address = self.address;
+        *self = Self {
+            address,
+            ..Self::default()
+        };
     }
 
     fn feed(&mut self, slice: &SampleSlice<'_>) -> Vec<Annotation> {
@@ -70,17 +79,23 @@ impl Decoder for I2cDecoder {
             let scl = slice.bit("scl", index);
             let sda = slice.bit("sda", index);
             if self.prev_scl && scl && self.prev_sda && !sda {
-                out.push(note(index, index + 1, "start", "Start", BTreeMap::new()));
                 self.in_frame = true;
                 self.expect_address = true;
                 self.acc = 0;
                 self.bits = 0;
                 self.byte_start = index;
+                self.shown = self.address.is_none();
+                if self.shown {
+                    out.push(note(index, index + 1, "start", "Start", BTreeMap::new()));
+                }
             } else if self.prev_scl && scl && !self.prev_sda && sda {
-                out.push(note(index, index + 1, "stop", "Stop", BTreeMap::new()));
+                if self.shown {
+                    out.push(note(index, index + 1, "stop", "Stop", BTreeMap::new()));
+                }
                 self.in_frame = false;
                 self.bits = 0;
                 self.acc = 0;
+                self.shown = self.address.is_none();
             } else if self.in_frame && !self.prev_scl && scl {
                 if self.bits == 0 {
                     self.byte_start = index;
@@ -94,18 +109,21 @@ impl Decoder for I2cDecoder {
                     if self.expect_address {
                         let read = data & 1 == 1;
                         let addr = data >> 1;
-                        let mut fields = BTreeMap::new();
-                        fields.insert("address".into(), format!("{addr:02X}"));
-                        fields.insert("read".into(), if read { "true" } else { "false" }.into());
-                        fields.insert("raw".into(), format!("{data:02X}"));
-                        let text = if read {
-                            format!("Read 0x{addr:02X}")
-                        } else {
-                            format!("Write 0x{addr:02X}")
-                        };
-                        out.push(note(self.byte_start, index + 1, "address", text, fields));
+                        self.shown = self.address.is_none() || self.address == Some(addr);
+                        if self.shown {
+                            let mut fields = BTreeMap::new();
+                            fields.insert("address".into(), format!("{addr:02X}"));
+                            fields.insert("read".into(), if read { "true" } else { "false" }.into());
+                            fields.insert("raw".into(), format!("{data:02X}"));
+                            let text = if read {
+                                format!("Read 0x{addr:02X}")
+                            } else {
+                                format!("Write 0x{addr:02X}")
+                            };
+                            out.push(note(self.byte_start, index + 1, "address", text, fields));
+                        }
                         self.expect_address = false;
-                    } else {
+                    } else if self.shown {
                         let mut fields = BTreeMap::new();
                         fields.insert("data".into(), format!("{data:02X}"));
                         out.push(note(
@@ -116,12 +134,14 @@ impl Decoder for I2cDecoder {
                             fields,
                         ));
                     }
-                    let mut ack_fields = BTreeMap::new();
-                    ack_fields.insert("ack".into(), if acked { "true" } else { "false" }.into());
-                    if acked {
-                        out.push(note(index, index + 1, "ack", "ACK", ack_fields));
-                    } else {
-                        out.push(note(index, index + 1, "nack", "NACK", ack_fields));
+                    if self.shown {
+                        let mut ack_fields = BTreeMap::new();
+                        ack_fields.insert("ack".into(), if acked { "true" } else { "false" }.into());
+                        if acked {
+                            out.push(note(index, index + 1, "ack", "ACK", ack_fields));
+                        } else {
+                            out.push(note(index, index + 1, "nack", "NACK", ack_fields));
+                        }
                     }
                     self.bits = 0;
                     self.acc = 0;
@@ -138,8 +158,27 @@ impl Decoder for I2cDecoder {
         Vec::new()
     }
 
-    fn set_option(&mut self, key: &str, _value: &str) -> Result<(), DecodeError> {
-        Err(DecodeError::UnknownOption(key.into()))
+    fn set_option(&mut self, key: &str, value: &str) -> Result<(), DecodeError> {
+        if key != "address" {
+            return Err(DecodeError::UnknownOption(key.into()));
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("any") {
+            self.address = None;
+            return Ok(());
+        }
+        let hex = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let addr = u8::from_str_radix(hex, 16).map_err(|_| {
+            DecodeError::Message("address must be a 7-bit hex value".into())
+        })?;
+        if addr > 0x7f {
+            return Err(DecodeError::Message("address must be 7 bits".into()));
+        }
+        self.address = Some(addr);
+        Ok(())
     }
 }
 
@@ -263,5 +302,37 @@ mod tests {
         assert!(output.annotations.iter().any(|row| row.class == "stop"));
         assert!(output.annotations.iter().any(|row| row.class == "ack"));
         assert!(output.annotations.iter().any(|row| row.class == "nack"));
+    }
+
+    #[test]
+    fn i2c_address_option_keeps_only_that_address() {
+        let (scl, sda, len) = fixture_eeprom_bits();
+        let channels = [("scl", scl.as_slice()), ("sda", sda.as_slice())];
+        let kept = run(
+            &DecodeRequest {
+                protocol: "i2c",
+                channels: &channels,
+                options: &[("address".into(), "50".into())],
+                region: 0..len,
+                sample_len: len,
+                lower: &[],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(kept.annotations.iter().any(|row| row.class == "address"));
+        let dropped = run(
+            &DecodeRequest {
+                protocol: "i2c",
+                channels: &channels,
+                options: &[("address".into(), "51".into())],
+                region: 0..len,
+                sample_len: len,
+                lower: &[],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(dropped.annotations.is_empty());
     }
 }

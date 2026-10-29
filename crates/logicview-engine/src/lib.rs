@@ -39,7 +39,6 @@ pub use logicview_capture::{
 const MAX_SESSIONS: usize = 8;
 
 const ANALOG_NAME: &str = "SINE";
-const ANALOG_COLOR: &str = "#ff8a5b";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -1270,11 +1269,9 @@ impl Slot {
                     connected: true,
                 })
                 .collect(),
-            analog: vec![AnalogInfo {
-                index: 0,
-                name: ANALOG_NAME.into(),
-                color: ANALOG_COLOR.into(),
-            }],
+            // A logic pod has no analog input. The demo sine is a synthetic
+            // trace, not a connected probe, so it stays out of the waveform.
+            analog: Vec::new(),
             warnings: self.session.warnings.clone(),
             error: self.session.error.clone(),
             active,

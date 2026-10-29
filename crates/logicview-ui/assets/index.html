@@ -32,9 +32,7 @@
           <span class="connected"><i class="dot"></i> Connected</span>
         </span>
         <span class="chev" aria-hidden="true">▾</span>
-        <select id="device-select" aria-label="Device">
-          <option value="demo">Demo</option>
-        </select>
+        <button id="device-select" type="button" aria-haspopup="menu" aria-label="Device"></button>
       </div>
       <button id="run" class="run" type="button" title="Run capture">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
@@ -108,16 +106,6 @@
           </div>
         </div>
         <canvas id="overview"></canvas>
-        <div id="split-bottom" class="h-split" role="separator" aria-orientation="horizontal" title="Resize decode panel"></div>
-        <div id="table-panel">
-          <div class="table-bar">
-            <button type="button" class="table-tab active" data-tab="decoded">Decoded</button>
-            <button type="button" class="table-tab" data-tab="edges">Edges</button>
-            <input id="table-search" type="search" placeholder="Search or A0-10-5A" aria-label="Search annotations">
-            <button id="table-export" type="button">Export</button>
-          </div>
-          <div id="table-body"></div>
-        </div>
         <div class="session-bar">
           <div id="tabs" class="tabs"></div>
           <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
@@ -126,19 +114,67 @@
       </div>
       <div id="split-side" class="v-split" role="separator" aria-orientation="vertical" title="Resize side panel"></div>
       <aside class="side-panel" id="side-panel">
-        <div class="side-tabs" role="tablist" aria-label="Side panel">
-          <button type="button" data-tab="device" class="active">Device</button>
-          <button type="button" data-tab="decode">Decode</button>
-          <button type="button" data-tab="cursors">Cursors</button>
-          <button type="button" data-tab="measure">Measure</button>
-          <button type="button" data-tab="export">Export</button>
+        <div class="side-rail" role="tablist" aria-label="Side panel">
+          <button id="side-pin" type="button" title="Pin sidebar" aria-label="Pin sidebar" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3zM12 15v5"></path></svg>
+          </button>
+          <button type="button" data-tab="device" class="active" title="Device" aria-label="Device">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
+          </button>
+          <button type="button" data-tab="decode" title="Decode" aria-label="Decode">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h4l2 4 2-6 2 8 2-6h4"></path></svg>
+          </button>
+          <button type="button" data-tab="cursors" title="Cursors" aria-label="Cursors">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18M7 4h10l-3 4 3 4H7"></path></svg>
+          </button>
+          <button type="button" data-tab="measure" title="Measure" aria-label="Measure">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v8M19 8v8M5 12h14"></path></svg>
+          </button>
+          <button type="button" data-tab="export" title="Export" aria-label="Export">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10M8 10l4 4 4-4M5 19h14"></path></svg>
+          </button>
         </div>
-        <div id="side-body" class="side-body"></div>
+        <div class="side-sheet">
+          <div id="side-body" class="side-body"></div>
+        </div>
       </aside>
     </div>
   </div>
   <div id="menu-pop" class="menu-pop hidden"></div>
+  <div id="device-menu" class="device-menu hidden" role="menu"></div>
+  <div id="bus-menu" class="menu-pop hidden"></div>
   <div id="hover" class="hover hidden"></div>
+  <div id="capture-wait" class="wait-dialog hidden" role="dialog" aria-live="polite" aria-label="Capture progress">
+    <div class="wait-card">
+      <svg class="radial" viewBox="0 0 120 120" aria-hidden="true">
+        <circle class="radial-track" cx="60" cy="60" r="46"></circle>
+        <circle id="wait-arc" class="radial-value" cx="60" cy="60" r="46"></circle>
+        <circle id="wait-spin" class="radial-spin" cx="60" cy="60" r="46"></circle>
+      </svg>
+      <p id="wait-text">Sampling</p>
+    </div>
+  </div>
+  <div id="decode-config" class="wait-dialog hidden" role="dialog" aria-label="Decoder settings">
+    <form class="wait-card bus-card decode-card" id="decode-config-form">
+      <h2 id="decode-config-title">Decoder</h2>
+      <div id="decode-config-body"></div>
+      <div class="bus-actions">
+        <button type="button" id="decode-config-cancel">Cancel</button>
+        <button type="submit">Apply</button>
+      </div>
+    </form>
+  </div>
+  <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Group a bus">
+    <form class="wait-card bus-card" id="bus-form">
+      <h2>Group a bus</h2>
+      <label class="field">Name <input id="bus-name" type="text" value="Bus 1"></label>
+      <div id="bus-channels"></div>
+      <div class="bus-actions">
+        <button type="button" id="bus-cancel">Cancel</button>
+        <button type="submit">Create</button>
+      </div>
+    </form>
+  </div>
   <script src="/assets/app.js"></script>
 </body>
 </html>
