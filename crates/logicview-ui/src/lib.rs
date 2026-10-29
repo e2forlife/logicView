@@ -372,9 +372,20 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             channel,
             from,
             rising,
+            forward,
         } => {
             let edge = engine
-                .search_edge(session.as_deref(), channel, from, rising)
+                .search_edge(session.as_deref(), channel, from, rising, forward)
+                .await?;
+            Ok(json!({"sample": edge}))
+        }
+        Command::NearestEdge {
+            session,
+            channel,
+            sample,
+        } => {
+            let edge = engine
+                .nearest_edge(session.as_deref(), channel, sample)
                 .await?;
             Ok(json!({"sample": edge}))
         }
@@ -436,16 +447,18 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                 (Some(start), Some(end)) => Some((start, end)),
                 _ => None,
             };
-            Ok(json!(engine
-                .add_decoder(
-                    session.as_deref(),
-                    &protocol,
-                    &channels,
-                    &options,
-                    region,
-                    stack_on.as_deref(),
-                )
-                .await?))
+            Ok(json!(
+                engine
+                    .add_decoder(
+                        session.as_deref(),
+                        &protocol,
+                        &channels,
+                        &options,
+                        region,
+                        stack_on.as_deref(),
+                    )
+                    .await?
+            ))
         }
         Command::RemoveDecoder { session, id } => {
             engine.remove_decoder(session.as_deref(), &id).await?;
@@ -459,24 +472,28 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             end,
             offset,
             limit,
-        } => Ok(json!(engine
-            .read_annotations(
-                session.as_deref(),
-                decoder.as_deref(),
-                query.as_deref(),
-                start,
-                end,
-                offset.unwrap_or(0),
-                limit.unwrap_or(300),
-            )
-            .await?)),
+        } => Ok(json!(
+            engine
+                .read_annotations(
+                    session.as_deref(),
+                    decoder.as_deref(),
+                    query.as_deref(),
+                    start,
+                    end,
+                    offset.unwrap_or(0),
+                    limit.unwrap_or(300),
+                )
+                .await?
+        )),
         Command::ExportAnnotations {
             session,
             format,
             query,
-        } => Ok(json!(engine
-            .export_annotations(session.as_deref(), &format, query.as_deref())
-            .await?)),
+        } => Ok(json!(
+            engine
+                .export_annotations(session.as_deref(), &format, query.as_deref())
+                .await?
+        )),
         Command::Tile {
             session,
             channel,
@@ -648,6 +665,7 @@ fn column_json(column: &Column) -> Value {
         "last": column.last,
         "toggled": column.toggled,
         "edges": column.edges,
+        "valid": column.valid,
     })
 }
 
@@ -700,7 +718,9 @@ struct TriggerStepCmd {
 enum Command {
     ListDevices,
     ListProfiles,
-    Connect { id: String },
+    Connect {
+        id: String,
+    },
     AttachDevice {
         session: Option<String>,
         id: String,
@@ -844,6 +864,13 @@ enum Command {
         from: u64,
         #[serde(default = "default_true")]
         rising: bool,
+        #[serde(default = "default_true")]
+        forward: bool,
+    },
+    NearestEdge {
+        session: Option<String>,
+        channel: usize,
+        sample: u64,
     },
     Tile {
         session: Option<String>,
@@ -906,6 +933,7 @@ mod tests {
                 last: false,
                 toggled: true,
                 edges: 300,
+                valid: true,
             }],
         );
         assert_eq!(&frame[..4], b"LVT1");
@@ -942,7 +970,9 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("LogicView"));
         assert!(html.contains("id=\"wave\""));
-        assert!(html.contains("id=\"start\""));
+        assert!(html.contains("id=\"run\""));
+        assert!(html.contains("id=\"stop\""));
+        assert!(!html.contains(">Instant<"));
     }
 
     #[tokio::test]
@@ -1143,6 +1173,119 @@ mod tests {
         }
         assert_eq!(stopped["phase"], "stopped");
         assert_eq!(stopped["trigger_sample"], 40);
+    }
+
+    #[tokio::test]
+    async fn stopped_capture_does_not_paint_a_tail_past_the_last_sample() {
+        let app = router(Engine::new());
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+        let count = status["sample_count"].as_u64().unwrap();
+        assert_eq!(count, 16_000);
+
+        let tail = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 80) as f64,
+                "columns": 80,
+                "samples_per_pixel": 1.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        let columns = tail["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 80);
+        for (offset, column) in columns.iter().enumerate() {
+            let sample = count - 80 + offset as u64;
+            let high = logicview_capture::clock_high(sample);
+            assert_eq!(column["valid"], true, "sample {sample}");
+            assert_eq!(column["toggled"], false, "sample {sample}");
+            assert_eq!(column["first"], high, "sample {sample}");
+            assert_eq!(column["last"], high, "sample {sample}");
+        }
+
+        let past = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": count as f64,
+                "columns": 6,
+                "samples_per_pixel": 8.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        for column in past["columns"].as_array().unwrap() {
+            assert_eq!(column["valid"], false);
+            assert_eq!(column["toggled"], false);
+            assert_eq!(column["first"], false);
+        }
+
+        let straddle = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 20) as f64,
+                "columns": 2,
+                "samples_per_pixel": 40.0,
+                "kind": "logic"
+            }),
+        )
+        .await;
+        let cols = straddle["columns"].as_array().unwrap();
+        assert_eq!(cols[0]["valid"], true);
+        assert_eq!(
+            cols[0]["toggled"], false,
+            "a high tail must not pick up unread samples past the count"
+        );
+        assert_eq!(cols[1]["valid"], false);
+        assert_eq!(cols[1]["toggled"], false);
+
+        let analog = post(
+            &app,
+            json!({
+                "cmd": "tile",
+                "channel": 0,
+                "start": (count - 32) as f64,
+                "columns": 8,
+                "samples_per_pixel": 16.0,
+                "kind": "analog"
+            }),
+        )
+        .await;
+        for column in analog["columns"].as_array().unwrap() {
+            if column["valid"] == true {
+                let min = column["min"].as_f64().unwrap();
+                let max = column["max"].as_f64().unwrap();
+                assert!(min.is_finite() && max.is_finite());
+                assert!(
+                    (-1.3..1.3).contains(&min) && (-1.3..1.3).contains(&max),
+                    "analog tail {min}..{max}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

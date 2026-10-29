@@ -38,7 +38,7 @@ On Windows the UI listens on TCP `127.0.0.1` (ephemeral port) and writes
 and connects over TCP. `LOGICVIEW_SOCKET` overrides the socket path on Unix and
 the endpoint file path on Windows. When that value is a loopback
 `host:port` such as `127.0.0.1:4174`, Windows binds and connects to that
-TCP address. Press Start. Stack **Demo SPI** from the
+TCP address. Press Run. Stack **Demo SPI** from the
 device drawer to see both pods. Hover a trace for width, period, frequency,
 and duty; the measure drawer keeps those readings. Add I2C or SPI from the
 analyzers drawer and read the rows in the bottom table. The trigger drawer

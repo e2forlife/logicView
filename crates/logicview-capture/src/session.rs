@@ -333,6 +333,13 @@ impl Session {
         for (index, bytes) in split.iter().enumerate() {
             self.store.append_channel(index, bytes, samples)?;
         }
+        // An unpacked analog tail longer than the logic sample count is not
+        // part of the capture. Drawing it shows a spike after the last sample.
+        let analog = if analog.len() as u64 > samples {
+            &analog[..samples as usize]
+        } else {
+            analog
+        };
         self.analog.append(analog)?;
         if matches!(
             self.phase,
@@ -351,6 +358,7 @@ impl Session {
     }
 
     pub fn finish(&mut self) {
+        self.analog.truncate(self.store.len() as usize);
         self.locate_edge_trigger();
         if self.resolve_edges && self.config.trigger_enabled && !self.instant {
             let steps = active_edge_steps(&self.config);
@@ -617,7 +625,33 @@ pub fn planned_samples(config: &SessionConfig) -> Result<u64, CaptureError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logicview_proto::decode_arm;
+    use logicview_proto::{decode_arm, pack_logic_atoms};
+
+    #[test]
+    fn analog_samples_past_the_logic_count_are_dropped() {
+        let mut session = Session::new();
+        let channels = vec![vec![0u8; 8]; 4];
+        let atoms = pack_logic_atoms(&channels).unwrap();
+        let mut analog = vec![0.2f32; 64];
+        analog.extend([40.0, -40.0, 12.0]);
+        session.on_samples(&atoms, &analog, 64).unwrap();
+        assert_eq!(session.store.len(), 64);
+        assert_eq!(session.analog.len(), 64);
+        assert!(session
+            .analog
+            .samples()
+            .iter()
+            .all(|sample| sample.abs() < 1.0));
+        session.analog.append(&[80.0, -80.0]).unwrap();
+        assert_eq!(session.analog.len(), 66);
+        session.finish();
+        assert_eq!(session.analog.len(), 64);
+        assert!(session
+            .analog
+            .samples()
+            .iter()
+            .all(|sample| sample.abs() < 1.0));
+    }
 
     #[test]
     fn two_edges_occupy_two_stages_including_the_upper_record() {

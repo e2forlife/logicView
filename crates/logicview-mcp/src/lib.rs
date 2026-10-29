@@ -67,9 +67,10 @@ pub fn attach_location() -> String {
 // build has no caller, so the unused warning is limited to that build.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse_loopback_endpoint(text: &str) -> Result<std::net::SocketAddr, String> {
-    let addr: std::net::SocketAddr = text.trim().parse().map_err(|_| {
-        "attach endpoint must be a loopback host:port".to_string()
-    })?;
+    let addr: std::net::SocketAddr = text
+        .trim()
+        .parse()
+        .map_err(|_| "attach endpoint must be a loopback host:port".to_string())?;
     if !addr.ip().is_loopback() {
         return Err(format!("refusing non-loopback attach address {addr}"));
     }
@@ -138,14 +139,20 @@ where
             .get("tool")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let arguments = request.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let arguments = request
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let response = match invoke(&engine, tool, &arguments).await {
             Ok(data) => json!({"id": id, "ok": true, "data": data}),
             Err(err) => json!({"id": id, "ok": false, "error": err}),
         };
         let mut bytes = serde_json::to_vec(&response).map_err(|err| err.to_string())?;
         bytes.push(b'\n');
-        write.write_all(&bytes).await.map_err(|err| err.to_string())?;
+        write
+            .write_all(&bytes)
+            .await
+            .map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -175,7 +182,10 @@ impl McpSession {
 
     pub async fn handle(&mut self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
-        let method = message.get("method").and_then(|value| value.as_str()).unwrap_or("");
+        let method = message
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
         if id.is_none() {
             return None;
@@ -197,13 +207,22 @@ impl McpSession {
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(id, json!({"tools": tool_defs()}))),
             "tools/call" => {
-                let name = params.get("name").and_then(|value| value.as_str()).unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let name = params
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 Some(rpc_ok(id, self.call_tool(name, &arguments).await))
             }
             "resources/list" => Some(rpc_ok(id, json!({"resources": resource_defs()}))),
             "resources/read" => {
-                let uri = params.get("uri").and_then(|value| value.as_str()).unwrap_or("");
+                let uri = params
+                    .get("uri")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 match self.read_resource(uri).await {
                     Ok(text) => Some(rpc_ok(
                         id,
@@ -220,7 +239,10 @@ impl McpSession {
             }
             "prompts/list" => Some(rpc_ok(id, json!({"prompts": prompt_defs()}))),
             "prompts/get" => {
-                let name = params.get("name").and_then(|value| value.as_str()).unwrap_or("");
+                let name = params
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 match prompt_text(name) {
                     Some(text) => Some(rpc_ok(
                         id,
@@ -265,7 +287,8 @@ impl McpSession {
         } else if let Some(rest) = uri.strip_prefix("logicview://capture/") {
             if let Some((id, tail)) = rest.split_once('/') {
                 if tail == "decoders" {
-                    self.dispatch("list_decoder_instances", &json!({"session": id})).await?
+                    self.dispatch("list_decoder_instances", &json!({"session": id}))
+                        .await?
                 } else if let Some(decoder) = tail.strip_prefix("annotations/") {
                     self.dispatch(
                         "read_annotations",
@@ -276,7 +299,8 @@ impl McpSession {
                     return Err(format!("unknown resource {uri}"));
                 }
             } else {
-                self.dispatch("capture_status", &json!({"session": rest})).await?
+                self.dispatch("capture_status", &json!({"session": rest}))
+                    .await?
             }
         } else if let Some(id) = uri.strip_prefix("logicview://device/") {
             let devices = self.dispatch("list_devices", &json!({})).await?;
@@ -302,10 +326,16 @@ async fn remote_call(
     let request = json!({"id": 1, "tool": tool, "arguments": arguments});
     let mut bytes = serde_json::to_vec(&request).map_err(|err| err.to_string())?;
     bytes.push(b'\n');
-    guard.write_all(&bytes).await.map_err(|err| err.to_string())?;
+    guard
+        .write_all(&bytes)
+        .await
+        .map_err(|err| err.to_string())?;
     let mut reader = BufReader::new(&mut *guard);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await.map_err(|err| err.to_string())?;
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|err| err.to_string())?;
     if read == 0 {
         return Err("attach connection closed".into());
     }
@@ -332,7 +362,10 @@ async fn stdio_loop(mut session: McpSession) -> Result<(), String> {
         if let Some(response) = session.handle(message).await {
             let mut bytes = serde_json::to_vec(&response).map_err(|err| err.to_string())?;
             bytes.push(b'\n');
-            stdout.write_all(&bytes).await.map_err(|err| err.to_string())?;
+            stdout
+                .write_all(&bytes)
+                .await
+                .map_err(|err| err.to_string())?;
             stdout.flush().await.map_err(|err| err.to_string())?;
         }
     }
@@ -341,7 +374,10 @@ async fn stdio_loop(mut session: McpSession) -> Result<(), String> {
 async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Option<Value>, String> {
     loop {
         let mut line = String::new();
-        let read = reader.read_line(&mut line).await.map_err(|err| err.to_string())?;
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|err| err.to_string())?;
         if read == 0 {
             return Ok(None);
         }
@@ -359,13 +395,19 @@ async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Opti
                 .map_err(|_| "bad Content-Length".to_string())?;
             loop {
                 line.clear();
-                reader.read_line(&mut line).await.map_err(|err| err.to_string())?;
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 if line == "\n" || line == "\r\n" || line.is_empty() {
                     break;
                 }
             }
             let mut body = vec![0u8; len];
-            reader.read_exact(&mut body).await.map_err(|err| err.to_string())?;
+            reader
+                .read_exact(&mut body)
+                .await
+                .map_err(|err| err.to_string())?;
             return serde_json::from_slice(&body)
                 .map(Some)
                 .map_err(|err| err.to_string());
@@ -384,15 +426,24 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
         "list_decoders_catalog" => Ok(json!(engine.decoder_catalog().await)),
         "connect" => {
             let id = req_str(args, "id")?;
-            Ok(json!(engine.connect(id).await.map_err(|err| err.to_string())?))
+            Ok(json!(engine
+                .connect(id)
+                .await
+                .map_err(|err| err.to_string())?))
         }
         "attach_device" => {
             let id = req_str(args, "id")?;
-            Ok(json!(engine.attach_device(session, id).await.map_err(|err| err.to_string())?))
+            Ok(json!(engine
+                .attach_device(session, id)
+                .await
+                .map_err(|err| err.to_string())?))
         }
         "detach_device" => {
             let id = req_str(args, "id")?;
-            Ok(json!(engine.detach_device(session, id).await.map_err(|err| err.to_string())?))
+            Ok(json!(engine
+                .detach_device(session, id)
+                .await
+                .map_err(|err| err.to_string())?))
         }
         "configure_logic" => {
             let mut config = SessionConfig::default();
@@ -402,7 +453,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
             if let Some(duration) = args.get("duration_ms").and_then(|value| value.as_u64()) {
                 config.duration_ms = duration;
             }
-            config.realtime = args.get("realtime").and_then(|value| value.as_bool()).unwrap_or(false);
+            config.realtime = args
+                .get("realtime")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             config.trigger_enabled = args
                 .get("trigger_enabled")
                 .and_then(|value| value.as_bool())
@@ -440,17 +494,29 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
                 .configure(session, config)
                 .await
                 .map_err(|err| err.to_string())?;
-            let status = engine.status(session).await.map_err(|err| err.to_string())?;
+            let status = engine
+                .status(session)
+                .await
+                .map_err(|err| err.to_string())?;
             Ok(json!(status))
         }
-        "configure_scope" | "configure_daq" => Err(
-            "oscilloscope and data acquisition are not in this build".into(),
-        ),
+        "configure_scope" | "configure_daq" => {
+            Err("oscilloscope and data acquisition are not in this build".into())
+        }
         "start_capture" => {
-            let force = args.get("force").and_then(|value| value.as_bool()).unwrap_or(false);
-            let instant = args.get("instant").and_then(|value| value.as_bool()).unwrap_or(false)
+            let force = args
+                .get("force")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let instant = args
+                .get("instant")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
                 || args.get("mode").and_then(|value| value.as_str()) == Some("instant");
-            let current = engine.status(session).await.map_err(|err| err.to_string())?;
+            let current = engine
+                .status(session)
+                .await
+                .map_err(|err| err.to_string())?;
             if !force
                 && matches!(
                     current.phase.as_str(),
@@ -471,7 +537,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
             Ok(capture_payload(&status, false))
         }
         "wait_capture" => {
-            let timeout_ms = args.get("timeout_ms").and_then(|value| value.as_u64()).unwrap_or(10_000);
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(10_000);
             if !(1..=120_000).contains(&timeout_ms) {
                 return Err("timeout_ms must be between 1 and 120000".into());
             }
@@ -494,7 +563,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
                 let (sessions, active) = engine.list_sessions().await;
                 return Ok(json!({"sessions": sessions, "active": active}));
             }
-            let status = engine.status(session).await.map_err(|err| err.to_string())?;
+            let status = engine
+                .status(session)
+                .await
+                .map_err(|err| err.to_string())?;
             Ok(capture_payload(&status, false))
         }
         "add_decoder" => {
@@ -527,9 +599,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
                 .map_err(|err| err.to_string())?;
             Ok(json!({"removed": id}))
         }
-        "list_decoder_instances" => {
-            Ok(json!(engine.list_decoders(session).await.map_err(|err| err.to_string())?))
-        }
+        "list_decoder_instances" => Ok(json!(engine
+            .list_decoders(session)
+            .await
+            .map_err(|err| err.to_string())?)),
         "read_annotations" | "search_annotations" => {
             let query = if tool == "search_annotations" {
                 Some(req_str(args, "query")?)
@@ -537,8 +610,14 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
                 args.get("query").and_then(|value| value.as_str())
             };
             let decoder = args.get("decoder").and_then(|value| value.as_str());
-            let offset = args.get("offset").and_then(|value| value.as_u64()).unwrap_or(0) as usize;
-            let limit = args.get("limit").and_then(|value| value.as_u64()).unwrap_or(200) as usize;
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(200) as usize;
             let rows = engine
                 .read_annotations(
                     session,
@@ -558,7 +637,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
             }))
         }
         "export_annotations" => {
-            let format = args.get("format").and_then(|value| value.as_str()).unwrap_or("csv");
+            let format = args
+                .get("format")
+                .and_then(|value| value.as_str())
+                .unwrap_or("csv");
             let query = args.get("query").and_then(|value| value.as_str());
             let body = engine
                 .export_annotations(session, format, query)
@@ -568,19 +650,32 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
         }
         "search_edges" => {
             let channel = req_u64(args, "channel")? as usize;
-            let from = args.get("from").and_then(|value| value.as_u64()).unwrap_or(0);
+            let from = args
+                .get("from")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
             if let Some(pattern) = args.get("pattern").and_then(|value| value.as_str()) {
                 let bits = parse_pattern(pattern);
-                let forward = args.get("forward").and_then(|value| value.as_bool()).unwrap_or(true);
+                let forward = args
+                    .get("forward")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
                 let sample = engine
                     .search_pattern(session, channel, from, &bits, forward)
                     .await
                     .map_err(|err| err.to_string())?;
                 Ok(json!({"sample": sample}))
             } else {
-                let rising = args.get("rising").and_then(|value| value.as_bool()).unwrap_or(true);
+                let rising = args
+                    .get("rising")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+                let forward = args
+                    .get("forward")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
                 let sample = engine
-                    .search_edge(session, channel, from, rising)
+                    .search_edge(session, channel, from, rising, forward)
                     .await
                     .map_err(|err| err.to_string())?;
                 Ok(json!({"sample": sample}))
@@ -593,7 +688,11 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
                 .measure(session, channel, sample)
                 .await
                 .map_err(|err| err.to_string())?;
-            let saved = if args.get("persist").and_then(|value| value.as_bool()).unwrap_or(false) {
+            let saved = if args
+                .get("persist")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
                 Some(
                     engine
                         .save_measurement(session, channel, sample)
@@ -614,7 +713,10 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
             }))
         }
         "set_cursors" => {
-            let channel = args.get("channel").and_then(|value| value.as_u64()).unwrap_or(0) as usize;
+            let channel = args
+                .get("channel")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
             if let Some(sample) = args.get("a").and_then(|value| value.as_u64()) {
                 engine
                     .set_cursor(session, 0, Some(sample))
@@ -754,8 +856,14 @@ fn summary_text(data: &Value) -> String {
         }
     }
     if let Some(phase) = data.get("phase").and_then(|value| value.as_str()) {
-        let samples = data.get("sample_count").and_then(|value| value.as_u64()).unwrap_or(0);
-        let id = data.get("capture_id").and_then(|value| value.as_str()).unwrap_or("");
+        let samples = data
+            .get("sample_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let id = data
+            .get("capture_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         return format!("capture {id} {phase}, {samples} samples");
     }
     data.to_string()
@@ -895,13 +1003,25 @@ mod tests {
             .await
             .is_none());
 
-        let prompt = rpc(&mut session, 2, "prompts/get", json!({"name": "bringup_i2c"})).await;
+        let prompt = rpc(
+            &mut session,
+            2,
+            "prompts/get",
+            json!({"name": "bringup_i2c"}),
+        )
+        .await;
         assert!(prompt["result"]["messages"][0]["content"]["text"]
             .as_str()
             .unwrap()
             .contains("0x50"));
 
-        rpc(&mut session, 3, "tools/call", json!({"name": "attach_device", "arguments": {"id": "demo:spi"}})).await;
+        rpc(
+            &mut session,
+            3,
+            "tools/call",
+            json!({"name": "attach_device", "arguments": {"id": "demo:spi"}}),
+        )
+        .await;
         rpc(
             &mut session,
             4,
@@ -909,9 +1029,21 @@ mod tests {
             json!({"name": "configure_logic", "arguments": {"sample_rate_hz": 1_000_000, "duration_ms": 10}}),
         )
         .await;
-        let started = rpc(&mut session, 5, "tools/call", json!({"name": "start_capture", "arguments": {}})).await;
+        let started = rpc(
+            &mut session,
+            5,
+            "tools/call",
+            json!({"name": "start_capture", "arguments": {}}),
+        )
+        .await;
         assert_eq!(started["result"]["isError"], false);
-        rpc(&mut session, 6, "tools/call", json!({"name": "wait_capture", "arguments": {"timeout_ms": 5000}})).await;
+        rpc(
+            &mut session,
+            6,
+            "tools/call",
+            json!({"name": "wait_capture", "arguments": {"timeout_ms": 5000}}),
+        )
+        .await;
         rpc(
             &mut session,
             7,
@@ -967,7 +1099,13 @@ mod tests {
             .unwrap()
             .contains("MOSI 0xA5 MISO 0x3C"));
 
-        let scope = rpc(&mut session, 11, "tools/call", json!({"name": "configure_scope", "arguments": {}})).await;
+        let scope = rpc(
+            &mut session,
+            11,
+            "tools/call",
+            json!({"name": "configure_scope", "arguments": {}}),
+        )
+        .await;
         assert_eq!(scope["result"]["isError"], true);
 
         let measured = rpc(
@@ -1010,7 +1148,8 @@ mod tests {
         }
         assert!(before > 0, "capture should be in progress");
 
-        let path = std::env::temp_dir().join(format!("logicview-attach-{}.sock", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("logicview-attach-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let server = engine.clone();
         let listen = path.clone();
@@ -1026,7 +1165,13 @@ mod tests {
             }
         }
         let mut remote = remote.expect("attach socket");
-        let response = rpc(&mut remote, 1, "tools/call", json!({"name": "start_capture", "arguments": {}})).await;
+        let response = rpc(
+            &mut remote,
+            1,
+            "tools/call",
+            json!({"name": "start_capture", "arguments": {}}),
+        )
+        .await;
         let data = tool_data(&response);
         assert_eq!(data["reused"], true);
         assert_eq!(data["capture_id"], "ses-1");

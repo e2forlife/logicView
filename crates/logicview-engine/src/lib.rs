@@ -16,7 +16,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use logicview_analysis::{cursor_span, find_edge, find_pattern, measure_pulse};
+use logicview_analysis::{
+    cursor_span, find_edge, find_edge_before, find_pattern, measure_pulse, nearest_edge,
+};
 use logicview_capture::{
     demo_pod, planned_samples, AnalogStore, HostClock, LogicStore, Phase, Session,
 };
@@ -305,7 +307,8 @@ impl Engine {
                     "{id} ({name}, {channels} channels) is not opened: no hardware test for this product id"
                 )));
             }
-            let pod = logicview_hal::Pod::open().map_err(|err| EngineError::Device(err.to_string()))?;
+            let pod =
+                logicview_hal::Pod::open().map_err(|err| EngineError::Device(err.to_string()))?;
             let info = DeviceInfo {
                 id: id.into(),
                 name: format!(
@@ -332,7 +335,11 @@ impl Engine {
         )))
     }
 
-    pub async fn attach_device(&self, id: Option<&str>, device_id: &str) -> Result<Status, EngineError> {
+    pub async fn attach_device(
+        &self,
+        id: Option<&str>,
+        device_id: &str,
+    ) -> Result<Status, EngineError> {
         let pod = demo_pod(device_id).ok_or_else(|| {
             if usb_product_id(device_id).is_some() {
                 EngineError::UnknownDevice(format!(
@@ -356,13 +363,21 @@ impl Engine {
         if slot.devices.iter().any(|device| device.id == device_id) {
             return Ok(slot.status(true));
         }
-        let mut ids: Vec<String> = slot.devices.iter().map(|device| device.id.clone()).collect();
+        let mut ids: Vec<String> = slot
+            .devices
+            .iter()
+            .map(|device| device.id.clone())
+            .collect();
         ids.push(pod.id.to_string());
         install_demo_ids(slot, &ids)?;
         Ok(slot.status(true))
     }
 
-    pub async fn detach_device(&self, id: Option<&str>, device_id: &str) -> Result<Status, EngineError> {
+    pub async fn detach_device(
+        &self,
+        id: Option<&str>,
+        device_id: &str,
+    ) -> Result<Status, EngineError> {
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         let slot = state.slot_mut(&id)?;
@@ -579,13 +594,32 @@ impl Engine {
         channel: usize,
         from: u64,
         rising: bool,
+        forward: bool,
     ) -> Result<Option<u64>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         let slot = state.slot(&id)?;
         let bytes = slot.session.store.channel_bytes(channel)?;
         let len = slot.session.store.len();
-        Ok(find_edge(bytes, len, from, rising))
+        Ok(if forward {
+            find_edge(bytes, len, from, rising)
+        } else {
+            find_edge_before(bytes, len, from, rising)
+        })
+    }
+
+    pub async fn nearest_edge(
+        &self,
+        id: Option<&str>,
+        channel: usize,
+        sample: u64,
+    ) -> Result<Option<u64>, EngineError> {
+        let state = self.shared.state.lock().await;
+        let id = self.resolve(&state, id)?;
+        let slot = state.slot(&id)?;
+        let bytes = slot.session.store.channel_bytes(channel)?;
+        let len = slot.session.store.len();
+        Ok(nearest_edge(bytes, len, sample))
     }
 
     pub async fn measure(
@@ -650,7 +684,20 @@ impl Engine {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
         };
-        let (generation, stop, image, enabled, samples, threshold, stream, run, interval, discard, continuous, header_wait) = {
+        let (
+            generation,
+            stop,
+            image,
+            enabled,
+            samples,
+            threshold,
+            stream,
+            run,
+            interval,
+            discard,
+            continuous,
+            header_wait,
+        ) = {
             let mut state = self.shared.state.lock().await;
             let config = state.slot(&id)?.session.config.clone();
             let mask = if config.channel_enable == 0 {
@@ -658,10 +705,14 @@ impl Engine {
             } else {
                 config.channel_enable
             };
-            logicview_hal::plan_clock(config.sample_rate_hz, mask, config.depth == DepthMode::Stream)
-                .map_err(|err| {
-                    EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
-                })?;
+            logicview_hal::plan_clock(
+                config.sample_rate_hz,
+                mask,
+                config.depth == DepthMode::Stream,
+            )
+            .map_err(|err| {
+                EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
+            })?;
             let clock = HostClock {
                 hw_max_hz: logicview_hal::HW_CLOCK_HZ,
                 half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
@@ -775,14 +826,18 @@ impl Engine {
         Ok(slot.cursors)
     }
 
-    pub async fn cursor_span(&self, id: Option<&str>, channel: usize) -> Result<CursorSpan, EngineError> {
+    pub async fn cursor_span(
+        &self,
+        id: Option<&str>,
+        channel: usize,
+    ) -> Result<CursorSpan, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         let slot = state.slot(&id)?;
         let (Some(a), Some(b)) = (slot.cursors[0], slot.cursors[1]) else {
-            return Err(EngineError::Capture(logicview_capture::CaptureError::Proto(
-                "set both cursors first".into(),
-            )));
+            return Err(EngineError::Capture(
+                logicview_capture::CaptureError::Proto("set both cursors first".into()),
+            ));
         };
         let bytes = slot.session.store.channel_bytes(channel)?;
         let len = slot.session.store.len();
@@ -826,7 +881,10 @@ impl Engine {
         Ok(saved)
     }
 
-    pub async fn measurements(&self, id: Option<&str>) -> Result<Vec<SavedMeasurement>, EngineError> {
+    pub async fn measurements(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Vec<SavedMeasurement>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         Ok(state.slot(&id)?.measurements.clone())
@@ -873,11 +931,13 @@ impl Engine {
             "discard_on_stop": slot.session.config.discard_on_stop,
         })
         .to_string();
-        Ok(logicview_store::write_dsl_bytes(&logicview_store::DslParts {
-            header,
-            session_json,
-            channels: slot.session.store.to_channels(),
-        })?)
+        Ok(logicview_store::write_dsl_bytes(
+            &logicview_store::DslParts {
+                header,
+                session_json,
+                channels: slot.session.store.to_channels(),
+            },
+        )?)
     }
 
     pub async fn arm_record(&self, id: Option<&str>) -> Result<Vec<u8>, EngineError> {
@@ -1169,7 +1229,9 @@ fn demo_device_info(id: &str) -> DeviceInfo {
     let pod = demo_pod(id);
     DeviceInfo {
         id: id.to_string(),
-        name: pod.map(|item| item.name.to_string()).unwrap_or_else(|| id.to_string()),
+        name: pod
+            .map(|item| item.name.to_string())
+            .unwrap_or_else(|| id.to_string()),
         kind: "demo".into(),
         connected: true,
     }
@@ -1183,7 +1245,10 @@ fn usb_product_id(id: &str) -> Option<u16> {
 
 fn session_uses_usb(devices: &[BoundDevice]) -> Result<bool, EngineError> {
     let usb = devices.iter().filter(|device| device.kind == "usb").count();
-    let demo = devices.iter().filter(|device| device.kind == "demo").count();
+    let demo = devices
+        .iter()
+        .filter(|device| device.kind == "demo")
+        .count();
     if usb == 0 && demo == devices.len() && !devices.is_empty() {
         return Ok(false);
     }
@@ -1206,9 +1271,8 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
     let mut colors = Vec::new();
     let mut origins = Vec::new();
     for id in ids {
-        let pod = demo_pod(id).ok_or_else(|| {
-            EngineError::UnknownDevice(format!("unknown demo device {id}"))
-        })?;
+        let pod = demo_pod(id)
+            .ok_or_else(|| EngineError::UnknownDevice(format!("unknown demo device {id}")))?;
         devices.push(BoundDevice {
             id: pod.id.to_string(),
             name: pod.name.to_string(),
@@ -1224,7 +1288,9 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
         }
     }
     if names.is_empty() {
-        return Err(EngineError::Device("a session needs at least one channel".into()));
+        return Err(EngineError::Device(
+            "a session needs at least one channel".into(),
+        ));
     }
     slot.devices = devices;
     slot.channel_names = names;
@@ -1239,9 +1305,8 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
 fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineError> {
     let mut waves = Vec::new();
     for device in devices {
-        let pod = demo_pod(&device.id).ok_or_else(|| {
-            EngineError::Device(format!("{} is not a demo source", device.id))
-        })?;
+        let pod = demo_pod(&device.id)
+            .ok_or_else(|| EngineError::Device(format!("{} is not a demo source", device.id)))?;
         for channel in pod.channels {
             waves.push(channel.level);
         }

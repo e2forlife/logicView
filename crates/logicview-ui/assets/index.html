@@ -8,37 +8,100 @@
 </head>
 <body>
   <div id="app">
-    <header class="topbar">
-      <button id="device-chip" class="chip" type="button" title="Device">
-        <span class="dot"></span>
-        <span>Demo</span>
-      </button>
-      <div class="modes" role="tablist" aria-label="Instrument">
-        <button type="button" class="mode active" data-mode="logic">Logic</button>
-        <button type="button" class="mode" data-mode="scope" disabled title="Oscilloscope is a later phase">Scope</button>
-        <button type="button" class="mode" data-mode="data" disabled title="Data acquisition is a later phase">Data</button>
-      </div>
-      <div id="summary" class="summary">Demo</div>
-      <div class="tab-row">
-        <div id="tabs" class="tabs"></div>
-        <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
-      </div>
-      <button id="instant" class="ghost" type="button" title="Instant (I)">Instant</button>
-      <button id="start" class="start" type="button" title="Start or stop (Space)">Start</button>
+    <header class="titlebar">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
+      </svg>
+      <strong>LogicView</strong>
+      <span class="subtitle">for DreamSourceLab DSLogic</span>
     </header>
+    <nav class="menubar" aria-label="Menu">
+      <button type="button" data-menu="file">File</button>
+      <button type="button" data-menu="edit">Edit</button>
+      <button type="button" data-menu="capture">Capture</button>
+      <button type="button" data-menu="view">View</button>
+      <button type="button" data-menu="decode">Decode</button>
+      <button type="button" data-menu="measure">Measure</button>
+      <button type="button" data-menu="tools">Tools</button>
+      <button type="button" data-menu="help">Help</button>
+    </nav>
+    <div class="toolbar">
+      <button id="device-chip" class="device-chip" type="button" title="Device">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
+        <span class="device-meta">
+          <strong id="device-name">Demo</strong>
+          <span class="connected"><i class="dot"></i> Connected</span>
+        </span>
+        <span class="chev" aria-hidden="true">▾</span>
+      </button>
+      <button id="run" class="run" type="button" title="Run capture">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
+        Run
+      </button>
+      <button id="stop" class="stop" type="button" title="Stop capture">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
+        Stop
+      </button>
+      <div class="tool-group" aria-label="Trigger">
+        <label class="check tight"><input id="trig-enable" type="checkbox"> Trigger</label>
+        <select id="trig-channel" aria-label="Trigger channel"></select>
+        <select id="trig-edge" aria-label="Trigger edge">
+          <option value="rising">Rising</option>
+          <option value="falling">Falling</option>
+          <option value="high">High</option>
+          <option value="low">Low</option>
+        </select>
+        <label class="tiny">Pre-trigger
+          <select id="trig-percent" aria-label="Pre-trigger">
+            <option value="0">0%</option>
+            <option value="10" selected>10%</option>
+            <option value="25">25%</option>
+            <option value="50">50%</option>
+            <option value="90">90%</option>
+          </select>
+        </label>
+      </div>
+      <div class="spacer"></div>
+      <button id="zoom-out" class="icon-btn" type="button" title="Zoom out" aria-label="Zoom out">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6M14.5 14.5L20 20"></path></svg>
+      </button>
+      <button id="zoom-in" class="icon-btn" type="button" title="Zoom in" aria-label="Zoom in">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M10 7v6M7 10h6M14.5 14.5L20 20"></path></svg>
+      </button>
+      <input id="timebase" type="range" min="0" max="18" value="14" aria-label="Time per division">
+      <span id="timebase-label">50 ms/div</span>
+      <button id="tool-marker" class="icon-btn" type="button" title="Add marker" aria-label="Add marker">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v18M6 4h11l-3 4 3 4H6"></path></svg>
+      </button>
+      <button id="tool-measure" class="icon-btn" type="button" title="Add measurement" aria-label="Add measurement">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v8M19 8v8M5 12h14M8 12l-2-2M8 12l-2 2M16 12l2-2M16 12l2 2"></path></svg>
+      </button>
+    </div>
     <div class="workspace">
-      <div class="wave-wrap">
+      <div class="wave-column">
         <div class="wave-main">
           <div class="gutter-col">
-            <div class="gutter-spacer"></div>
+            <div class="gutter-head">
+              <span>Channels</span>
+              <button id="channel-add" type="button" title="Devices">+</button>
+            </div>
             <div id="gutter"></div>
           </div>
           <div class="canvas-col">
             <canvas id="ruler"></canvas>
-            <canvas id="wave"></canvas>
+            <div class="wave-stage">
+              <canvas id="wave"></canvas>
+              <button id="edge-prev" class="edge-btn edge-prev" type="button" title="Previous edge" aria-label="Previous edge">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 6l-6 6 6 6"></path></svg>
+              </button>
+              <button id="edge-next" class="edge-btn edge-next" type="button" title="Next edge" aria-label="Next edge">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6l6 6-6 6"></path></svg>
+              </button>
+            </div>
           </div>
         </div>
         <canvas id="overview"></canvas>
+        <div id="split-bottom" class="h-split" role="separator" aria-orientation="horizontal" title="Resize decode panel"></div>
         <div id="table-panel">
           <div class="table-bar">
             <button type="button" class="table-tab active" data-tab="decoded">Decoded</button>
@@ -48,29 +111,27 @@
           </div>
           <div id="table-body"></div>
         </div>
+        <div class="session-bar">
+          <div id="tabs" class="tabs"></div>
+          <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
+        </div>
         <div id="status" class="status">idle</div>
       </div>
-      <aside class="rail" id="rail">
-        <button type="button" data-drawer="device" title="Device (O)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2"></circle></svg>
-        </button>
-        <button type="button" data-drawer="capture" title="Capture">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h10M5 17h12"></path></svg>
-        </button>
-        <button type="button" data-drawer="trigger" title="Trigger (T)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8-7 8-7-8z"></path></svg>
-        </button>
-        <button type="button" data-drawer="analyzers" title="Analyzers (D)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16l4-8 4 6 3-4 5 6"></path></svg>
-        </button>
-        <button type="button" data-drawer="measure" title="Measure (M)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18V6M4 18h16M8 18v-3M12 18v-6M16 18v-4"></path></svg>
-        </button>
+      <div id="split-side" class="v-split" role="separator" aria-orientation="vertical" title="Resize side panel"></div>
+      <aside class="side-panel" id="side-panel">
+        <div class="side-tabs" role="tablist" aria-label="Side panel">
+          <button type="button" data-tab="device" class="active">Device</button>
+          <button type="button" data-tab="decode">Decode</button>
+          <button type="button" data-tab="cursors">Cursors</button>
+          <button type="button" data-tab="measure">Measure</button>
+          <button type="button" data-tab="export">Export</button>
+        </div>
+        <div id="side-body" class="side-body"></div>
       </aside>
-      <div id="drawer" class="drawer hidden"></div>
     </div>
-    <div id="hover" class="hover hidden"></div>
   </div>
+  <div id="menu-pop" class="menu-pop hidden"></div>
+  <div id="hover" class="hover hidden"></div>
   <script src="/assets/app.js"></script>
 </body>
 </html>
