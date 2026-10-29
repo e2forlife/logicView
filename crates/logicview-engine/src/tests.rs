@@ -104,9 +104,15 @@ async fn instant_clears_the_trigger_enable_bit() {
         .unwrap();
     let armed = decode_arm(&engine.arm_record(None).await.unwrap()).unwrap();
     assert!(armed.mode.contains(ModeFlags::TRIGGER_ENABLE));
+    assert!(armed.mode.contains(ModeFlags::SERIAL_TRIGGER));
     assert!(!armed.mode.contains(ModeFlags::INSTANT));
+    assert_eq!(armed.stage_count, 2);
     assert_eq!(armed.stages[0].mask, 1);
-    assert_eq!(armed.stages[0].edge, 1);
+    assert_eq!(armed.stages[0].value, 0);
+    assert_eq!(armed.stages[0].edge, 0);
+    assert_eq!(armed.stages[1].mask, 1);
+    assert_eq!(armed.stages[1].value, 1);
+    assert_eq!(armed.stages[1].edge, 1);
     assert!(armed.trigger_position >= 64);
 }
 

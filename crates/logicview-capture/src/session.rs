@@ -384,6 +384,49 @@ impl Default for Session {
     }
 }
 
+/// Opposite level, then the edge. Both stages use `count` 1.
+fn qualified_edge(
+    step: TriggerStep,
+    stages: &mut [Stage; 16],
+    upper: &mut Option<[UpperStage; 16]>,
+) -> u8 {
+    let channel = step.channel.min(31);
+    let bit = 1u32 << (channel % 16);
+    let (level, edge_value) = if step.rising { (0, bit) } else { (bit, 0) };
+    let on_low = channel < 16;
+    stages[0] = Stage {
+        mask: if on_low { bit } else { 0 },
+        value: if on_low { level } else { 0 },
+        edge: 0,
+        invert: false,
+        logic_or: false,
+        count: 1,
+    };
+    stages[1] = Stage {
+        mask: if on_low { bit } else { 0 },
+        value: if on_low { edge_value } else { 0 },
+        edge: if on_low { bit } else { 0 },
+        invert: false,
+        logic_or: false,
+        count: 1,
+    };
+    if !on_low {
+        let mut upper_stages = [UpperStage::default(); 16];
+        upper_stages[0] = UpperStage {
+            mask: bit,
+            value: level,
+            edge: 0,
+        };
+        upper_stages[1] = UpperStage {
+            mask: bit,
+            value: edge_value,
+            edge: bit,
+        };
+        *upper = Some(upper_stages);
+    }
+    2
+}
+
 fn apply_edge_stages(
     steps: &[TriggerStep],
     stages: &mut [Stage; 16],
@@ -487,7 +530,16 @@ fn build_arm(
     let mut upper = None;
     let stage_count = if config.trigger_enabled && !instant {
         let steps = active_edge_steps(config);
-        if !steps.is_empty() {
+        if steps.len() == 1 && config.trigger_steps.is_empty() {
+            // A lone rising or falling stage matches the level that is already
+            // there, so the pod triggers immediately and the header stays near
+            // 1. On this Plus the edge is a two-stage serial sequence: the
+            // opposite level, then the edge. The position field is a cap. The
+            // header lands on that edge, and on the marker when the edge
+            // arrives after the requested depth. Measured on channel 0.
+            mode.insert(ModeFlags::SERIAL_TRIGGER);
+            qualified_edge(steps[0], &mut stages, &mut upper)
+        } else if !steps.is_empty() {
             // One stage per edge, in order. The record format holds 16.
             // The demo path proves the sequence by searching samples; the
             // pod image is written and has not been run on hardware.
@@ -600,6 +652,7 @@ mod tests {
         let armed = decode_arm(&bytes).unwrap();
         assert_eq!(armed.stage_count, 2);
         assert!(armed.mode.contains(ModeFlags::TRIGGER_ENABLE));
+        assert!(!armed.mode.contains(ModeFlags::SERIAL_TRIGGER));
         assert_eq!(armed.stages[0].mask, 1 << 1);
         assert_eq!(armed.stages[0].value, 1 << 1);
         assert_eq!(armed.stages[0].edge, 1 << 1);
@@ -609,6 +662,39 @@ mod tests {
         assert_eq!(upper[1].mask, 1 << 1);
         assert_eq!(upper[1].value, 0);
         assert_eq!(upper[1].edge, 1 << 1);
+    }
+
+    #[test]
+    fn a_falling_edge_is_high_then_the_edge() {
+        let config = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            trigger_enabled: true,
+            trigger_channel: 0,
+            trigger_kind: TriggerKind::Falling,
+            ..SessionConfig::default()
+        };
+        let bytes = build_arm(
+            &config,
+            262_144,
+            false,
+            1,
+            &HostClock {
+                hw_max_hz: 100_000_000,
+                half_rate_hz: None,
+                quarter_rate_hz: None,
+            },
+        )
+        .unwrap();
+        let armed = decode_arm(&bytes).unwrap();
+        assert!(armed.mode.contains(ModeFlags::SERIAL_TRIGGER));
+        assert_eq!(armed.stage_count, 2);
+        assert_eq!(armed.stages[0].value, 1);
+        assert_eq!(armed.stages[0].edge, 0);
+        assert_eq!(armed.stages[1].value, 0);
+        assert_eq!(armed.stages[1].edge, 1);
+        assert_eq!(armed.stages[0].count, 1);
+        assert_eq!(armed.stages[1].count, 1);
     }
 
     #[test]
