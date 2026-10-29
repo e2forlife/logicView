@@ -287,17 +287,20 @@ impl Engine {
             .iter()
             .map(|pod| demo_device_info(pod.id))
             .collect();
-        if let Ok(pods) = logicview_hal::list_plus() {
-            for pod in pods {
-                devices.push(DeviceInfo {
-                    id: pod.id,
-                    name: pod.name,
-                    kind: "usb".into(),
-                    connected: true,
-                });
+        match logicview_hal::list_pods() {
+            Ok(pods) => {
+                for pod in pods {
+                    devices.push(DeviceInfo {
+                        id: pod.id,
+                        name: pod.name,
+                        kind: "usb".into(),
+                        connected: true,
+                    });
+                }
             }
+            Err(err) => tracing::warn!("USB scan failed: {err}"),
         }
-        devices
+        hardware_before_demo(devices)
     }
 
     pub async fn connect(&self, id: &str) -> Result<DeviceInfo, EngineError> {
@@ -1310,6 +1313,20 @@ fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
     }
 }
 
+fn hardware_before_demo(devices: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
+    let mut usb = Vec::new();
+    let mut other = Vec::new();
+    for device in devices {
+        if device.kind == "usb" {
+            usb.push(device);
+        } else {
+            other.push(device);
+        }
+    }
+    usb.extend(other);
+    usb
+}
+
 fn demo_device_info(id: &str) -> DeviceInfo {
     let pod = demo_pod(id);
     DeviceInfo {
@@ -1377,7 +1394,7 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
             "a session needs at least one channel".into(),
         ));
     }
-        slot.devices = devices;
+    slot.devices = devices;
     slot.channel_names = names;
     slot.channel_colors = colors;
     slot.origins = origins;
@@ -1437,10 +1454,15 @@ fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError>
                     .cloned()
                     .unwrap_or_else(|| "#d5dce6".into()),
             );
-            origins.push(slot.catalog_origins.get(index).cloned().unwrap_or(ChannelOrigin {
-                device_id: "session".into(),
-                device_name: "Session".into(),
-            }));
+            origins.push(
+                slot.catalog_origins
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(ChannelOrigin {
+                        device_id: "session".into(),
+                        device_name: "Session".into(),
+                    }),
+            );
         }
     }
     if names.is_empty() {
