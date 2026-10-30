@@ -14,6 +14,10 @@ const TIME_DIVS = [
   1e-3, 2e-3, 5e-3, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
 ];
 const MARKER_COLORS = ["#5aa2ff", "#ff8a5b", "#3dcc8e", "#e2b340", "#c58bff", "#ff6b8a"];
+const CHANNEL_COLORS = [
+  "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2",
+  "#7dcea0", "#f1948a", "#ff5c8a", "#46d6c8", "#f0d060", "#8b9cff",
+];
 
 const state = {
   sessions: [],
@@ -55,6 +59,7 @@ const state = {
   planned: 0,
   waitKind: "",
   deviceList: [],
+  profiles: [],
 };
 
 const settings = {
@@ -92,10 +97,13 @@ function view() {
   const id = state.active || "pending";
   if (!views[id]) {
     let order = null;
+    let colors = {};
     try {
       const raw = sessionStorage.getItem("lv-order:" + id);
       if (raw) order = JSON.parse(raw);
-    } catch (_) { /* keep the natural order */ }
+      const storedColors = sessionStorage.getItem("lv-colors:" + id);
+      if (storedColors) colors = JSON.parse(storedColors);
+    } catch (_) { /* keep the natural order and server colors */ }
     views[id] = {
       start: 0,
       spp: 1,
@@ -107,6 +115,7 @@ function view() {
       nextBus: 1,
       selected: null,
       names: {},
+      colors,
     };
   }
   return views[id];
@@ -127,25 +136,49 @@ async function api(body) {
   return json.data;
 }
 
-function naturalRows() {
+function logicRowModel(channel, decoderId) {
+  const index = channel.index;
+  const tileKey = "logic:" + index;
+  return {
+    key: decoderId ? "logic:" + index + "@" + decoderId : tileKey,
+    tileKey,
+    kind: "logic",
+    channel: index,
+    name: channel.name,
+    color: storedColor(tileKey, channel.color),
+    device: channel.device_name || "",
+    decoderId: decoderId || "",
+  };
+}
+
+function storedColor(key, fallback) {
+  const colors = view().colors;
+  return (colors && colors[key]) || fallback;
+}
+
+function colorKey(row) {
+  if (row.kind === "logic") return row.tileKey || ("logic:" + row.channel);
+  if (row.kind === "analog") return "analog:" + row.channel;
+  return row.key;
+}
+
+function persistColors() {
+  try {
+    sessionStorage.setItem("lv-colors:" + (state.active || "pending"), JSON.stringify(view().colors || {}));
+  } catch (_) { /* the in-memory color still lasts for this session */ }
+}
+
+function sourceRows() {
   const rows = [];
-  for (const channel of state.channels) {
-    rows.push({
-      key: "logic:" + channel.index,
-      kind: "logic",
-      channel: channel.index,
-      name: channel.name,
-      color: channel.color,
-      device: channel.device_name || "",
-    });
-  }
+  for (const channel of state.channels) rows.push(logicRowModel(channel, ""));
   for (const channel of state.analog) {
     rows.push({
       key: "analog:" + channel.index,
+      tileKey: "analog:" + channel.index,
       kind: "analog",
       channel: channel.index,
       name: channel.name,
-      color: channel.color,
+      color: storedColor("analog:" + channel.index, channel.color),
       device: "",
     });
   }
@@ -155,32 +188,129 @@ function naturalRows() {
       kind: "bus",
       channel: bus.channels[0] ?? 0,
       name: bus.name,
-      color: "#d5deea",
+      color: storedColor("bus:" + bus.id, "#d5deea"),
       device: "",
       bus,
     });
   }
-  for (const decoder of state.decoders || []) {
-    if (decoder.protocol !== "spi") continue;
-    if (!state.spiView[decoder.id]) state.spiView[decoder.id] = { analog: false };
-    const analog = state.spiView[decoder.id].analog;
-    rows.push({
-      key: "decode:" + decoder.id,
-      kind: "bus",
-      channel: decoder.channels.mosi ?? 0,
-      name: "MOSI/MISO",
-      color: analog ? "#7dcea0" : "#d5deea",
-      device: "",
-      bus: {
-        id: "decode:" + decoder.id,
-        name: "MOSI/MISO",
-        channels: [],
-        analog,
-        decode: decoder.id,
-      },
-    });
+  return rows;
+}
+
+function decoderIndexes(decoder) {
+  const seen = new Set();
+  const indexes = [];
+  for (const value of Object.values(decoder.channels || {})) {
+    const index = Number(value);
+    if (!Number.isFinite(index) || seen.has(index)) continue;
+    seen.add(index);
+    indexes.push(index);
+  }
+  return indexes;
+}
+
+function indexesInOrder(indexes, source) {
+  const wanted = new Set(indexes);
+  const ordered = [];
+  for (const row of source) {
+    if (row.kind === "logic" && wanted.has(row.channel) && !ordered.includes(row.channel)) ordered.push(row.channel);
+  }
+  for (const index of indexes) {
+    if (!ordered.includes(index)) ordered.push(index);
+  }
+  return ordered;
+}
+
+function decodeShownAnalog(id) {
+  return decodeFormat(id) === "analog" || !!(state.spiView[id] && state.spiView[id].analog);
+}
+
+function decodeBusRow(decoder, channel) {
+  const analog = decodeShownAnalog(decoder.id);
+  const name = protocolLabel(decoder.protocol);
+  return {
+    key: "decode:" + decoder.id,
+    kind: "decode",
+    channel,
+    name,
+    color: analog ? "#7dcea0" : "#8eb6ff",
+    device: "",
+    decoderId: decoder.id,
+    bus: {
+      id: "decode:" + decoder.id,
+      name,
+      channels: [],
+      analog,
+      decode: decoder.id,
+    },
+  };
+}
+
+function groupRows(decoder, source) {
+  const indexes = indexesInOrder(decoderIndexes(decoder), source);
+  const channel = indexes.length ? indexes[0] : 0;
+  const rows = [decodeBusRow(decoder, channel)];
+  if (decoderCondensed(decoder.id)) return rows;
+  const byIndex = new Map(state.channels.map((item) => [item.index, item]));
+  for (const index of indexes) {
+    const signal = byIndex.get(index);
+    if (!signal) continue;
+    const row = logicRowModel(signal, decoder.id);
+    row.child = true;
+    rows.push(row);
   }
   return rows;
+}
+
+function displayRows() {
+  const source = orderedSourceRows();
+  const decoders = state.decoders || [];
+  const groups = decoders.map((decoder) => {
+    const indexes = decoderIndexes(decoder);
+    let anchor = -1;
+    source.forEach((row, index) => {
+      if (anchor >= 0) return;
+      if (row.kind === "logic" && indexes.includes(row.channel)) anchor = index;
+    });
+    return {
+      id: decoder.id,
+      anchor,
+      stackOn: decoder.stack_on || "",
+      rows: groupRows(decoder, source),
+    };
+  });
+  const claimed = new Set();
+  for (const decoder of decoders) {
+    for (const index of decoderIndexes(decoder)) claimed.add(index);
+  }
+  const out = [];
+  const placed = new Set();
+  const waitingOnParent = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
+  const placeGroup = (group) => {
+    if (placed.has(group.id)) return;
+    out.push(...group.rows);
+    placed.add(group.id);
+    for (const child of groups) {
+      if (!placed.has(child.id) && child.stackOn === group.id) placeGroup(child);
+    }
+  };
+  source.forEach((row, index) => {
+    for (const group of groups) {
+      if (group.anchor !== index || placed.has(group.id) || waitingOnParent(group)) continue;
+      placeGroup(group);
+    }
+    if (row.kind === "logic" && claimed.has(row.channel)) return;
+    out.push(row);
+  });
+  let guard = groups.length + 1;
+  while (placed.size < groups.length && guard-- > 0) {
+    const next = groups.find((group) => !placed.has(group.id) && !waitingOnParent(group));
+    if (!next) break;
+    placeGroup(next);
+  }
+  for (const group of groups) {
+    if (!placed.has(group.id)) placeGroup(group);
+  }
+  return out;
 }
 
 function probeForRow(row) {
@@ -197,6 +327,7 @@ function channelIsEnabled(index) {
 }
 
 function rowEnabled(row) {
+  if (row.kind === "lane" || row.kind === "condense" || row.kind === "decode") return true;
   if (row.kind === "bus") {
     if (row.bus && row.bus.decode) return true;
     return row.bus.channels.some((index) => channelIsEnabled(index));
@@ -206,8 +337,8 @@ function rowEnabled(row) {
   return channelIsEnabled(probe ? probe.index : row.channel);
 }
 
-function orderedRows() {
-  const rows = naturalRows();
+function orderedSourceRows() {
+  const rows = sourceRows();
   const order = view().order;
   if (!order || !order.length) return rows;
   const map = new Map(rows.map((row) => [row.key, row]));
@@ -223,8 +354,16 @@ function orderedRows() {
   return out;
 }
 
+function orderedRows() {
+  return displayRows();
+}
+
+function layoutRows() {
+  return orderedRows().filter((row) => rowEnabled(row) && !rowHiddenByDecoder(row));
+}
+
 function visibleRows() {
-  return orderedRows().filter((row) => !state.hidden.has(row.key) && rowEnabled(row));
+  return layoutRows().filter((row) => !state.hidden.has(row.key));
 }
 
 function triggerOrigin() {
@@ -447,37 +586,37 @@ function startChannelDrag(key, startY) {
 }
 
 function rowMetrics() {
-  const rows = visibleRows();
+  const rows = layoutRows();
   const stage = document.querySelector(".wave-stage");
   const viewport = Math.max(1, stage ? stage.clientHeight : 1);
   const v = view();
-  const lanes = overlayLanes();
   const laneH = 26;
-  const laneBlock = lanes.length * laneH;
+  const flexRows = rows.filter((row) => row.kind !== "lane");
+  const laneCount = rows.length - flexRows.length;
   if (!v.heights) v.heights = {};
   if (!v.customHeights) {
-    const count = Math.max(1, rows.length);
-    const room = Math.max(28, viewport - laneBlock);
+    const count = Math.max(1, flexRows.length);
+    const room = Math.max(28, viewport - laneCount * laneH);
     const base = Math.floor(room / count);
     let used = 0;
-    rows.forEach((row, index) => {
-      const height = index === rows.length - 1 ? Math.max(28, room - used) : Math.max(28, base);
+    flexRows.forEach((row, index) => {
+      const height = index === flexRows.length - 1 ? Math.max(28, room - used) : Math.max(28, base);
       v.heights[row.key] = height;
       used += Math.max(28, base);
     });
   } else {
-    for (const row of rows) {
+    for (const row of flexRows) {
       if (!v.heights[row.key]) v.heights[row.key] = 64;
     }
   }
-  let top = laneBlock;
+  let top = 0;
   const layout = rows.map((row) => {
-    const height = Math.max(28, v.heights[row.key] || 64);
+    const height = row.kind === "lane" ? laneH : Math.max(28, v.heights[row.key] || 64);
     const item = { row, top, height };
     top += height;
     return item;
   });
-  return { layout, total: Math.max(1, top), viewport, lanes, laneH, laneBlock };
+  return { layout, total: Math.max(1, top), viewport, lanes: [], laneH, laneBlock: 0 };
 }
 
 function startRowResize(key, startY) {
@@ -503,27 +642,61 @@ function startRowResize(key, startY) {
   window.addEventListener("pointerup", up);
 }
 
+let foldAnim = null;
+
+function rowFolded(row) {
+  return row.kind === "decode" && decoderCondensed(row.decoderId);
+}
+
+function foldButton(row, folded) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "fold";
+  button.title = folded ? "Show waveform channels" : "Hide waveform channels";
+  button.setAttribute("aria-expanded", folded ? "false" : "true");
+  button.setAttribute("aria-label", button.title);
+  button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>`;
+  const animate = foldAnim === row.decoderId;
+  if (animate) {
+    button.classList.add("anim");
+    if (folded) button.classList.add("open");
+    foldAnim = null;
+  } else if (!folded) {
+    button.classList.add("open");
+  }
+  button.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    foldAnim = row.decoderId;
+    decodePref(row.decoderId).condensed = !folded;
+    state.gutterSig = "";
+    renderGutter();
+    drawWave();
+    scheduleTiles();
+  });
+  if (animate) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        button.classList.toggle("open", !folded);
+      });
+    });
+  }
+  return button;
+}
+
 function renderGutter() {
-  const rows = orderedRows();
   const metrics = rowMetrics();
   const selected = view().selected;
-  const laneSig = (metrics.lanes || []).map((decoder) => decoder.id).join(",");
-  const sig = laneSig + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
+  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
-  for (const decoder of metrics.lanes || []) {
-    const lane = document.createElement("div");
-    lane.className = "decode-lane";
-    lane.style.height = metrics.laneH + "px";
-    lane.style.flex = "none";
-    lane.textContent = protocolLabel(decoder.protocol);
-    gutter.appendChild(lane);
-  }
   for (const item of metrics.layout) {
     const row = item.row;
+    const folded = rowFolded(row);
+    const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
-    el.className = "ch" + (row.key === selected ? " selected" : "") + (state.hidden.has(row.key) ? " dim" : "");
+    el.className = "ch" + (row.child ? " child" : "") + (row.key === selected ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
     el.style.height = item.height + "px";
     el.style.flex = "none";
@@ -531,6 +704,16 @@ function renderGutter() {
     const bar = document.createElement("span");
     bar.className = "bar";
     bar.style.background = row.color;
+    bar.title = "Channel color";
+    bar.addEventListener("mousedown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+    bar.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openColorFlyout(row, bar);
+    });
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = signalName(row);
@@ -546,12 +729,13 @@ function renderGutter() {
     }
     const kind = document.createElement("span");
     kind.className = "kind";
-    kind.textContent = row.kind === "analog" ? "Analog" : row.kind === "bus" ? (row.bus.analog ? "Analog" : "Bus") : "Digital";
+    kind.textContent = rowKindLabel(row);
     const eye = document.createElement("button");
     eye.type = "button";
     eye.className = "eye";
-    eye.title = state.hidden.has(row.key) ? "Show channel" : "Hide channel";
-    eye.innerHTML = eyeIcon(state.hidden.has(row.key));
+    eye.title = dim ? "Show channel" : "Hide channel";
+    eye.setAttribute("aria-pressed", String(!dim));
+    eye.innerHTML = eyeIcon(dim);
     eye.addEventListener("pointerdown", (ev) => ev.stopPropagation());
     eye.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -559,6 +743,7 @@ function renderGutter() {
       else state.hidden.add(row.key);
       state.gutterSig = "";
       renderGutter();
+      drawWave();
       scheduleTiles();
     });
     const handle = document.createElement("div");
@@ -570,12 +755,13 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    el.append(bar, name, kind, eye, handle);
+    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
-      if (ev.button !== 0 || ev.target.closest("button, .row-resize")) return;
+      if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
       startChannelDrag(row.key, ev.clientY);
     });
-    if (row.kind === "bus") {
+    if ((row.kind === "bus" || row.kind === "decode") && row.bus) {
       el.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         openBusMenu(row.bus, ev.clientX, ev.clientY);
@@ -739,12 +925,13 @@ function drawWave() {
   for (const item of layout) {
     const row = item.row;
     if (state.hidden.has(row.key)) continue;
-    const cols = state.tiles[row.key];
+    const cols = state.tiles[row.tileKey || row.key];
     if (!cols) continue;
     if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
     else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
   }
   drawBuses(ctx, layout);
+  drawCondensedRows(ctx, w, layout);
   drawDecodeOverlay(ctx, w, metrics);
   ctx.restore();
   for (const item of layout) {
@@ -911,13 +1098,49 @@ function drawMeasureSpan(ctx, w, h) {
 
 const FRAME_CLASS = new Set(["select", "start", "stop", "ack", "nack"]);
 
+const DECODE_FORMATS = {
+  hex: "Hex",
+  dec: "Decimal",
+  bin: "Binary",
+  oct: "Octal",
+  analog: "Analog",
+};
+
+function decodePref(id) {
+  if (!state.decodeView[id]) state.decodeView[id] = { overlay: true, condensed: false, format: "hex" };
+  return state.decodeView[id];
+}
+
 function overlayEnabled(id) {
   const pref = state.decodeView[id];
   return !pref || pref.overlay !== false;
 }
 
-function overlayLanes() {
-  return (state.decoders || []).filter((decoder) => !overlayEnabled(decoder.id));
+function decoderCondensed(id) {
+  return !!(state.decodeView[id] && state.decodeView[id].condensed);
+}
+
+function decodeFormat(id) {
+  const pref = state.decodeView[id];
+  return pref && DECODE_FORMATS[pref.format] ? pref.format : "hex";
+}
+
+function decoderChannelIndexes(decoder) {
+  return Object.values(decoder.channels || {}).map(Number).filter((index) => Number.isFinite(index));
+}
+
+function rowHiddenByDecoder(row) {
+  return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId);
+}
+
+function rowKindLabel(row) {
+  if (row.kind === "condense" || row.kind === "decode") {
+    if (row.bus && row.bus.analog) return "Analog";
+    return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
+  }
+  if (row.kind === "analog") return "Analog";
+  if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
+  return "Digital";
 }
 
 function valueAnnotations(decoder) {
@@ -933,10 +1156,15 @@ function annotationLabel(row) {
   return row.text || row.class || "";
 }
 
-function logicRow(layout, channel) {
+function logicRow(layout, channel, decoderId) {
   const index = Number(channel);
   if (!Number.isFinite(index)) return null;
-  return layout.find((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key)) || null;
+  const matches = layout.filter((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key));
+  if (decoderId) {
+    const owned = matches.find((item) => item.row.decoderId === decoderId);
+    if (owned) return owned;
+  }
+  return matches.find((item) => !item.row.decoderId) || matches[0] || null;
 }
 
 function dataLineTargets(decoder) {
@@ -952,48 +1180,10 @@ function dataLineTargets(decoder) {
   if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
   if (decoder.protocol === "eeprom24") {
     const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
-    return [{ channel: parent && parent.channels ? parent.channels.sda : null, label: text }];
+    return [{ channel: parent && parent.channels ? parent.channels.sda : null, decoderId: parent && parent.id, label: text }];
   }
   const first = Object.values(channels)[0];
   return [{ channel: first, label: text }];
-}
-
-function traceRoundRect(ctx, x, y, w, h, r) {
-  const radius = Math.max(0, Math.min(r, w / 2, h / 2));
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.arcTo(x + w, y, x + w, y + h, radius);
-  ctx.arcTo(x + w, y + h, x, y + h, radius);
-  ctx.arcTo(x, y + h, x, y, radius);
-  ctx.arcTo(x, y, x + w, y, radius);
-  ctx.closePath();
-}
-
-function drawValueBoxes(ctx, rows, top, bottom, translucent, canvasW) {
-  const height = Math.max(10, bottom - top);
-  let lastLabel = -1;
-  ctx.lineWidth = 1;
-  for (const row of rows) {
-    const x0 = sampleX(row.start_sample);
-    const x1 = Math.max(x0 + 1, sampleX(row.end_sample));
-    if (x1 < 0 || x0 > canvasW) continue;
-    const width = x1 - x0;
-    traceRoundRect(ctx, x0, top, width, height, 4);
-    ctx.fillStyle = translucent ? "rgba(61, 141, 253, 0.34)" : "rgba(61, 141, 253, 0.72)";
-    ctx.fill();
-    ctx.strokeStyle = translucent ? "rgba(198, 220, 255, 0.8)" : "rgba(214, 230, 255, 0.95)";
-    ctx.stroke();
-    const label = annotationLabel(row);
-    if (width < 36 || x0 < lastLabel) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(x0 + 2, top, Math.max(0, width - 4), height);
-    ctx.clip();
-    ctx.fillStyle = "#f4f7fb";
-    ctx.fillText(label, x0 + 6, translucent ? top + 14 : top + height / 2);
-    ctx.restore();
-    lastLabel = x0 + Math.min(width, ctx.measureText(label).width + 12);
-  }
 }
 
 function traceHexagon(ctx, x, y, w, h) {
@@ -1008,7 +1198,7 @@ function traceHexagon(ctx, x, y, w, h) {
   ctx.closePath();
 }
 
-function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf) {
+function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
   const height = Math.max(12, bottom - top);
   let lastLabel = -1;
   ctx.lineWidth = 1.25;
@@ -1020,7 +1210,7 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf) {
     traceHexagon(ctx, x0, top, width, height);
     ctx.save();
     ctx.fillStyle = color || "#3d8dfd";
-    ctx.globalAlpha = 0.36;
+    ctx.globalAlpha = alpha == null ? 0.36 : alpha;
     ctx.fill();
     ctx.globalAlpha = 0.92;
     ctx.strokeStyle = color || "#c6dcff";
@@ -1046,31 +1236,101 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
   ctx.font = "12px sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  let laneIndex = 0;
   for (const decoder of state.decoders || []) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
-    if (overlayEnabled(decoder.id)) {
-      for (const target of dataLineTargets(decoder)) {
-        const item = logicRow(layout, target.channel);
-        if (!item) continue;
-        const pad = Math.max(8, item.height * 0.22);
-        drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
-      }
-    } else {
-      const top = laneIndex * metrics.laneH + 3;
-      drawValueBoxes(ctx, rows, top, top + metrics.laneH - 6, false, canvasW);
-      laneIndex += 1;
+    if (decoderCondensed(decoder.id) || !overlayEnabled(decoder.id)) continue;
+    for (const target of dataLineTargets(decoder)) {
+      const item = logicRow(layout, target.channel, target.decoderId || decoder.id);
+      if (!item) continue;
+      const pad = Math.max(8, item.height * 0.22);
+      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
     }
   }
-  if (metrics.laneBlock > 0) {
-    ctx.strokeStyle = "rgba(255,255,255,0.08)";
-    ctx.beginPath();
-    ctx.moveTo(0, metrics.laneBlock + 0.5);
-    ctx.lineTo(canvasW, metrics.laneBlock + 0.5);
-    ctx.stroke();
-  }
   ctx.restore();
+}
+
+function annotationNumbers(row) {
+  const fields = row.fields || {};
+  if (row.protocol === "spi" && (fields.mosi || fields.miso)) {
+    const out = [];
+    if (fields.mosi) out.push(parseInt(fields.mosi, 16));
+    if (fields.miso) out.push(parseInt(fields.miso, 16));
+    return out.filter((value) => Number.isFinite(value));
+  }
+  if (fields.data) return [parseInt(fields.data, 16)].filter((value) => Number.isFinite(value));
+  if (fields.address) return [parseInt(fields.address, 16)].filter((value) => Number.isFinite(value));
+  return [];
+}
+
+function formatDecoded(value, format) {
+  const n = value & 0xff;
+  if (format === "dec") return String(n);
+  if (format === "bin") return n.toString(2).padStart(8, "0");
+  if (format === "oct") return n.toString(8);
+  return "0x" + n.toString(16).toUpperCase().padStart(2, "0");
+}
+
+function condensedLabel(row, format) {
+  const parts = annotationNumbers(row).map((value) => formatDecoded(value, format));
+  return parts.length ? parts.join(" / ") : annotationLabel(row);
+}
+
+function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
+  const max = 255;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  let started = false;
+  for (const row of rows) {
+    const value = valueOf(row);
+    if (!Number.isFinite(value)) continue;
+    const y = bot - (Math.max(0, Math.min(max, value)) / max) * (bot - top);
+    const x0 = sampleX(row.start_sample);
+    const x1 = Math.max(x0 + 1, sampleX(row.end_sample));
+    if (!started) {
+      ctx.moveTo(x0, y);
+      started = true;
+    } else ctx.lineTo(x0, y);
+    ctx.lineTo(x1, y);
+  }
+  ctx.stroke();
+}
+
+function drawCondensedRows(ctx, canvasW, layout) {
+  for (const item of layout) {
+    if (item.row.kind !== "condense" && item.row.kind !== "decode") continue;
+    if (state.hidden.has(item.row.key)) continue;
+    const decoder = (state.decoders || []).find((row) => row.id === item.row.decoderId);
+    if (!decoder) continue;
+    const rows = valueAnnotations(decoder);
+    const format = item.row.bus && item.row.bus.analog ? "analog" : decodeFormat(decoder.id);
+    const pad = Math.max(8, item.height * 0.22);
+    const bandTop = item.top + pad;
+    const bandBot = item.top + item.height - pad;
+    if (format === "analog") {
+      const fields = rows[0] && rows[0].fields;
+      if (fields && (fields.mosi || fields.miso)) {
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+      } else {
+        drawStepSeries(ctx, rows, bandTop, bandBot, "#8eb6ff", (row) => {
+          const values = annotationNumbers(row);
+          return values.length ? values[0] : NaN;
+        });
+      }
+      ctx.fillStyle = "rgba(176, 188, 204, 0.7)";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("255", 6, bandTop + 8);
+      ctx.fillText("0", 6, bandBot - 6);
+      continue;
+    }
+    const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
+    const mid = (bandTop + bandBot) / 2;
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, (row) => condensedLabel(row, format), 0.82);
+  }
 }
 
 function spiWords(decoderId) {
@@ -1354,22 +1614,35 @@ async function runTiles() {
   }
 }
 
+function tileRequests() {
+  const seen = new Set();
+  const rows = [];
+  for (const row of visibleRows()) {
+    if (row.kind !== "logic" && row.kind !== "analog") continue;
+    const key = row.tileKey || row.key;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ row, key });
+  }
+  return rows;
+}
+
 async function fetchTiles() {
-  const rows = visibleRows().filter((row) => row.kind === "logic" || row.kind === "analog");
+  const requests = tileRequests();
   const width = Math.max(1, Math.floor(wave.clientWidth || 1));
   const v = view();
   const req = ++state.req;
   const spp = Math.max(v.spp, 1e-9);
   const start = v.start;
-  if (rows.length === 0) {
+  if (requests.length === 0) {
     state.tiles = {};
     drawWave();
     drawRuler();
     return;
   }
-  const pending = { req, got: {}, expect: rows.length, start, spp, width };
+  const pending = { req, got: {}, expect: requests.length, start, spp, width };
   state.pending = pending;
-  const bodies = rows.map((row) => ({
+  const bodies = requests.map(({ row, key }) => ({
     cmd: "tile",
     req,
     session: state.active,
@@ -1378,7 +1651,7 @@ async function fetchTiles() {
     columns: width,
     samples_per_pixel: spp,
     kind: row.kind,
-    key: row.key,
+    key,
   }));
   const sent = socket && socket.readyState === WebSocket.OPEN;
   if (sent) {
@@ -1392,13 +1665,13 @@ async function fetchTiles() {
       };
       pending.done = finish;
       pending.timer = setTimeout(async () => {
-        if (state.req === req && Object.keys(pending.got).length < rows.length) {
+        if (state.req === req && Object.keys(pending.got).length < requests.length) {
           await httpTiles(req, bodies, pending);
         }
         finish();
       }, 280);
       for (const body of bodies) socket.send(JSON.stringify(body));
-      if (Object.keys(pending.got).length >= rows.length) finish();
+      if (Object.keys(pending.got).length >= requests.length) finish();
     });
   } else {
     await httpTiles(req, bodies, pending);
@@ -1413,7 +1686,12 @@ async function fetchTiles() {
     return;
   }
   if (Object.keys(pending.got).length) {
-    state.tiles = pending.got;
+    const previous = state.tileView;
+    const sameTileView = previous
+      && previous.start === start
+      && previous.spp === spp
+      && previous.width === width;
+    state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
     state.tileView = { start, spp, width };
     drawWave();
     drawRuler();
@@ -1611,7 +1889,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode, and can lay decoded values on the data line. SPI draws MOSI and MISO on the waveform as a bus; right-click that bus for an analog level.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Each decoder is a bus row with its waveform channels underneath. The arrow beside the decoder name folds those channels into the bus, or shows them again. The eye hides that row’s waveform. Overlay draws decoded values on the data lines while the waveforms are visible. A channel used by two decoders appears in each group.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -1630,12 +1908,12 @@ function panelHtml(name) {
   }
   if (name === "export") {
     return `<h2>Export</h2>
-      <button class="block" id="export-csv" type="button">Download CSV</button>
-      <button class="block" id="export-xlsx" type="button">Download Excel</button>
-      <button class="block" id="download" type="button">Download .lvcap</button>
-      <button class="block" id="download-dsl" type="button">Download .dsl</button>
+      <button class="block" id="export-csv" type="button">Save CSV…</button>
+      <button class="block" id="export-xlsx" type="button">Save Excel…</button>
+      <button class="block" id="download" type="button">Save .lvcap…</button>
+      <button class="block" id="download-dsl" type="button">Save .dsl…</button>
       <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
+      <p class="hint">Saving a capture asks where to put the file. CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -1681,13 +1959,9 @@ function devicePanel() {
     <p id="profile-note" class="hint">Choose the source from the device menu. A plugged-in pod is listed above the demo devices. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
     <h3>Acquisition</h3>
     <label class="acq-row">Sample rate
-      <select id="set-rate" aria-label="Sample rate">
-        <option value="100000">100 kS/s</option>
-        <option value="1000000">1 MS/s</option>
-        <option value="20000000">20 MS/s</option>
-        <option value="100000000">100 MS/s</option>
-      </select>
+      <select id="set-rate" aria-label="Sample rate">${rateOptionsHtml()}</select>
     </label>
+    <p id="rate-note" class="hint">${rateNote()}</p>
     <label class="acq-row">Length
       <select id="set-duration" aria-label="Capture length">
         <option value="10">10 ms</option>
@@ -1775,7 +2049,7 @@ function channelChecks(probes) {
   }).join("");
   const buttons = groups[state.channelGroup].map((probe) => {
     const on = channelIsEnabled(probe.index);
-    const color = probe.color || "#8eb6ff";
+    const color = storedColor("logic:" + probe.index, probe.color || "#8eb6ff");
     return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${probe.index}">${probe.index}</button>`;
   }).join("");
   return `<div class="ch-tabs">${tabs}</div><div class="ch-enables">${buttons}</div>`;
@@ -1787,6 +2061,13 @@ function bindPanel(name) {
     bindSelect("set-rate", "rate", true);
     bindSelect("set-duration", "duration", true);
     bindSelect("set-depth", "depth", false);
+    const depth = document.getElementById("set-depth");
+    if (depth) {
+      depth.addEventListener("change", () => {
+        clampSampleRate();
+        refillRateSelect();
+      });
+    }
     bindSelect("set-run", "run", false);
     const repeat = document.getElementById("set-repeat");
     const threshold = document.getElementById("set-threshold");
@@ -1858,6 +2139,7 @@ function bindPanel(name) {
         if (isOn) settings.channelEnable &= ~(1 << bit);
         else settings.channelEnable |= 1 << bit;
         writeSampleMask();
+        clampSampleRate();
         state.gutterSig = "";
         renderGutter();
         scheduleTiles();
@@ -1921,10 +2203,10 @@ function bindPanel(name) {
     renderMeasureList();
   }
   if (name === "export") {
-    document.getElementById("export-csv").addEventListener("click", () => downloadCapture("/api/export/csv", "capture.csv"));
-    document.getElementById("export-xlsx").addEventListener("click", () => downloadCapture("/api/export/xlsx", "capture.xlsx"));
-    document.getElementById("download").addEventListener("click", () => downloadCapture("/api/export/lvcap", "capture.lvcap"));
-    document.getElementById("download-dsl").addEventListener("click", () => downloadCapture("/api/export/dsl", "capture.dsl"));
+    document.getElementById("export-csv").addEventListener("click", () => saveCaptureExport("csv"));
+    document.getElementById("export-xlsx").addEventListener("click", () => saveCaptureExport("xlsx"));
+    document.getElementById("download").addEventListener("click", () => saveCaptureExport("lvcap"));
+    document.getElementById("download-dsl").addEventListener("click", () => saveCaptureExport("dsl"));
     document.getElementById("export-ann").addEventListener("click", exportAnnotations);
   }
 }
@@ -2012,6 +2294,120 @@ function bindSelect(id, key, numeric) {
   el.addEventListener("change", () => {
     settings[key] = numeric ? Number(el.value) : el.value;
   });
+}
+
+const RATE_LADDER = [
+  10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
+  1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000, 25_000_000,
+  50_000_000, 100_000_000, 200_000_000, 250_000_000, 400_000_000,
+  500_000_000, 1_000_000_000,
+];
+
+const PLUS_BUFFER_RATES = [
+  { max_channels: 4, max_hz: 400_000_000 },
+  { max_channels: 8, max_hz: 200_000_000 },
+  { max_channels: 16, max_hz: 100_000_000 },
+];
+const PLUS_STREAM_RATES = [
+  { max_channels: 3, max_hz: 100_000_000 },
+  { max_channels: 6, max_hz: 50_000_000 },
+  { max_channels: 12, max_hz: 25_000_000 },
+  { max_channels: 16, max_hz: 20_000_000 },
+];
+
+function activeProductId() {
+  const usb = (state.devices || []).find((device) => String(device.id).startsWith("usb:"));
+  if (!usb) return 0x0020;
+  const pid = Number.parseInt(String(usb.id).split(":").pop(), 16);
+  return Number.isFinite(pid) ? pid : 0x0020;
+}
+
+function activeRateBands() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid)
+    || (state.profiles || []).find((item) => item.product_id === 0x0020);
+  const stream = settings.depth === "stream";
+  if (profile) {
+    const bands = stream ? profile.stream_rates : profile.buffer_rates;
+    if (bands && bands.length) return bands;
+  }
+  return stream ? PLUS_STREAM_RATES : PLUS_BUFFER_RATES;
+}
+
+function enabledChannelCount() {
+  const probes = state.probes.length ? state.probes : state.channels;
+  const width = Math.max(1, probes.length || 1);
+  if (!settings.channelEnable) return width;
+  let count = 0;
+  for (const probe of probes) {
+    if (channelIsEnabled(probe.index)) count += 1;
+  }
+  return Math.max(1, count);
+}
+
+function maxSampleHz(bands, channels) {
+  const band = bands.find((item) => channels <= item.max_channels) || bands[bands.length - 1];
+  return band ? band.max_hz : 100_000_000;
+}
+
+function legalSampleRates() {
+  const channels = enabledChannelCount();
+  const max = maxSampleHz(activeRateBands(), channels);
+  const rates = RATE_LADDER.filter((rate) => rate <= max);
+  if (max > 0 && !rates.includes(max)) rates.push(max);
+  rates.sort((a, b) => a - b);
+  return { channels, max, rates };
+}
+
+function clampSampleRate() {
+  const choice = legalSampleRates();
+  if (!choice.rates.length) return choice;
+  if (!choice.rates.includes(settings.rate) || settings.rate > choice.max) {
+    const under = choice.rates.filter((rate) => rate <= Math.min(settings.rate, choice.max));
+    settings.rate = under.length ? under[under.length - 1] : choice.rates[choice.rates.length - 1];
+  }
+  return choice;
+}
+
+function formatSampleRate(hz) {
+  const text = (value, unit) => {
+    const rounded = Math.round(value * 1000) / 1000;
+    return (Number.isInteger(rounded) ? String(rounded) : String(rounded)) + " " + unit;
+  };
+  if (hz >= 1e9) return text(hz / 1e9, "GS/s");
+  if (hz >= 1e6) return text(hz / 1e6, "MS/s");
+  if (hz >= 1e3) return text(hz / 1e3, "kS/s");
+  return hz + " S/s";
+}
+
+function rateProfileLabel() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid);
+  if (profile) return profile.name.replace(/^DSLogic /, "");
+  return pid === 0x002c ? "U3Pro32" : "Plus";
+}
+
+function rateNote() {
+  const choice = legalSampleRates();
+  const mode = settings.depth === "stream" ? "stream" : "buffer";
+  const noun = choice.channels === 1 ? "channel" : "channels";
+  return `${choice.channels} ${noun} enabled. ${rateProfileLabel()} ${mode} tops out at ${formatSampleRate(choice.max)}.`;
+}
+
+function rateOptionsHtml() {
+  clampSampleRate();
+  return legalSampleRates().rates.map((rate) => `<option value="${rate}">${formatSampleRate(rate)}</option>`).join("");
+}
+
+function refillRateSelect() {
+  const select = document.getElementById("set-rate");
+  const note = document.getElementById("rate-note");
+  const choice = clampSampleRate();
+  if (select) {
+    select.innerHTML = choice.rates.map((rate) => `<option value="${rate}">${formatSampleRate(rate)}</option>`).join("");
+    select.value = String(settings.rate);
+  }
+  if (note) note.textContent = rateNote();
 }
 
 function bindCheck(id, key) {
@@ -2115,11 +2511,14 @@ async function loadDeviceChoices() {
     }
     syncDeviceSelect();
     api({ cmd: "list_profiles" }).then((profiles) => {
+      state.profiles = profiles;
       const note = document.getElementById("profile-note");
-      if (!note) return;
-      const untested = profiles.filter((profile) => !profile.hardware_tested).length;
-      const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
-      note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
+      if (note) {
+        const untested = profiles.filter((profile) => !profile.hardware_tested).length;
+        const tested = profiles.filter((profile) => profile.hardware_tested).map((profile) => profile.name);
+        note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
+      }
+      if (state.tab === "device") refillRateSelect();
     }).catch(() => {});
   } catch (err) {
     statusEl.textContent = err.message;
@@ -2530,24 +2929,423 @@ async function refreshMeasurements() {
   }
 }
 
-async function downloadCapture(path, filename) {
+const SAVE_KINDS = {
+  csv: {
+    title: "Save CSV",
+    filename: "capture.csv",
+    ext: ".csv",
+    mime: "text/csv",
+    path: "/api/export/csv",
+    note: "One row per sample: time and logic levels.",
+    picker: { description: "CSV", accept: { "text/csv": [".csv"] } },
+  },
+  xlsx: {
+    title: "Save Excel",
+    filename: "capture.xlsx",
+    ext: ".xlsx",
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    path: "/api/export/xlsx",
+    note: "One row per sample. A long capture is cut at Excel's row limit.",
+    picker: { description: "Excel workbook", accept: { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"] } },
+  },
+  lvcap: {
+    title: "Save capture",
+    filename: "capture.lvcap",
+    ext: ".lvcap",
+    mime: "application/zip",
+    path: "/api/export/lvcap",
+    note: "LogicView capture, including the samples.",
+    picker: { description: "LogicView capture", accept: { "application/zip": [".lvcap"] } },
+  },
+  dsl: {
+    title: "Save capture",
+    filename: "capture.dsl",
+    ext: ".dsl",
+    mime: "application/zip",
+    path: "/api/export/dsl",
+    note: "Capture container with the sample blocks.",
+    picker: { description: "Capture", accept: { "application/zip": [".dsl"] } },
+  },
+};
+
+let saveJob = null;
+
+function saveCaptureExport(kind) {
+  const spec = SAVE_KINDS[kind];
+  if (!spec) return;
+  openSaveDialog({
+    title: spec.title,
+    note: spec.note,
+    filename: spec.filename,
+    ext: spec.ext,
+    mime: spec.mime,
+    picker: spec.picker,
+    produce: () => fetchCaptureBlob(spec.path),
+  });
+}
+
+async function fetchCaptureBlob(path) {
   const res = await fetch(path);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    statusEl.textContent = body.error || "export failed";
-    return;
+    throw new Error(body.error || "export failed");
   }
-  const blob = await res.blob();
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(link.href);
   const rows = res.headers.get("x-logicview-rows");
   const total = res.headers.get("x-logicview-total");
   if (rows && total && rows !== total) {
     statusEl.textContent = `exported ${Number(rows).toLocaleString()} of ${Number(total).toLocaleString()} samples`;
   }
+  return res.blob();
+}
+
+function openSaveDialog(job) {
+  saveJob = job;
+  document.getElementById("save-title").textContent = job.title;
+  document.getElementById("save-note").textContent = job.note || "";
+  const input = document.getElementById("save-name");
+  input.value = job.filename;
+  document.getElementById("save-dialog").classList.remove("hidden");
+  input.focus();
+  input.select();
+}
+
+function closeSaveDialog() {
+  saveJob = null;
+  document.getElementById("save-dialog").classList.add("hidden");
+}
+
+async function confirmSave(ev) {
+  ev.preventDefault();
+  const job = saveJob;
+  if (!job) return;
+  const button = document.getElementById("save-confirm");
+  button.disabled = true;
+  try {
+    let name = document.getElementById("save-name").value.trim() || job.filename;
+    name = name.replace(/[\\/]/g, "");
+    if (job.ext && !name.toLowerCase().endsWith(job.ext)) name += job.ext;
+    const produced = await job.produce();
+    const blob = produced instanceof Blob ? produced : new Blob([produced], { type: job.mime || "application/octet-stream" });
+    closeSaveDialog();
+    const wrote = await writeChosenFile(name, blob, job.picker);
+    if (wrote === "cancel") statusEl.textContent = "save cancelled";
+    else statusEl.textContent = "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function writeChosenFile(name, blob, pickerType) {
+  if (typeof window.showSaveFilePicker === "function") {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: pickerType ? [pickerType] : undefined,
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return handle.name || name;
+    } catch (err) {
+      if (err && err.name === "AbortError") return "cancel";
+    }
+  }
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1500);
+  return name;
+}
+
+function setupDocument() {
+  const v = view();
+  const mode = document.getElementById("cursor-mode");
+  const decoders = state.decoders || [];
+  return {
+    kind: "logicview-setup",
+    version: 1,
+    order: v.order || orderedRows().map((row) => row.key),
+    heights: v.heights || {},
+    customHeights: !!v.customHeights,
+    names: v.names || {},
+    hidden: [...state.hidden],
+    buses: v.buses || [],
+    nextBus: v.nextBus || 1,
+    selected: v.selected || null,
+    colors: v.colors || {},
+    markers: (v.markers || []).map((marker) => ({
+      id: marker.id,
+      n: marker.n,
+      sample: marker.sample,
+      channel: marker.channel,
+      name: marker.name || "",
+    })),
+    cursors: {
+      a: state.cursors ? state.cursors[0] : null,
+      b: state.cursors ? state.cursors[1] : null,
+      mode: mode ? mode.value : "single",
+    },
+    decoders: decoders.map((decoder) => ({
+      protocol: decoder.protocol,
+      channels: Object.fromEntries(Object.entries(decoder.channels || {}).map(([name, index]) => [name, channelSpecByIndex(index)])),
+      options: decoder.options || {},
+      stackIndex: decoder.stack_on ? decoders.findIndex((row) => row.id === decoder.stack_on) : null,
+      view: Object.assign({ overlay: true, condensed: false, format: "hex" }, state.decodeView[decoder.id] || {}),
+    })),
+  };
+}
+
+function channelSpecByIndex(index) {
+  const channel = state.channels.find((row) => row.index === index);
+  return channel ? channelSpec(channel) : String(index);
+}
+
+function saveSetup() {
+  openSaveDialog({
+    title: "Save setup",
+    note: "Channel layout, colors, cursors, and decoders. This file does not include samples.",
+    filename: "setup.lvsetup",
+    ext: ".lvsetup",
+    mime: "application/json",
+    picker: { description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] } },
+    produce: () => JSON.stringify(setupDocument(), null, 2),
+  });
+}
+
+async function openSetupFile(file) {
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch (_) {
+    statusEl.textContent = "setup file is not JSON";
+    return;
+  }
+  try {
+    await applySetup(doc);
+    statusEl.textContent = "opened " + file.name;
+  } catch (err) {
+    statusEl.textContent = err.message || "could not open setup";
+  }
+}
+
+async function applySetup(doc) {
+  if (!doc || doc.kind !== "logicview-setup") throw new Error("not a LogicView setup");
+  const v = view();
+  v.order = Array.isArray(doc.order) ? doc.order : v.order;
+  v.heights = doc.heights && typeof doc.heights === "object" ? doc.heights : {};
+  v.customHeights = !!doc.customHeights;
+  v.names = doc.names && typeof doc.names === "object" ? doc.names : {};
+  v.colors = doc.colors && typeof doc.colors === "object" ? doc.colors : {};
+  v.buses = Array.isArray(doc.buses) ? doc.buses : [];
+  v.nextBus = Number(doc.nextBus) || v.nextBus || 1;
+  v.selected = doc.selected || null;
+  v.markers = Array.isArray(doc.markers) ? doc.markers : [];
+  const maxMarker = v.markers.reduce((max, marker) => Math.max(max, Number(marker.id) || 0), 0);
+  state.nextMarker = Math.max(state.nextMarker, maxMarker + 1);
+  state.hidden = new Set(Array.isArray(doc.hidden) ? doc.hidden : []);
+  if (v.order) persistOrder(v.order);
+  persistColors();
+  const mode = document.getElementById("cursor-mode");
+  if (mode && doc.cursors && doc.cursors.mode) mode.value = doc.cursors.mode;
+  if (doc.cursors) {
+    state.cursors = [doc.cursors.a ?? null, doc.cursors.b ?? null];
+    if (doc.cursors.a != null) await api({ cmd: "set_cursor", session: state.active, which: 0, sample: doc.cursors.a });
+    if (doc.cursors.b != null) await api({ cmd: "set_cursor", session: state.active, which: 1, sample: doc.cursors.b });
+  }
+  const existing = [...await api({ cmd: "list_decoders", session: state.active })].reverse();
+  for (const row of existing) {
+    try { await api({ cmd: "remove_decoder", session: state.active, id: row.id }); } catch (_) { /* already removed with its parent */ }
+  }
+  state.decodeView = {};
+  state.spiView = {};
+  const created = [];
+  for (const decoder of doc.decoders || []) {
+    const stack = Number.isInteger(decoder.stackIndex) ? created[decoder.stackIndex] : null;
+    const info = await api({
+      cmd: "add_decoder",
+      session: state.active,
+      protocol: decoder.protocol,
+      channels: decoder.channels || {},
+      options: decoder.options || {},
+      stack_on: stack || null,
+    });
+    created.push(info.id);
+    if (decoder.view) state.decodeView[info.id] = Object.assign({ overlay: true, condensed: false, format: "hex" }, decoder.view);
+  }
+  state.gutterSig = "";
+  await refreshDecoders();
+  await loadAnnotations();
+  renderMarkerList();
+  drawWave();
+  drawRuler();
+}
+
+function openColorFlyout(row, anchor) {
+  const fly = document.getElementById("color-flyout");
+  const key = colorKey(row);
+  if (!fly.classList.contains("hidden") && fly.dataset.key === key) {
+    closeColorFlyout();
+    return;
+  }
+  fly.dataset.key = key;
+  fly.dataset.row = row.key;
+  const current = normalizeHex(row.color);
+  document.getElementById("color-custom").value = current;
+  for (const swatch of fly.querySelectorAll(".swatch")) {
+    swatch.classList.toggle("picked", swatch.dataset.color === current);
+  }
+  placeColorFlyout(anchor);
+}
+
+function closeColorFlyout() {
+  const fly = document.getElementById("color-flyout");
+  fly.classList.add("hidden");
+  delete fly.dataset.key;
+  delete fly.dataset.row;
+}
+
+function placeColorFlyout(anchor) {
+  const fly = document.getElementById("color-flyout");
+  fly.classList.remove("hidden");
+  const rect = anchor.getBoundingClientRect();
+  const width = fly.offsetWidth;
+  const height = fly.offsetHeight;
+  let left = rect.right + 8;
+  let top = rect.top;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, rect.left - width - 8);
+  if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - height);
+  fly.style.left = left + "px";
+  fly.style.top = top + "px";
+}
+
+function normalizeHex(color) {
+  const text = String(color || "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(text) ? text.toLowerCase() : "#e2b340";
+}
+
+function setChannelColor(rowKey, color) {
+  const row = orderedRows().find((item) => item.key === rowKey);
+  if (!row) return;
+  const colors = view().colors || (view().colors = {});
+  colors[colorKey(row)] = color;
+  persistColors();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  if (row.kind === "logic") {
+    const button = document.querySelector(`.ch-en[data-bit="${row.channel}"]`);
+    if (button) button.style.setProperty("--ch", color);
+  }
+  const fly = document.getElementById("color-flyout");
+  if (!fly.classList.contains("hidden")) {
+    const current = normalizeHex(color);
+    document.getElementById("color-custom").value = current;
+    for (const swatch of fly.querySelectorAll(".swatch")) {
+      swatch.classList.toggle("picked", swatch.dataset.color === current);
+    }
+    const anchor = gutter.querySelector(`.ch[data-key="${CSS.escape(rowKey)}"] .bar`);
+    if (anchor) placeColorFlyout(anchor);
+  }
+}
+
+function fillColorSwatches() {
+  const host = document.getElementById("color-swatches");
+  if (!host || host.childElementCount) return;
+  for (const color of CHANNEL_COLORS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "swatch";
+    button.dataset.color = color;
+    button.style.background = color;
+    button.title = color;
+    button.setAttribute("aria-label", color);
+    button.addEventListener("click", () => {
+      const fly = document.getElementById("color-flyout");
+      if (fly.dataset.row) setChannelColor(fly.dataset.row, color);
+    });
+    host.appendChild(button);
+  }
+}
+
+function isCaptureName(name) {
+  const lower = String(name || "").toLowerCase();
+  return lower.endsWith(".lvcap") || lower.endsWith(".dsl");
+}
+
+async function openCaptureFile(file) {
+  statusEl.textContent = "opening " + file.name;
+  const bytes = await file.arrayBuffer();
+  const res = await fetch("/api/import?name=" + encodeURIComponent(file.name), {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: bytes,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.ok) {
+    statusEl.textContent = json.error || "could not open capture";
+    return;
+  }
+  state.tiles = {};
+  state.annotations = [];
+  state.decoders = [];
+  state.selectedDecoder = null;
+  state.decodeView = {};
+  view().userNavigated = false;
+  state.gutterSig = "";
+  applyStatus(json.data, false);
+  await refreshDecoders();
+  await loadAnnotations();
+  const count = Number(json.data.sample_count || 0).toLocaleString();
+  statusEl.textContent = `opened ${file.name} · ${count} samples`;
+}
+
+function dragHasFile(ev) {
+  const types = ev.dataTransfer && ev.dataTransfer.types;
+  return !!types && [...types].includes("Files");
+}
+
+function bindCaptureDrop() {
+  const stage = document.querySelector(".wave-stage");
+  stage.addEventListener("dragenter", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    stage.classList.add("drop-capture");
+  });
+  stage.addEventListener("dragover", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+    stage.classList.add("drop-capture");
+  });
+  stage.addEventListener("dragleave", (ev) => {
+    if (ev.relatedTarget && stage.contains(ev.relatedTarget)) return;
+    stage.classList.remove("drop-capture");
+  });
+  stage.addEventListener("drop", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    stage.classList.remove("drop-capture");
+    const file = [...ev.dataTransfer.files].find((item) => isCaptureName(item.name));
+    if (!file) {
+      statusEl.textContent = "Drop a .lvcap or .dsl capture";
+      return;
+    }
+    openCaptureFile(file);
+  });
+  window.addEventListener("dragover", (ev) => {
+    if (dragHasFile(ev)) ev.preventDefault();
+  });
+  window.addEventListener("drop", (ev) => {
+    if (!dragHasFile(ev)) return;
+    ev.preventDefault();
+    if (ev.target.closest && ev.target.closest(".wave-stage")) return;
+    statusEl.textContent = "Drop the capture on the waveform";
+  });
 }
 
 function connectSocket() {
@@ -2657,7 +3455,7 @@ async function snapMarker(marker, clientX, clientY) {
 
 wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
-  if (!row || row.kind !== "bus" || !row.bus) return;
+  if (!row || (row.kind !== "bus" && row.kind !== "decode") || !row.bus) return;
   ev.preventDefault();
   openBusMenu(row.bus, ev.clientX, ev.clientY);
 });
@@ -3017,10 +3815,12 @@ function bindSplitters() {
 
 const MENUS = {
   file: [
-    ["Export CSV", () => downloadCapture("/api/export/csv", "capture.csv")],
-    ["Export Excel", () => downloadCapture("/api/export/xlsx", "capture.xlsx")],
-    ["Download .lvcap", () => downloadCapture("/api/export/lvcap", "capture.lvcap")],
-    ["Download .dsl", () => downloadCapture("/api/export/dsl", "capture.dsl")],
+    ["Save setup…", () => saveSetup()],
+    ["Open setup…", () => document.getElementById("setup-file").click()],
+    ["Export CSV…", () => saveCaptureExport("csv")],
+    ["Export Excel…", () => saveCaptureExport("xlsx")],
+    ["Save .lvcap…", () => saveCaptureExport("lvcap")],
+    ["Save .dsl…", () => saveCaptureExport("dsl")],
   ],
   edit: [["Clear markers", () => {
     view().markers = [];
@@ -3073,9 +3873,12 @@ function openMenu(button) {
     pop.appendChild(item);
   }
   const rect = button.getBoundingClientRect();
-  pop.style.left = rect.left + "px";
-  pop.style.top = rect.bottom + "px";
   pop.classList.remove("hidden");
+  const width = pop.offsetWidth;
+  let left = rect.left;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  pop.style.left = left + "px";
+  pop.style.top = rect.bottom + "px";
   for (const other of document.querySelectorAll(".menubar button")) {
     other.classList.toggle("open", other === button);
   }
@@ -3168,6 +3971,7 @@ document.addEventListener("click", (ev) => {
     closeDeviceMenu();
   }
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
+  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
 });
 
 window.addEventListener("keydown", (ev) => {
@@ -3191,7 +3995,11 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (key === "Escape") {
-    if (state.menu) closeMenu();
+    const save = document.getElementById("save-dialog");
+    const fly = document.getElementById("color-flyout");
+    if (save && !save.classList.contains("hidden")) closeSaveDialog();
+    else if (fly && !fly.classList.contains("hidden")) closeColorFlyout();
+    else if (state.menu) closeMenu();
     else if (state.tool) setTool(state.tool);
     return;
   }
@@ -3365,8 +4173,12 @@ function openBusMenu(bus, x, y) {
   item.textContent = bus.analog ? "Hex view" : "Analog view";
   item.addEventListener("click", () => {
     if (bus.decode) {
+      const analog = !bus.analog;
       if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
-      state.spiView[bus.decode].analog = !state.spiView[bus.decode].analog;
+      state.spiView[bus.decode].analog = analog;
+      const pref = decodePref(bus.decode);
+      if (analog) pref.format = "analog";
+      else if (pref.format === "analog") pref.format = "hex";
     } else {
       bus.analog = !bus.analog;
     }
@@ -3419,7 +4231,16 @@ function openDecodeConfig(decoder) {
   const options = decoder.options || {};
   const channels = decoder.channels || {};
   const overlayOn = overlayEnabled(decoder.id);
+  const pref = decodePref(decoder.id);
   const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the data line</label>`];
+  if (Object.keys(channels).length) {
+    const format = decodeFormat(decoder.id);
+    const options = Object.entries(DECODE_FORMATS).map(([value, label]) => `<option value="${value}"${format === value ? " selected" : ""}>${label}</option>`).join("");
+    parts.push(`<label class="check"><input id="decode-condense" type="checkbox"${pref.condensed ? " checked" : ""}> Hide channels under this decoder</label>
+      <label class="field">Decoded data
+        <select id="decode-format">${options}</select>
+      </label>`);
+  }
   parts.push(...Object.keys(channels).map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
@@ -3486,6 +4307,26 @@ async function boot() {
   syncTimebaseLabel();
 }
 
+fillColorSwatches();
+bindCaptureDrop();
+document.getElementById("save-cancel").addEventListener("click", closeSaveDialog);
+document.getElementById("save-form").addEventListener("submit", (ev) => confirmSave(ev));
+document.getElementById("save-form").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") {
+    ev.preventDefault();
+    ev.stopPropagation();
+    closeSaveDialog();
+  }
+});
+document.getElementById("color-custom").addEventListener("input", (ev) => {
+  const fly = document.getElementById("color-flyout");
+  if (fly.dataset.row) setChannelColor(fly.dataset.row, ev.target.value);
+});
+document.getElementById("setup-file").addEventListener("change", (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (file) openSetupFile(file);
+});
 document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
 document.getElementById("bus-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
@@ -3530,10 +4371,13 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
   }
   const stack = document.getElementById("decode-stack");
   const overlayBox = document.getElementById("decode-overlay");
-  if (overlayBox) {
-    state.decodeView[id] = state.decodeView[id] || {};
-    state.decodeView[id].overlay = overlayBox.checked;
-  }
+  const condenseBox = document.getElementById("decode-condense");
+  const formatBox = document.getElementById("decode-format");
+  const pref = decodePref(id);
+  if (overlayBox) pref.overlay = overlayBox.checked;
+  if (condenseBox) pref.condensed = condenseBox.checked;
+  if (formatBox && DECODE_FORMATS[formatBox.value]) pref.format = formatBox.value;
+  state.gutterSig = "";
   try {
     await api({
       cmd: "update_decoder",
@@ -3546,6 +4390,7 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     closeDecodeConfig();
     await refreshDecoders();
     await loadAnnotations();
+    scheduleTiles();
   } catch (err) {
     statusEl.textContent = err.message;
   }

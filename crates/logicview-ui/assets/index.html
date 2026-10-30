@@ -13,17 +13,17 @@
         <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
       </svg>
       <strong>LogicView</strong>
+      <nav class="menubar" aria-label="Menu">
+        <button type="button" data-menu="file">File</button>
+        <button type="button" data-menu="edit">Edit</button>
+        <button type="button" data-menu="capture">Capture</button>
+        <button type="button" data-menu="view">View</button>
+        <button type="button" data-menu="decode">Decode</button>
+        <button type="button" data-menu="measure">Measure</button>
+        <button type="button" data-menu="tools">Tools</button>
+        <button type="button" data-menu="help">Help</button>
+      </nav>
     </header>
-    <nav class="menubar" aria-label="Menu">
-      <button type="button" data-menu="file">File</button>
-      <button type="button" data-menu="edit">Edit</button>
-      <button type="button" data-menu="capture">Capture</button>
-      <button type="button" data-menu="view">View</button>
-      <button type="button" data-menu="decode">Decode</button>
-      <button type="button" data-menu="measure">Measure</button>
-      <button type="button" data-menu="tools">Tools</button>
-      <button type="button" data-menu="help">Help</button>
-    </nav>
     <div class="toolbar">
       <div class="device-chip" title="Device">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
@@ -164,6 +164,23 @@
       </div>
     </form>
   </div>
+  <div id="color-flyout" class="color-flyout hidden" role="dialog" aria-label="Channel color">
+    <div class="swatches" id="color-swatches"></div>
+    <label class="field">Custom <input id="color-custom" type="color" value="#e2b340" aria-label="Custom channel color"></label>
+  </div>
+  <div id="save-dialog" class="wait-dialog hidden" role="dialog" aria-label="Save file">
+    <form class="wait-card bus-card" id="save-form">
+      <h2 id="save-title">Save</h2>
+      <p id="save-note" class="hint"></p>
+      <label class="field">File name <input id="save-name" type="text" autocomplete="off" spellcheck="false"></label>
+      <p class="hint">Save asks where to put the file.</p>
+      <div class="bus-actions">
+        <button type="button" id="save-cancel">Cancel</button>
+        <button type="submit" id="save-confirm">Save</button>
+      </div>
+    </form>
+  </div>
+  <input id="setup-file" type="file" accept=".json,.lvsetup,application/json" hidden>
   <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Group a bus">
     <form class="wait-card bus-card" id="bus-form">
       <h2>Group a bus</h2>

@@ -37,6 +37,118 @@ pub const HW_CLOCK_HZ: u64 = 100_000_000;
 pub const HALF_RATE_HZ: u64 = 200_000_000;
 pub const QUARTER_RATE_HZ: u64 = 400_000_000;
 
+/// Highest rate for a channel count. Bands are inclusive upper bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub max_channels: u32,
+    pub max_hz: u64,
+}
+
+/// Plus buffer ceilings enforced by [`plan_clock`]: 4 channels to 400 MHz,
+/// 8 to 200 MHz, 16 to 100 MHz.
+const PLUS_BUFFER: &[RateLimit] = &[
+    RateLimit {
+        max_channels: 4,
+        max_hz: QUARTER_RATE_HZ,
+    },
+    RateLimit {
+        max_channels: 8,
+        max_hz: HALF_RATE_HZ,
+    },
+    RateLimit {
+        max_channels: 16,
+        max_hz: HW_CLOCK_HZ,
+    },
+];
+
+/// Plus stream ceilings enforced by [`plan_clock`].
+const PLUS_STREAM: &[RateLimit] = &[
+    RateLimit {
+        max_channels: 3,
+        max_hz: 100_000_000,
+    },
+    RateLimit {
+        max_channels: 6,
+        max_hz: 50_000_000,
+    },
+    RateLimit {
+        max_channels: 12,
+        max_hz: 25_000_000,
+    },
+    RateLimit {
+        max_channels: 16,
+        max_hz: 20_000_000,
+    },
+];
+
+/// U3Pro32 ceilings. Buffer matches the datasheet: 1 GHz through 8 channels,
+/// 500 MHz through 16, and 250 MHz through 32. Stream is the high-speed link
+/// measured on this pod: 100 MHz through 3 channels, 50 through 6, 25 through
+/// 12, 20 through 16, and 10 MHz at 32. Datasheet super-speed stream rates
+/// stay off this table; that link was not measured.
+const U3PRO32_BUFFER: &[RateLimit] = &[
+    RateLimit {
+        max_channels: 8,
+        max_hz: 1_000_000_000,
+    },
+    RateLimit {
+        max_channels: 16,
+        max_hz: 500_000_000,
+    },
+    RateLimit {
+        max_channels: 32,
+        max_hz: 250_000_000,
+    },
+];
+
+const U3PRO32_STREAM: &[RateLimit] = &[
+    RateLimit {
+        max_channels: 3,
+        max_hz: 100_000_000,
+    },
+    RateLimit {
+        max_channels: 6,
+        max_hz: 50_000_000,
+    },
+    RateLimit {
+        max_channels: 12,
+        max_hz: 25_000_000,
+    },
+    RateLimit {
+        max_channels: 16,
+        max_hz: 20_000_000,
+    },
+    RateLimit {
+        max_channels: 32,
+        max_hz: 10_000_000,
+    },
+];
+
+/// Plus limits for every product except the 32-channel U3Pro32.
+pub fn rate_limits(product_id: u16, stream: bool) -> &'static [RateLimit] {
+    if product_id == U3PRO32_PID {
+        if stream {
+            U3PRO32_STREAM
+        } else {
+            U3PRO32_BUFFER
+        }
+    } else if stream {
+        PLUS_STREAM
+    } else {
+        PLUS_BUFFER
+    }
+}
+
+pub fn max_sample_hz(limits: &[RateLimit], channels: u32) -> u64 {
+    let channels = channels.max(1);
+    for band in limits {
+        if channels <= band.max_channels {
+            return band.max_hz;
+        }
+    }
+    limits.last().map(|band| band.max_hz).unwrap_or(HW_CLOCK_HZ)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockPlan {
     pub divider: u32,
@@ -97,17 +209,11 @@ pub fn plan_clock(rate_hz: u64, enabled: u32, stream: bool) -> Result<ClockPlan,
 
 /// Buffer clock for one channel count on the U3Pro32.
 ///
-/// Eight or fewer channels run to 1 GHz, sixteen to 500 MHz, and thirty-two
-/// to 250 MHz. The arm divider is `ceil(that max / rate)` split by
-/// [`U3_PRE_DIVIDER`].
+/// This is the buffer row of [`rate_limits`]: eight or fewer channels run to
+/// 1 GHz, sixteen to 500 MHz, and thirty-two to 250 MHz. The arm divider is
+/// `ceil(that max / rate)` split by [`U3_PRE_DIVIDER`].
 pub fn u3_channel_max_hz(channels: u32) -> u64 {
-    if channels <= 8 {
-        1_000_000_000
-    } else if channels <= 16 {
-        500_000_000
-    } else {
-        250_000_000
-    }
+    max_sample_hz(rate_limits(U3PRO32_PID, false), channels)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,8 +222,8 @@ pub struct U3Clock {
     pub pre_divider: u64,
 }
 
-/// High-speed stream caps: 3 channels at 100 MHz, 6 at 50, 12 at 25, 16 at
-/// 20, and 32 at 10. Super-speed rates were not measured on this pod.
+/// Arm clock for one U3Pro32 capture. The accepted rate is the matching row
+/// of [`rate_limits`]. Super-speed stream rates were not measured on this pod.
 pub fn plan_u3_clock(rate_hz: u64, enabled: u32, stream: bool) -> Result<U3Clock, HalError> {
     if rate_hz == 0 {
         return Err(HalError::Message(
@@ -131,27 +237,13 @@ pub fn plan_u3_clock(rate_hz: u64, enabled: u32, stream: bool) -> Result<U3Clock
         ));
     }
     let hw_max_hz = u3_channel_max_hz(channels);
-    if stream {
-        let limit = if channels <= 3 {
-            100_000_000
-        } else if channels <= 6 {
-            50_000_000
-        } else if channels <= 12 {
-            25_000_000
-        } else if channels <= 16 {
-            20_000_000
+    let limit = max_sample_hz(rate_limits(U3PRO32_PID, stream), channels);
+    if rate_hz > limit {
+        return Err(HalError::Message(if stream {
+            format!("{channels} stream channels top out at {limit} Hz on this high-speed pod")
         } else {
-            10_000_000
-        };
-        if rate_hz > limit {
-            return Err(HalError::Message(format!(
-                "{channels} stream channels top out at {limit} Hz on this high-speed pod"
-            )));
-        }
-    } else if rate_hz > hw_max_hz {
-        return Err(HalError::Message(format!(
-            "{channels} buffer channels cannot run at {rate_hz} Hz on this pod"
-        )));
+            format!("{channels} buffer channels cannot run at {rate_hz} Hz on this pod")
+        }));
     }
     Ok(U3Clock {
         hw_max_hz,
@@ -192,6 +284,81 @@ mod tests {
         let stream = plan_clock(20_000_000, 0xFFFF, true).unwrap();
         assert_eq!(stream.divider, 5);
         assert!(plan_clock(25_000_000, 0xFFFF, true).is_err());
+    }
+
+    #[test]
+    fn plus_rate_bands_match_plan_clock() {
+        for stream in [false, true] {
+            for band in rate_limits(PLUS_PID, stream) {
+                let mask = (1u32 << band.max_channels) - 1;
+                assert!(
+                    plan_clock(band.max_hz, mask, stream).is_ok(),
+                    "{} ch at {} stream={stream}",
+                    band.max_channels,
+                    band.max_hz
+                );
+                if band.max_channels < 16 {
+                    let wider = (1u32 << (band.max_channels + 1)) - 1;
+                    assert!(plan_clock(band.max_hz, wider, stream).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wider_pods_use_a_lower_ceiling() {
+        assert_eq!(max_sample_hz(rate_limits(PLUS_PID, false), 4), 400_000_000);
+        assert_eq!(max_sample_hz(rate_limits(PLUS_PID, false), 8), 200_000_000);
+        assert_eq!(max_sample_hz(rate_limits(PLUS_PID, false), 16), 100_000_000);
+        assert_eq!(max_sample_hz(rate_limits(PLUS_PID, true), 3), 100_000_000);
+        assert_eq!(max_sample_hz(rate_limits(PLUS_PID, true), 4), 50_000_000);
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, false), 8),
+            1_000_000_000
+        );
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, false), 9),
+            500_000_000
+        );
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, false), 32),
+            250_000_000
+        );
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, true), 3),
+            100_000_000
+        );
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, true), 16),
+            20_000_000
+        );
+        assert_eq!(
+            max_sample_hz(rate_limits(U3PRO32_PID, true), 32),
+            10_000_000
+        );
+    }
+
+    #[test]
+    fn u3_rate_bands_match_plan_u3_clock() {
+        for stream in [false, true] {
+            for band in rate_limits(U3PRO32_PID, stream) {
+                let mask = if band.max_channels >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << band.max_channels) - 1
+                };
+                assert!(
+                    plan_u3_clock(band.max_hz, mask, stream).is_ok(),
+                    "{} ch at {} stream={stream}",
+                    band.max_channels,
+                    band.max_hz
+                );
+                if band.max_channels < 32 {
+                    let wider = (1u32 << (band.max_channels + 1)) - 1;
+                    assert!(plan_u3_clock(band.max_hz, wider, stream).is_err());
+                }
+            }
+        }
     }
 
     #[test]
