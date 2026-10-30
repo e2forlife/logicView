@@ -158,6 +158,16 @@ pub struct DecoderSchema {
     #[serde(default)] pub optional_channels: Vec<String>,
     #[serde(default)] pub stack_on: Option<String>,
     #[serde(default)] pub classes: Vec<String>,
+    #[serde(default)] pub options: Vec<DecoderOption>,
+}
+
+/// A script-configurable setting. Values are transported as strings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DecoderOption {
+    pub id: String,
+    pub name: String,
+    pub default: String,
+    #[serde(default)] pub values: Vec<String>,
 }
 
 /// Lists built-in and external scripted decoders.
@@ -176,7 +186,7 @@ pub fn catalog() -> Vec<DecoderSchema> {
 fn schema(id: &str, name: &str, channels: &[&str], stack: Option<&str>, classes: &[&str]) -> DecoderSchema {
     DecoderSchema { id: id.into(), name: name.into(), channels: channels.iter().map(|v| (*v).into()).collect(),
         optional_channels: channels.iter().map(|v| (*v).into()).collect(), stack_on: stack.map(str::to_string),
-        classes: classes.iter().map(|v| (*v).into()).collect() }
+        classes: classes.iter().map(|v| (*v).into()).collect(), options: Vec::new() }
 }
 
 /// Constructs a decoder with default options, returning `None` for unknown protocol identifiers.
@@ -214,8 +224,21 @@ pub struct DecodeRequest<'a> {
     pub region: Range<u64>,
     /// Valid capture length used to bound the requested region.
     pub sample_len: u64,
+    /// Capture sample rate in hertz, or None when unavailable.
+    pub sample_rate_hz: Option<u64>,
     /// Lower-level annotations supplied when decoding a protocol stack.
     pub lower: &'a [Annotation],
+    /// Structured packets from the immediate parent decoder.
+    pub lower_packets: &'a [ProtocolPacket],
+}
+
+/// A typed protocol event delivered to another decoder in a stack.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProtocolPacket {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub kind: String,
+    pub data: serde_json::Value,
 }
 
 /// Annotations completed by a decoding pass, with an indication of cancellation.
@@ -223,6 +246,8 @@ pub struct DecodeRequest<'a> {
 pub struct DecodeOutput {
     /// Completed protocol events, including any produced before cancellation.
     pub annotations: Vec<Annotation>,
+    /// Structured events consumed by a stacked decoder.
+    pub packets: Vec<ProtocolPacket>,
     /// Whether processing stopped because the caller requested cancellation.
     pub cancelled: bool,
 }

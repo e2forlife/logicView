@@ -24,6 +24,7 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         if cancel.load(Ordering::Relaxed) {
             return Ok(DecodeOutput {
                 annotations: Vec::new(),
+                packets: Vec::new(),
                 cancelled: true,
             });
         }
@@ -31,6 +32,7 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         annotations.extend(decoder.finish());
         return Ok(DecodeOutput {
             annotations,
+            packets: Vec::new(),
             cancelled: false,
         });
     }
@@ -41,6 +43,7 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         if cancel.load(Ordering::Relaxed) {
             return Ok(DecodeOutput {
                 annotations,
+                packets: Vec::new(),
                 cancelled: true,
             });
         }
@@ -52,12 +55,38 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
     if cancel.load(Ordering::Relaxed) {
         return Ok(DecodeOutput {
             annotations,
+            packets: Vec::new(),
             cancelled: true,
         });
     }
     annotations.extend(decoder.finish());
+    let packets = if request.protocol == "spi" {
+        let mut packets: Vec<_> = annotations.iter().filter(|row| row.class == "word").map(|row| {
+            let byte = |name: &str| row.fields.get(name).and_then(|s| u64::from_str_radix(s, 16).ok());
+            super::ProtocolPacket { start_sample: row.start_sample, end_sample: row.end_sample,
+                kind: "DATA".into(), data: serde_json::json!({ "mosi": byte("mosi"), "miso": byte("miso") }) }
+        }).collect();
+        if let Some((_, bytes)) = request.channels.iter().find(|(name, _)| *name == "cs") {
+            let start = request.region.start.min(end);
+            if start < end {
+                let active_high = request.options.iter().any(|(key, value)| key == "cs" && value == "high");
+                let mut previous = logicview_analysis::bit_at(bytes, start);
+                for sample in start + 1..end {
+                    let current = logicview_analysis::bit_at(bytes, sample);
+                    if current != previous {
+                        packets.push(super::ProtocolPacket { start_sample: sample, end_sample: sample + 1,
+                            kind: "CS-CHANGE".into(), data: serde_json::json!({ "old": previous, "new": current, "selected": current == active_high }) });
+                        previous = current;
+                    }
+                }
+            }
+        }
+        packets.sort_by_key(|packet| packet.end_sample);
+        packets
+    } else { Vec::new() };
     Ok(DecodeOutput {
         annotations,
+        packets,
         cancelled: false,
     })
 }
@@ -215,8 +244,8 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len,
-                lower: &[],
+                sample_len: len, sample_rate_hz: None,
+                lower: &[], lower_packets: &[],
             },
             &AtomicBool::new(true),
         )

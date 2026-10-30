@@ -139,7 +139,8 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     words.push(position as u16);
     words.push((position >> 16) as u16);
     words.push(H_GLOBAL);
-    words.push(((config.channel_count as u16) << 8) | config.stage_count as u16);
+    // The FPGA field is five bits wide: 32 channels are encoded as zero.
+    words.push((((config.channel_count as u16) & 0x1f) << 8) | config.stage_count as u16);
     let scope = fit_u32(u64::from(config.scope_count))?;
     words.push(H_SCOPE);
     words.push(scope as u16);
@@ -150,7 +151,9 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     words.push(H_GAIN);
     words.push(config.fine_gain);
     words.push(H_TRIGGER);
-    push_groups(&mut words, |stage| stage.mask, &config.stages);
+    // Extended U3Pro32 records use one bits for ignored comparator inputs.
+    // Retain the previously measured Plus encoding for legacy records.
+    push_groups(&mut words, |stage| if config.upper.is_some() { !stage.mask } else { stage.mask }, &config.stages);
     push_groups(&mut words, |stage| stage.value, &config.stages);
     push_groups(&mut words, |stage| stage.edge, &config.stages);
     for stage in &config.stages {
@@ -168,7 +171,7 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     if let Some(upper) = &config.upper {
         push_u32(&mut words, OPEN_SYNC);
         words.push(H_UPPER);
-        push_upper(&mut words, upper, |stage| stage.mask);
+        push_upper(&mut words, upper, |stage| !stage.mask);
         push_upper(&mut words, upper, |stage| stage.value);
         push_upper(&mut words, upper, |stage| stage.edge);
         words.push(UPPER_ALIGN);
@@ -237,6 +240,8 @@ pub fn decode_arm(bytes: &[u8]) -> Result<ArmConfig, ProtoError> {
                 edge: edge[i],
             };
         }
+        for stage in &mut config.stages { stage.mask = !stage.mask; }
+        for stage in &mut upper { stage.mask = !stage.mask; }
         config.upper = Some(upper);
     }
     if reader.i != bytes.len() {
@@ -430,6 +435,14 @@ mod tests {
         assert_eq!(decode_arm(&encoded).unwrap(), canonical());
     }
 
+    #[test]
+    fn thirty_two_channels_use_the_five_bit_global_count() {
+        let config = ArmConfig { channel_count: 32, stage_count: 2, ..ArmConfig::default() };
+        let encoded = encode_arm(&config).unwrap();
+        // Global header follows sync, mode, divider, count, and position.
+        assert_eq!(u16::from_le_bytes([encoded[28], encoded[29]]), 2);
+    }
+
     /// Checks that extended-channel triggers use a separate record and survive decoding.
     #[test]
     fn upper_channel_record_is_a_second_sync_pair() {
@@ -440,6 +453,10 @@ mod tests {
         config.upper = Some(upper);
         let bytes = encode_arm(&config).unwrap();
         assert_eq!(bytes.len(), 372 + 204);
+        // First comparator: channel 0 participates, all others are ignored.
+        assert_eq!(u16::from_le_bytes([bytes[48], bytes[49]]), 0xfffe);
+        // Extended comparator 0 has no participating channels.
+        assert_eq!(u16::from_le_bytes([bytes[378], bytes[379]]), 0xffff);
         let decoded = decode_arm(&bytes).unwrap();
         let upper = decoded.upper.unwrap();
         assert_eq!(upper[0].mask, 0x0001_0000);

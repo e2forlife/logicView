@@ -313,8 +313,8 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len,
-                lower: &[],
+                sample_len: len, sample_rate_hz: None,
+                lower: &[], lower_packets: &[],
             },
             &AtomicBool::new(false),
         )
@@ -329,6 +329,10 @@ mod tests {
         assert_eq!(words[0].fields.get("miso").map(String::as_str), Some("3C"));
         assert_eq!(words[0].text, "MOSI 0xA5 MISO 0x3C");
         assert!(output.annotations.iter().any(|row| row.class == "select"));
+        let packet = output.packets.iter().find(|packet| packet.kind == "DATA").unwrap();
+        assert_eq!(packet.data["mosi"], 0xa5);
+        assert_eq!(packet.data["miso"], 0x3c);
+        assert!(output.packets.iter().any(|packet| packet.kind == "CS-CHANGE"));
     }
     #[test]
     fn spi_decodes_one_data_line_without_chip_select() {
@@ -340,11 +344,14 @@ mod tests {
         let miso = pack(&rows, 2);
         let channels = [("sck", sck.as_slice()), ("miso", miso.as_slice())];
         let len = rows.len() as u64;
-        let result = run(&DecodeRequest { protocol: "spi", channels: &channels, options: &[], region: 0..len, sample_len: len, lower: &[] }, &AtomicBool::new(false)).unwrap();
+        let result = run(&DecodeRequest { protocol: "spi", channels: &channels, options: &[], region: 0..len, sample_len: len, sample_rate_hz: None, lower: &[], lower_packets: &[] }, &AtomicBool::new(false)).unwrap();
         let word = result.annotations.iter().find(|row| row.class == "word").unwrap();
         assert_eq!(word.fields.get("miso").map(String::as_str), Some("3C"));
         assert!(!word.fields.contains_key("mosi"));
         assert_eq!(word.text, "MISO 0x3C");
+        let packet = result.packets.iter().find(|packet| packet.kind == "DATA").unwrap();
+        assert_eq!(packet.data["miso"], 0x3c);
+        assert!(packet.data["mosi"].is_null());
     }
 
 }

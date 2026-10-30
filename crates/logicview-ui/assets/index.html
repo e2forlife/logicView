@@ -43,26 +43,6 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
         Stop
       </button>
-      <div class="tool-group" aria-label="Trigger">
-        <svg class="trig-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 16h4l2-8 3 10 2-6h7"></path></svg>
-        <label class="check tight"><input id="trig-enable" type="checkbox"> Trigger</label>
-        <select id="trig-channel" aria-label="Trigger channel"></select>
-        <select id="trig-edge" aria-label="Trigger edge">
-          <option value="rising">Rising</option>
-          <option value="falling">Falling</option>
-          <option value="high">High</option>
-          <option value="low">Low</option>
-        </select>
-        <label class="tiny">Pre-trigger
-          <select id="trig-percent" aria-label="Pre-trigger">
-            <option value="0">0%</option>
-            <option value="10" selected>10%</option>
-            <option value="25">25%</option>
-            <option value="50">50%</option>
-            <option value="90">90%</option>
-          </select>
-        </label>
-      </div>
       <div class="spacer"></div>
       <button id="zoom-out" class="icon-btn" type="button" title="Zoom out" aria-label="Zoom out">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6M14.5 14.5L20 20"></path></svg>
@@ -122,6 +102,9 @@
           </button>
           <button type="button" data-tab="device" class="active" title="Device" aria-label="Device">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg><span>Device</span>
+          </button>
+          <button type="button" data-tab="triggers" title="Triggers" aria-label="Triggers">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17h6V7h9v10h3"></path><path d="M9 12V7M7 9l2-2 2 2"></path></svg><span>Triggers</span>
           </button>
           <button type="button" data-tab="decode" title="Decode" aria-label="Decode">
             <svg class="decode-tab-icon" viewBox="0 0 24 24" aria-hidden="true"><text x="12" y="10">01</text><text x="12" y="21">10</text></svg><span>Decode</span>

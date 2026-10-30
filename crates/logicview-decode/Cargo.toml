@@ -10,6 +10,7 @@ description = "Protocol decoders written from published bus specifications"
 logicview-config = { path = "../logicview-config" }
 logicview-analysis = { path = "../logicview-analysis" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 mlua = { version = "0.12.2", features = ["lua55", "vendored", "serialize"] }
 

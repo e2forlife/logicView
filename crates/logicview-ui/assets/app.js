@@ -446,7 +446,7 @@ function applyStatus(status, fromLive) {
     view().customHeights = false;
     view().heights = {};
     state.gutterSig = "";
-    if (state.tab === "device") selectTab("device");
+    if (state.tab === "device" || state.tab === "triggers") selectTab(state.tab);
   }
   if (status.devices) {
     state.devices = status.devices;
@@ -512,7 +512,6 @@ function renderChrome() {
   paintStatus();
   renderTabs();
   renderGutter();
-  renderTriggerChoices();
   renderMarkerList();
   renderMeasureList();
   drawRuler();
@@ -547,26 +546,6 @@ function renderTabs() {
     button.textContent = session.name;
     button.addEventListener("click", () => selectSession(session.id));
     tabsEl.appendChild(button);
-  }
-}
-
-function renderTriggerChoices() {
-  const select = document.getElementById("trig-channel");
-  if (!select) return;
-  const sig = state.channels.map((channel) => channel.index + ":" + channel.name).join("|");
-  if (select.dataset.sig === sig) return;
-  select.dataset.sig = sig;
-  select.replaceChildren();
-  const rows = state.channels.length ? state.channels : [{ index: 0, name: "0" }];
-  for (const channel of rows) {
-    const option = document.createElement("option");
-    option.value = String(channel.index);
-    option.textContent = channel.name;
-    select.appendChild(option);
-  }
-  select.value = String(settings.triggerChannel);
-  if (select.value !== String(settings.triggerChannel)) {
-    settings.triggerChannel = Number(select.value || 0);
   }
 }
 
@@ -975,7 +954,7 @@ function drawWave() {
     ctx.font = "14px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("Press Run to capture the demo source", w / 2, h / 2);
+    ctx.fillText("Click Run to capture data", w / 2, h / 2);
     return;
   }
   drawGrid(ctx, w, h, layout);
@@ -2014,6 +1993,7 @@ function selectTab(name) {
 
 function panelHtml(name) {
   if (name === "device") return devicePanel();
+  if (name === "triggers") return triggerPanel();
   if (name === "decode") {
     const query = escapeHtml(state.decodeQuery || "");
     return `<div class="decode-heading"><h2>Decode</h2>
@@ -2067,16 +2047,6 @@ function panelHtml(name) {
 }
 
 function devicePanel() {
-  const steps = settings.triggerSteps
-    .map((step, index) => `<div class="step">
-        <input type="number" min="0" max="31" value="${step.channel}" data-step="${index}" data-field="channel" aria-label="Step ${index + 1} channel">
-        <select data-step="${index}" data-field="edge" aria-label="Step ${index + 1} edge">
-          <option value="rising"${step.rising ? " selected" : ""}>Rising</option>
-          <option value="falling"${step.rising ? "" : " selected"}>Falling</option>
-        </select>
-        <button type="button" data-remove="${index}">Remove</button>
-      </div>`)
-    .join("");
   const devices = state.devices || [];
   const title = devices.map((device) => device.name).join(" + ") || settings.deviceName || "Demo";
   const hardware = devices.some((device) => device.kind === "usb");
@@ -2084,7 +2054,6 @@ function devicePanel() {
   const analog = state.analog.length
     ? state.analog.map((channel) => channel.name).join(", ")
     : "none";
-  const source = state.channels.map((channel) => `<option value="${channel.index}">${channel.name}</option>`).join("");
   const analogRow = state.analog.length
     ? `<div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>`
     : "";
@@ -2134,24 +2103,6 @@ function devicePanel() {
         <option value="5">5.0 V</option>
       </select>
     </label>
-    <h3>Trigger</h3>
-    <label class="acq-row">Source
-      <select id="panel-trig-channel" aria-label="Trigger source">${source}</select>
-    </label>
-    <label class="acq-row">Type
-      <select id="panel-trig-edge" aria-label="Trigger type">
-        <option value="rising">Rising edge</option>
-        <option value="falling">Falling edge</option>
-        <option value="high">High</option>
-        <option value="low">Low</option>
-      </select>
-    </label>
-    <label class="acq-row">Position
-      <span>
-        <input id="set-position" type="range" min="0" max="90" step="10" aria-label="Pre-trigger position">
-        <span id="set-position-label"></span>
-      </span>
-    </label>
     <details class="advanced">
       <summary>Advanced</summary>
       <label class="acq-row">Run
@@ -2172,8 +2123,43 @@ function devicePanel() {
       <label class="check"><input id="set-ext" type="checkbox"> External clock</label>
       <label class="check"><input id="set-fall" type="checkbox"> Clock falling edge</label>
       <label class="check"><input id="set-discard" type="checkbox"> Discard on stop</label>
+    </details>`;
+}
+
+function triggerPanel() {
+  const steps = settings.triggerSteps
+    .map((step, index) => `<div class="step">
+        <input type="number" min="0" max="31" value="${step.channel}" data-step="${index}" data-field="channel" aria-label="Step ${index + 1} channel">
+        <select data-step="${index}" data-field="edge" aria-label="Step ${index + 1} edge">
+          <option value="rising"${step.rising ? " selected" : ""}>Rising</option>
+          <option value="falling"${step.rising ? "" : " selected"}>Falling</option>
+        </select>
+        <button type="button" data-remove="${index}">Remove</button>
+      </div>`)
+    .join("");
+  const source = (state.channels.length ? state.channels : [{ index: 0, name: "0" }]).map((channel) => `<option value="${channel.index}">${escapeHtml(channel.name)}</option>`).join("");
+  return `<h2>Triggers</h2>
+    <label class="check"><input id="trig-enable" type="checkbox"> Enable trigger</label>
+    <label class="acq-row">Source
+      <select id="panel-trig-channel" aria-label="Trigger source">${source}</select>
+    </label>
+    <label class="acq-row">Type
+      <select id="panel-trig-edge" aria-label="Trigger type">
+        <option value="rising">Rising edge</option>
+        <option value="falling">Falling edge</option>
+        <option value="high">High</option>
+        <option value="low">Low</option>
+      </select>
+    </label>
+    <label class="acq-row">Position
+      <span>
+        <input id="set-position" type="range" min="0" max="90" step="1" aria-label="Pre-trigger position">
+        <span id="set-position-label"></span>
+      </span>
+    </label>
+    <details class="advanced"><summary>Advanced trigger</summary>
       <h3>Trigger sequence</h3>
-      <p class="hint">A sequence replaces the toolbar edge. Steps run in order and the mark is the last one. Each step is one arm-record stage, up to 16.</p>
+      <p class="hint">A sequence replaces the single trigger. Steps run in order and the mark is the last one. Each step is one arm-record stage, up to 16.</p>
       <div id="trigger-steps">${steps}</div>
       <button class="block" id="add-step" type="button"${settings.triggerSteps.length >= 16 ? " disabled" : ""}>Add edge step</button>
     </details>`;
@@ -2225,30 +2211,6 @@ function bindPanel(name) {
     threshold.value = String(settings.threshold);
     repeat.addEventListener("change", () => { settings.repeatMs = Number(repeat.value); });
     threshold.addEventListener("change", () => { settings.threshold = Number(threshold.value); });
-    const source = document.getElementById("panel-trig-channel");
-    const edge = document.getElementById("panel-trig-edge");
-    const position = document.getElementById("set-position");
-    const positionLabel = document.getElementById("set-position-label");
-    source.value = String(settings.triggerChannel);
-    edge.value = settings.triggerKind;
-    position.value = String(settings.percent);
-    positionLabel.textContent = settings.percent + "%";
-    source.addEventListener("change", () => {
-      settings.triggerChannel = Number(source.value);
-      const toolbar = document.getElementById("trig-channel");
-      if (toolbar) toolbar.value = source.value;
-    });
-    edge.addEventListener("change", () => {
-      settings.triggerKind = edge.value;
-      const toolbar = document.getElementById("trig-edge");
-      if (toolbar) toolbar.value = edge.value;
-    });
-    position.addEventListener("input", () => {
-      settings.percent = Number(position.value);
-      positionLabel.textContent = settings.percent + "%";
-      const toolbar = document.getElementById("trig-percent");
-      if (toolbar) toolbar.value = String(settings.percent);
-    });
     const card = document.getElementById("device-card");
     if (card) card.addEventListener("click", () => openDeviceMenu(card));
     for (const tab of document.querySelectorAll("#channel-enable .ch-tab")) {
@@ -2292,13 +2254,37 @@ function bindPanel(name) {
     bindCheck("set-ext", "extClock");
     bindCheck("set-fall", "clockFalling");
     bindCheck("set-discard", "discard");
+  }
+  if (name === "triggers") {
+    const enable = document.getElementById("trig-enable");
+    enable.checked = settings.trigger;
+    enable.addEventListener("change", () => { settings.trigger = enable.checked; });
+    const source = document.getElementById("panel-trig-channel");
+    const edge = document.getElementById("panel-trig-edge");
+    const position = document.getElementById("set-position");
+    const positionLabel = document.getElementById("set-position-label");
+    source.value = String(settings.triggerChannel);
+    if (!source.value) { source.selectedIndex = 0; settings.triggerChannel = Number(source.value || 0); }
+    edge.value = settings.triggerKind;
+    position.value = String(settings.percent);
+    positionLabel.textContent = settings.percent + "%";
+    source.addEventListener("change", () => {
+      settings.triggerChannel = Number(source.value);
+    });
+    edge.addEventListener("change", () => {
+      settings.triggerKind = edge.value;
+    });
+    position.addEventListener("input", () => {
+      settings.percent = Number(position.value);
+      positionLabel.textContent = settings.percent + "%";
+    });
     document.getElementById("add-step").addEventListener("click", () => {
       const next = settings.triggerSteps.length === 0 ? 1 : settings.triggerSteps.length === 1 ? 3 : 0;
       settings.triggerSteps.push({ channel: next, rising: true });
       settings.trigger = true;
       const box = document.getElementById("trig-enable");
       if (box) box.checked = true;
-      selectTab("device");
+      selectTab("triggers");
     });
     for (const input of document.querySelectorAll("#trigger-steps [data-field='channel']")) {
       input.addEventListener("change", () => {
@@ -2317,7 +2303,7 @@ function bindPanel(name) {
     for (const button of document.querySelectorAll("#trigger-steps [data-remove]")) {
       button.addEventListener("click", () => {
         settings.triggerSteps.splice(Number(button.dataset.remove), 1);
-        selectTab("device");
+        selectTab("triggers");
       });
     }
   }
@@ -2711,16 +2697,6 @@ async function useDevice(id) {
   applyStatus(status, false);
 }
 
-function decoderChannels(protocol) {
-  if (protocol === "i2c") return { scl: "SCL", sda: "SDA" };
-  if (protocol === "spi") {
-    const prefix = state.channels.some((channel) => channel.device_id === "demo:spi") ? "demo:spi/" : "";
-    return { sck: prefix + "SCK", mosi: prefix + "MOSI", miso: prefix + "MISO", cs: prefix + "CS" };
-  }
-  if (protocol === "uart") return { rx: "UART" };
-  return {};
-}
-
 const PROTOCOL_LABEL = { i2c: "I2C", spi: "SPI", uart: "UART", eeprom24: "EEPROM 24xx" };
 const GEAR_ICON = `<span class="settings-icon" aria-hidden="true"></span>`;
 const TRASH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M8 7l1 13h6l1-13"></path></svg>`;
@@ -2736,14 +2712,19 @@ function protocolLabel(protocol) {
 async function addDecoder(protocol) {
   protocol = protocol || document.getElementById("decoder-kind").value;
   try {
+    const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
+    const parent = schema?.stack_on && state.decoders.find((row) => row.protocol === schema.stack_on);
     const created = await api({
       cmd: "add_decoder",
       session: state.active,
       protocol,
-      channels: decoderChannels(protocol),
+      channels: {},
+      stack_on: parent ? parent.id : null,
     });
     state.selectedDecoder = created.id;
     await refreshDecoders();
+    const decoder = state.decoders.find((row) => row.id === created.id);
+    if (decoder) openDecodeConfig(decoder);
     await loadAnnotations();
   } catch (err) {
     statusEl.textContent = err.message;
@@ -4232,24 +4213,6 @@ waveStage.addEventListener("pointerleave", (ev) => {
 });
 document.getElementById("timebase").addEventListener("input", (ev) => applyTimebase(Number(ev.target.value)));
 
-const trigEnable = document.getElementById("trig-enable");
-const trigEdge = document.getElementById("trig-edge");
-const trigChannel = document.getElementById("trig-channel");
-const trigPercent = document.getElementById("trig-percent");
-trigEnable.checked = settings.trigger;
-trigEdge.value = settings.triggerKind;
-trigPercent.value = String(settings.percent);
-trigEnable.addEventListener("change", () => { settings.trigger = trigEnable.checked; });
-trigEdge.addEventListener("change", () => { settings.triggerKind = trigEdge.value; });
-trigChannel.addEventListener("change", () => { settings.triggerChannel = Number(trigChannel.value); });
-trigPercent.addEventListener("change", () => {
-  settings.percent = Number(trigPercent.value);
-  const slider = document.getElementById("set-position");
-  const label = document.getElementById("set-position-label");
-  if (slider) slider.value = trigPercent.value;
-  if (label) label.textContent = settings.percent + "%";
-});
-
 for (const button of document.querySelectorAll(".side-rail button[data-tab]")) {
   button.addEventListener("click", () => openSidebar(button.dataset.tab));
 }
@@ -4297,7 +4260,7 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (key === "o" || key === "O") { selectTab("device"); return; }
-  if (key === "t" || key === "T") { selectTab("device"); return; }
+  if (key === "t" || key === "T") { selectTab("triggers"); return; }
   if (key === "d" || key === "D") { selectTab("decode"); return; }
   if (key === "m" || key === "M") { selectTab("measure"); return; }
   if (key === "r" || key === "R") {
@@ -4549,7 +4512,7 @@ function openDecodeConfig(decoder) {
   const overlayOn = overlayEnabled(decoder.id);
   const pref = decodePref(decoder.id);
   const parts = [`<label class="check"><input id="decode-overlay" type="checkbox"${overlayOn ? " checked" : ""}> Overlay decoded values on the data line</label>`];
-  if (Object.keys(channels).length) {
+  if ((state.decoderCatalog.find((item) => item.id === decoder.protocol)?.channels || []).length) {
     const format = decodeFormat(decoder.id);
     const options = Object.entries(DECODE_FORMATS).map(([value, label]) => `<option value="${value}"${format === value ? " selected" : ""}>${label}</option>`).join("");
     parts.push(`<label class="check"><input id="decode-condense" type="checkbox"${pref.condensed ? " checked" : ""}> Hide channels under this decoder</label>
@@ -4595,8 +4558,20 @@ function openDecodeConfig(decoder) {
     parts.push(`<label class="field">Samples per bit
       <input id="decode-bit-samples" type="number" min="1" max="10000" value="${escapeHtml(options.bit_samples || "10")}">
     </label>`);
-  } else if (decoder.protocol === "eeprom24") {
-    const parents = state.decoders.filter((row) => row.protocol === "i2c");
+  }
+  for (const option of schema?.options || []) {
+    const current = options[option.id] ?? option.default;
+    const name = escapeHtml(option.name);
+    const id = escapeHtml(option.id);
+    if (option.values?.length) {
+      const choices = option.values.map((value) => `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(value)}</option>`).join("");
+      parts.push(`<label class="field">${name}<select data-decoder-option="${id}">${choices}</select></label>`);
+    } else {
+      parts.push(`<label class="field">${name}<input data-decoder-option="${id}" type="text" value="${escapeHtml(current)}"></label>`);
+    }
+  }
+  if (schema?.stack_on) {
+    const parents = state.decoders.filter((row) => row.protocol === schema.stack_on && row.id !== decoder.id);
     const choices = parents.map((row) => `<option value="${escapeHtml(row.id)}"${row.id === decoder.stack_on ? " selected" : ""}>${escapeHtml(protocolLabel(row.protocol) + " " + row.id)}</option>`).join("");
     parts.push(`<label class="field">Stacks on
       <select id="decode-stack">${choices}</select>
@@ -4807,6 +4782,9 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     options.address = address || "any";
   } else if (decoder.protocol === "uart") {
     options.bit_samples = document.getElementById("decode-bit-samples").value;
+  }
+  for (const input of ev.target.querySelectorAll("[data-decoder-option]")) {
+    options[input.dataset.decoderOption] = input.value;
   }
   const stack = document.getElementById("decode-stack");
   const overlayBox = document.getElementById("decode-overlay");

@@ -225,8 +225,8 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len,
-                lower: &[],
+                sample_len: len, sample_rate_hz: None,
+                lower: &[], lower_packets: &[],
             },
             &AtomicBool::new(false),
         )

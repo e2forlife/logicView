@@ -1513,6 +1513,7 @@ dependencies = [
  "logicview-config",
  "mlua",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

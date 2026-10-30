@@ -625,7 +625,29 @@ fn build_arm(
     let mut upper = None;
     let stage_count = if config.trigger_enabled && !instant {
         let steps = active_edge_steps(config);
-        if steps.len() == 1 && config.trigger_steps.is_empty() {
+        if clock.ext_record && config.trigger_steps.is_empty() {
+            // U3Pro32 uses the reference driver's simple trigger format: one
+            // condition, stage index zero, and an inactive second comparator.
+            let channel = config.trigger_channel.min(31);
+            let bit = 1u32 << (channel % 16);
+            let (value, edge) = match config.trigger_kind {
+                TriggerKind::Rising => (bit, bit),
+                TriggerKind::Falling => (0, bit),
+                TriggerKind::High => (bit, 0),
+                TriggerKind::Low => (0, 0),
+            };
+            stages[0].logic_or = true;
+            if channel < 16 {
+                stages[0].mask = bit;
+                stages[0].value = value;
+                stages[0].edge = edge;
+            } else {
+                let mut extended = [UpperStage::default(); 16];
+                extended[0] = UpperStage { mask: bit, value, edge };
+                upper = Some(extended);
+            }
+            0
+        } else if steps.len() == 1 && config.trigger_steps.is_empty() {
             // A lone rising or falling stage matches the level that is already
             // there, so the pod triggers immediately and the header stays near
             // 1. On this Plus the edge is a two-stage serial sequence: the
@@ -638,7 +660,8 @@ fn build_arm(
             // One stage per edge, in order. The record format holds 16.
             // The demo path proves the sequence by searching samples; the
             // pod image is written and has not been run on hardware.
-            apply_edge_stages(&steps, &mut stages, &mut upper)?
+            let count = apply_edge_stages(&steps, &mut stages, &mut upper)?;
+            if clock.ext_record { count - 1 } else { count }
         } else {
             let channel = config.trigger_channel.min(31);
             let bit = 1u32 << (channel % 16);
@@ -857,6 +880,26 @@ mod tests {
         assert_eq!(armed.divider >> 16, 0x0400);
         assert!(armed.mode.contains(ModeFlags::SLOW_ACQUISITION));
         assert!(armed.upper.is_some());
+    }
+
+    #[test]
+    fn u3_simple_edge_uses_reference_trigger_record_for_both_banks() {
+        let clock = HostClock { hw_max_hz: 500_000_000, half_rate_hz: None,
+            quarter_rate_hz: None, pre_divider: 5, ext_record: true };
+        for channel in [3, 19] {
+            let config = SessionConfig { trigger_enabled: true, trigger_channel: channel,
+                trigger_kind: TriggerKind::Rising, ..SessionConfig::default() };
+            let bytes = build_arm(&config, 64_000, false, u32::MAX, &clock).unwrap();
+            let arm = decode_arm(&bytes).unwrap();
+            assert!(!arm.mode.contains(ModeFlags::SERIAL_TRIGGER));
+            assert_eq!(arm.stage_count, 0);
+            assert!(arm.stages[0].logic_or);
+            let (low, upper) = (arm.stages[0], arm.upper.unwrap()[0]);
+            assert_eq!(low.mask, if channel < 16 { 8 } else { 0 });
+            assert_eq!(upper.mask, if channel >= 16 { 8 } else { 0 });
+            assert_eq!(low.edge, low.mask);
+            assert_eq!(upper.edge, upper.mask);
+        }
     }
 
     /// Checks that slow-acquisition mode follows aggregate transfer volume, not sample rate alone.

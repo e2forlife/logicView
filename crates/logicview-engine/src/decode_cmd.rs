@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use logicview_decode::{
     catalog, export_csv, export_text, run, search_annotations, Annotation, DecodeRequest,
-    DecoderSchema,
+    DecoderSchema, DecodeOutput,
 };
 
 use super::{AnnotationRow, DecoderInfo, DecoderInst, Engine, EngineError, Slot};
@@ -37,8 +37,8 @@ impl Engine {
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, session)?;
         let slot = state.slot_mut(&id)?;
-        let stack = if schema.stack_on.is_some() {
-            Some(resolve_stack(slot, stack_on)?)
+        let stack = if let Some(expected) = schema.stack_on.as_deref() {
+            Some(resolve_stack(slot, stack_on, expected, None)?)
         } else if stack_on.is_some() {
             return Err(EngineError::Decode(format!(
                 "{protocol} does not stack on another decoder"
@@ -82,9 +82,15 @@ impl Engine {
         let id = self.resolve(&state, session)?;
         let slot = state.slot_mut(&id)?;
         let before = slot.decoders.len();
-        slot.decoders.retain(|decoder| {
-            decoder.id != decoder_id && decoder.stack_on.as_deref() != Some(decoder_id)
-        });
+        let mut removed = vec![decoder_id.to_string()];
+        loop {
+            let dependents: Vec<String> = slot.decoders.iter().filter(|decoder|
+                decoder.stack_on.as_ref().is_some_and(|parent| removed.contains(parent)) && !removed.contains(&decoder.id)
+            ).map(|decoder| decoder.id.clone()).collect();
+            if dependents.is_empty() { break; }
+            removed.extend(dependents);
+        }
+        slot.decoders.retain(|decoder| !removed.contains(&decoder.id));
         if slot.decoders.len() == before {
             return Err(EngineError::Decode(format!("unknown decoder {decoder_id}")));
         }
@@ -120,9 +126,9 @@ impl Engine {
                 resolved.insert(name, resolve_channel(slot, spec)?);
             }
         }
-        let stack = if schema.stack_on.is_some() {
+        let stack = if let Some(expected) = schema.stack_on.as_deref() {
             Some(if stack_on.is_some() {
-                resolve_stack(slot, stack_on)?
+                resolve_stack(slot, stack_on, expected, Some(decoder_id))?
             } else {
                 slot.decoders
                     .iter()
@@ -252,20 +258,23 @@ pub(crate) fn rerun(slot: &mut Slot) {
             Err(_) => packed.push(Vec::new()),
         }
     }
-    slot.annotations = decode_all(&slot.decoders, &packed, len);
+    slot.annotations = decode_all(&slot.decoders, &packed, len, slot.session.config.sample_rate_hz);
 }
 
 /// Runs signal decoders before stacked decoders and merges their events into time order.
 ///
 /// The current implementation treats a failed decoder run as an empty result,
 /// so absent rows do not by themselves establish that the bus was inactive.
-fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<AnnotationRow> {
-    let mut produced: BTreeMap<String, Vec<Annotation>> = BTreeMap::new();
+fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64, sample_rate_hz: u64) -> Vec<AnnotationRow> {
+    let mut produced: BTreeMap<String, DecodeOutput> = BTreeMap::new();
     let mut rows = Vec::new();
-    let mut order: Vec<usize> = (0..decoders.len())
-        .filter(|index| decoders[*index].stack_on.is_none())
-        .collect();
-    order.extend((0..decoders.len()).filter(|index| decoders[*index].stack_on.is_some()));
+    let mut order = Vec::new();
+    while order.len() < decoders.len() {
+        let next = (0..decoders.len()).find(|index| !order.contains(index) &&
+            decoders[*index].stack_on.as_ref().is_none_or(|parent|
+                order.iter().any(|prior| decoders[*prior].id == *parent)));
+        match next { Some(index) => order.push(index), None => break }
+    }
     for index in order {
         let inst = &decoders[index];
         let ready = match inst.protocol.as_str() {
@@ -279,8 +288,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
             .stack_on
             .as_ref()
             .and_then(|parent| produced.get(parent))
-            .cloned()
-            .unwrap_or_default();
+            ;
         let names: Vec<String> = inst.channels.keys().cloned().collect();
         let bytes: Vec<&[u8]> = inst
             .channels
@@ -308,15 +316,17 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
                 options: &options,
                 region,
                 sample_len: len,
-                lower: &lower,
+                sample_rate_hz: Some(sample_rate_hz),
+                lower: lower.map_or(&[], |output| output.annotations.as_slice()),
+                lower_packets: lower.map_or(&[], |output| output.packets.as_slice()),
             },
             &AtomicBool::new(false),
         );
-        let annotations = match output {
-            Ok(item) => item.annotations,
-            Err(err) => { tracing::warn!(decoder = %inst.id, "decoder failed: {err}"); Vec::new() }
+        let output = match output {
+            Ok(item) => item,
+            Err(err) => { tracing::warn!(decoder = %inst.id, "decoder failed: {err}"); DecodeOutput { annotations: Vec::new(), packets: Vec::new(), cancelled: false } }
         };
-        for annotation in &annotations {
+        for annotation in &output.annotations {
             rows.push(AnnotationRow {
                 decoder: inst.id.clone(),
                 protocol: inst.protocol.clone(),
@@ -327,7 +337,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
                 fields: annotation.fields.clone(),
             });
         }
-        produced.insert(inst.id.clone(), annotations);
+        produced.insert(inst.id.clone(), output);
     }
     rows.sort_by(|left, right| {
         left.start_sample
@@ -339,32 +349,37 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
 }
 
 /// Finds an unambiguous I2C parent for the supported EEPROM decoder stack.
-fn resolve_stack(slot: &Slot, stack_on: Option<&str>) -> Result<String, EngineError> {
+fn resolve_stack(slot: &Slot, stack_on: Option<&str>, expected: &str, child: Option<&str>) -> Result<String, EngineError> {
     if let Some(id) = stack_on {
         let parent = slot
             .decoders
             .iter()
             .find(|decoder| decoder.id == id)
             .ok_or_else(|| EngineError::Decode(format!("no decoder {id} to stack on")))?;
-        if parent.protocol != "i2c" {
+        if parent.protocol != expected {
             return Err(EngineError::Decode(
-                "eeprom24 stacks on an I2C decoder".into(),
+                format!("decoder stacks on {expected}"),
             ));
+        }
+        let mut ancestor = Some(parent);
+        while let Some(item) = ancestor {
+            if Some(item.id.as_str()) == child { return Err(EngineError::Decode("decoder stack would contain a cycle".into())); }
+            ancestor = item.stack_on.as_ref().and_then(|id| slot.decoders.iter().find(|decoder| decoder.id == *id));
         }
         return Ok(parent.id.clone());
     }
     let i2c: Vec<_> = slot
         .decoders
         .iter()
-        .filter(|decoder| decoder.protocol == "i2c")
+        .filter(|decoder| decoder.protocol == expected && Some(decoder.id.as_str()) != child)
         .collect();
     match i2c.as_slice() {
         [only] => Ok(only.id.clone()),
         [] => Err(EngineError::Decode(
-            "add an I2C decoder before the EEPROM stack".into(),
+            format!("add a {expected} decoder before this stack"),
         )),
         _ => Err(EngineError::Decode(
-            "name the I2C decoder to stack on".into(),
+            format!("name the {expected} decoder to stack on"),
         )),
     }
 }
