@@ -224,20 +224,40 @@ function decodeShownAnalog(id) {
   return decodeFormat(id) === "analog" || !!(state.spiView[id] && state.spiView[id].analog);
 }
 
-function decodeBusRow(decoder, channel) {
+function laneColor(channel, fallback) {
+  const signal = state.channels.find((item) => item.index === Number(channel));
+  if (!signal) return fallback;
+  return storedColor("logic:" + signal.index, signal.color || fallback);
+}
+
+function decodeLanes(decoder, fallbackChannel) {
+  const channels = decoder.channels || {};
+  if (decoder.protocol === "spi") {
+    const lanes = [];
+    if (Number.isFinite(Number(channels.mosi))) lanes.push({ id: "mosi", name: "MOSI", channel: Number(channels.mosi) });
+    if (Number.isFinite(Number(channels.miso))) lanes.push({ id: "miso", name: "MISO", channel: Number(channels.miso) });
+    if (lanes.length > 1) return lanes;
+  }
+  return [{ id: "", name: protocolLabel(decoder.protocol), channel: fallbackChannel }];
+}
+
+function decodeBusRow(decoder, lane, header) {
   const analog = decodeShownAnalog(decoder.id);
-  const name = protocolLabel(decoder.protocol);
+  const channel = Number.isFinite(Number(lane.channel)) ? Number(lane.channel) : 0;
+  const key = lane.id ? "decode:" + decoder.id + ":" + lane.id : "decode:" + decoder.id;
   return {
-    key: "decode:" + decoder.id,
+    key,
     kind: "decode",
     channel,
-    name,
-    color: analog ? "#7dcea0" : "#8eb6ff",
+    name: lane.name,
+    color: laneColor(channel, analog ? "#7dcea0" : "#8eb6ff"),
     device: "",
     decoderId: decoder.id,
+    header: !!header,
+    lane: lane.id || "",
     bus: {
-      id: "decode:" + decoder.id,
-      name,
+      id: key,
+      name: lane.name,
       channels: [],
       analog,
       decode: decoder.id,
@@ -248,7 +268,7 @@ function decodeBusRow(decoder, channel) {
 function groupRows(decoder, source) {
   const indexes = indexesInOrder(decoderIndexes(decoder), source);
   const channel = indexes.length ? indexes[0] : 0;
-  const rows = [decodeBusRow(decoder, channel)];
+  const rows = decodeLanes(decoder, channel).map((lane, index) => decodeBusRow(decoder, lane, index === 0));
   if (decoderCondensed(decoder.id)) return rows;
   const byIndex = new Map(state.channels.map((item) => [item.index, item]));
   for (const index of indexes) {
@@ -684,6 +704,13 @@ function foldButton(row, folded) {
   return button;
 }
 
+function foldSpacer() {
+  const spacer = document.createElement("span");
+  spacer.className = "fold-spacer";
+  spacer.setAttribute("aria-hidden", "true");
+  return spacer;
+}
+
 function renderGutter() {
   const metrics = rowMetrics();
   const selected = view().selected;
@@ -755,7 +782,8 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    if (row.kind === "decode" && row.header) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    else if (row.kind === "decode") el.append(bar, foldSpacer(), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
@@ -1276,6 +1304,13 @@ function condensedLabel(row, format) {
   return parts.length ? parts.join(" / ") : annotationLabel(row);
 }
 
+function laneLabel(row, format, lane) {
+  const raw = row.fields && row.fields[lane];
+  if (raw == null || raw === "") return "";
+  const value = parseInt(raw, 16);
+  return Number.isFinite(value) ? formatDecoded(value, format) : String(raw);
+}
+
 function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
   const max = 255;
   ctx.beginPath();
@@ -1309,15 +1344,20 @@ function drawCondensedRows(ctx, canvasW, layout) {
     const bandTop = item.top + pad;
     const bandBot = item.top + item.height - pad;
     if (format === "analog") {
-      const fields = rows[0] && rows[0].fields;
-      if (fields && (fields.mosi || fields.miso)) {
-        drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
-        drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+      const lane = item.row.lane;
+      if (lane) {
+        drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color, (row) => parseInt((row.fields || {})[lane], 16));
       } else {
-        drawStepSeries(ctx, rows, bandTop, bandBot, "#8eb6ff", (row) => {
-          const values = annotationNumbers(row);
-          return values.length ? values[0] : NaN;
-        });
+        const fields = rows[0] && rows[0].fields;
+        if (fields && (fields.mosi || fields.miso)) {
+          drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
+          drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+        } else {
+          drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color || "#8eb6ff", (row) => {
+            const values = annotationNumbers(row);
+            return values.length ? values[0] : NaN;
+          });
+        }
       }
       ctx.fillStyle = "rgba(176, 188, 204, 0.7)";
       ctx.font = "10px sans-serif";
@@ -1329,7 +1369,8 @@ function drawCondensedRows(ctx, canvasW, layout) {
     }
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
-    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, (row) => condensedLabel(row, format), 0.82);
+    const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane) : (row) => condensedLabel(row, format);
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, labelOf, 0.82);
   }
 }
 
@@ -1889,7 +1930,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Each decoder is a bus row with its waveform channels underneath. The arrow beside the decoder name folds those channels into the bus, or shows them again. The eye hides that row’s waveform. Overlay draws decoded values on the data lines while the waveforms are visible. A channel used by two decoders appears in each group.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Each data lane is its own hex bus, stacked at the top of the decoder, with the waveform channels underneath. The arrow beside the first bus folds those waveforms into the buses, or shows them again. The eye hides that row’s waveform. Overlay draws decoded values on the data lines while the waveforms are visible. A channel used by two decoders appears in each group.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>

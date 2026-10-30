@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
-use tao::window::WindowBuilder;
+use tao::window::{Icon, WindowBuilder};
 use wry::WebViewBuilder;
 
 pub fn open(addr: SocketAddr) -> Result<(), String> {
@@ -67,13 +67,23 @@ async fn run_server(
     Ok(())
 }
 
+fn window_icon() -> Option<Icon> {
+    const PX: u32 = 256;
+    let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/window-icon.rgba"));
+    Icon::from_rgba(rgba.to_vec(), PX, PX).ok()
+}
+
 fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
+    let mut builder = WindowBuilder::new()
         .with_title("LogicView")
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(960.0, 640.0))
-        .with_theme(Some(tao::window::Theme::Dark))
+        .with_theme(Some(tao::window::Theme::Dark));
+    if let Some(icon) = window_icon() {
+        builder = builder.with_window_icon(Some(icon));
+    }
+    let window = builder
         .build(&event_loop)
         .map_err(|err| format!("could not open the LogicView window: {err}"))?;
 
