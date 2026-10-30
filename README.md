@@ -1,75 +1,77 @@
+<p align="center">
+  <img src="crates/logicview-ui/assets/icon.png" alt="LogicView icon" width="128">
+</p>
+
 # LogicView
 
-Clean-room Rust logic analyzer. Phases 0–4 are the capture contract, the demo
-engine, the Axum waveform shell, and buffer/stream capture for one high-speed
-DSLogic Plus (`0x2A0E:0x0020`) or one high-speed DSLogic U3Pro32
-(`0x2A0E:0x002C`). This tree adds protocol decode (UART, I2C, SPI,
-and a 24xx-style EEPROM stack), the data table, and a stdio MCP server.
-A session can stack the Demo and Demo SPI pods onto one waveform. Other logic
-product ids are listed with their channel counts and are not opened: they have
-not been tested on hardware. Oscilloscope and data acquisition are not in this
-build. Firmware and the FPGA bitstream are not in this repo. Set
-`LOGICVIEW_FIRMWARE_DIR` to the folder that contains `DSLogicPlus.bin` or
-`DSLogicU3Pro32.bin` when that pod's FPGA is not already configured.
+LogicView is an open-source project for capturing and exploring signals and building an extensible platform for laboratory hardware. It aims to bring USB- and Ethernet-connected devices into a consistent workspace, from logic analyzers to rack instruments controlled using SCPI. Current hardware work focuses on DSLogic logic analyzers; broader device and instrument support is a future goal.
 
-```
+LogicView is an independent project and is not affiliated with DreamSourceLab.
+
+## Project status
+
+LogicView is in early development. The Rust workspace includes a desktop waveform interface, a capture engine, simulated devices, protocol decoders, and a Model Context Protocol (MCP) server. You can explore the interface with the demo devices without connecting hardware.
+
+- **Hardware:** Buffer and stream captures have been checked on one DSLogic Plus (`0x2A0E:0x0020`) and one DSLogic U3Pro32 (`0x2A0E:0x002C`). Other listed DSLogic models cannot currently be opened and have not been tested. Simultaneous arming of two USB pods has not been verified.
+- **Analysis:** Waveform measurements and UART, I2C, SPI, and 24xx-style EEPROM decoding are available. The interface includes a data table and an ordered edge-trigger interface; hardware trigger stages have not been verified on a pod.
+- **Platforms:** Windows and Linux desktop builds are the current focus. macOS, Android, and iOS are goals for future investigation, not supported releases. Mobile support depends on platform and hardware-access constraints.
+- **Scope:** SCPI instruments, Ethernet-connected devices, oscilloscopes, and data acquisition are not supported in the current build.
+
+See [Mission and vision](MISSION.md) for the project's direction and [Contributing](CONTRIBUTING.md) for ways to help.
+
+## Get started
+
+Install the stable [Rust toolchain](https://www.rust-lang.org/tools/install). On Linux, the desktop build also requires WebKitGTK 4.1, GTK 3, and pkg-config development packages. On Windows, the desktop window uses WebView2.
+
+```sh
 cargo test --workspace
 cargo run -p logicview-app
-cargo run -p logicview-app -- mcp
 ```
 
-`cargo run -p logicview-app` opens LogicView in its own window. That window
-hosts the Axum UI. On Windows, from this directory:
+The app opens a desktop window and serves its interface on loopback port `4173`. Set `LOGICVIEW_PORT` to choose a different port. Press **Run** to use the demo source; add **Demo SPI** from the device drawer to see multiple demo pods on the waveform. The analyzers drawer adds protocol decoders, and the measurement drawer keeps waveform readings.
 
-```
+For supported hardware, firmware and FPGA bitstreams are not included in the repository. If the pod's FPGA is not already configured, set `LOGICVIEW_FIRMWARE_DIR` to a directory containing the appropriate user-supplied `DSLogicPlus.bin` or `DSLogicU3Pro32.bin`. See [Contributing](CONTRIBUTING.md) before working with hardware or reference materials.
+
+### Windows packaging
+
+From the repository directory:
+
+```bat
 scripts\package-release.cmd
 scripts\run-debug.cmd
 ```
 
-`package-release.cmd` runs `cargo build --release -p logicview-app` and writes
-`dist\logicview-<version>-windows.zip`. The archive holds a
-`logicview-<version>` folder with `logicview.exe` and the files from
-`crates\logicview-ui\assets`. Unzip it and launch `logicview.exe`. The
-release binary is a Windows GUI program: the LogicView window opens and no
-console window appears. The window uses WebView2, which current Windows 10
-and Windows 11 already include. `run-debug.cmd` is the debug build. It keeps
-a console for logs and opens the same window. A Linux build uses WebKitGTK 4.1.
+The packaging script builds a release executable and writes `dist\logicview-<version>-windows.zip`, including the UI assets. Extract the archive and run `logicview.exe`. The debug script keeps a console open for logs.
 
-The window talks to the engine on loopback port 4173. Set `LOGICVIEW_PORT`
-to use another port. `logicview mcp` attaches to that running engine when
-the endpoint is up, and otherwise starts its own demo engine. On Unix the
-endpoint is a socket at `/tmp/logicview.sock`.
-On Windows the UI listens on TCP `127.0.0.1` (ephemeral port) and writes
-`127.0.0.1:<port>` into `%TEMP%\logicview.sock`; the MCP client reads that file
-and connects over TCP. `LOGICVIEW_SOCKET` overrides the socket path on Unix and
-the endpoint file path on Windows. When that value is a loopback
-`host:port` such as `127.0.0.1:4174`, Windows binds and connects to that
-TCP address. Press Run. Stack **Demo SPI** from the
-device drawer to see both pods. Hover a trace for width, period, frequency,
-and duty; the measure drawer keeps those readings. Add I2C or SPI from the
-analyzers drawer and read the rows in the bottom table. The trigger drawer
-takes an ordered list of edges (channel 1 rising, then channel 3 rising,
-fires on channel 3). Each step is one stage in the arm record. The demo
-source finds that sequence in the captured samples. The same stages are
-written for a pod and have not been run on hardware.
+### MCP server
 
-## Crates
+```sh
+cargo run -p logicview-app -- mcp
+```
 
-| Crate | Phase | Role |
-| --- | --- | --- |
-| `logicview-proto` | 0 | Arm record, logic header, sample atoms, `.dsl` header text |
-| `logicview-hal` | 3 | DSLogic Plus and U3Pro32 USB, FPGA sequencing, buffer capture |
-| `logicview-analysis` | 1 | Edge search and pulse measurements |
-| `logicview-decode` | 5 | UART, I2C, SPI, and a 24xx EEPROM stack |
-| `logicview-capture` | 1 | Demo source, session phases, logic mipmap |
-| `logicview-store` | 1 | `.lvcap` directory or zip |
-| `logicview-engine` | 1 | Command facade, multi-pod channel list, live events |
-| `logicview-mcp` | 6 | stdio MCP and the UI attach endpoint |
-| `logicview-ui` | 2 | Axum routes, WebSocket tile frames, waveform shell |
-| `logicview-app` | 2 | `logicview` binary |
+The stdio MCP server attaches to a running engine when available; otherwise it starts its own demo engine. On Unix the default endpoint is `/tmp/logicview.sock`. On Windows, the running UI writes its loopback TCP endpoint to `%TEMP%\logicview.sock`. `LOGICVIEW_SOCKET` overrides the Unix socket path or Windows endpoint file path; on Windows a loopback `host:port` value specifies a TCP address instead.
 
-See `CONTRIBUTING.md` for the clean-room rule. Decoders follow the published
-I2C, SPI, UART, and 24C02 sequences, not another project's scripts. The arm
-record's sample-count shift is 4, measured on the Plus pod:
-packed counts `0x10`, `0x40`, and `0x80` kept 32, 128, and 256 bytes on one
-channel.
+## Architecture
+
+| Crate | Responsibility |
+| --- | --- |
+| `logicview-proto` | Hardware protocol records, sample data, and `.dsl` header text |
+| `logicview-hal` | Device profiles, USB hardware access, FPGA setup, and capture |
+| `logicview-capture` | Capture sessions, demo sources, and waveform data |
+| `logicview-analysis` | Edge search and pulse measurements |
+| `logicview-decode` | Protocol decoders |
+| `logicview-store` | `.lvcap` capture storage |
+| `logicview-engine` | Commands, device sessions, and live events |
+| `logicview-mcp` | MCP server and engine attachment |
+| `logicview-ui` | Web interface and waveform transport |
+| `logicview-app` | Desktop application and executable |
+
+## Contributing
+
+Contributions are welcome, including device research, hardware testing, documentation, accessibility, platform support, and protocol analysis. Please read [CONTRIBUTING.md](CONTRIBUTING.md), especially its clean-room rules, before starting.
+
+## License
+
+Copyright (C) 2026 Chuck
+
+LogicView is licensed under the GNU General Public License, version 3 or any later version (`GPL-3.0-or-later`). The full license text is in [LICENSE.md](LICENSE.md).
