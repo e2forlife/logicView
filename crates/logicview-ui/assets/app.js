@@ -2577,6 +2577,18 @@ async function applyDeviceChoice(value) {
   const ids = value.split("+").filter(Boolean);
   if (!ids.length) return;
   try {
+    if (ids.some((id) => id.startsWith("usb:"))) {
+      // Fetch the authoritative status before opening, even if the background
+      // profile request is still in flight.
+      const profiles = await api({ cmd: "list_profiles" });
+      for (const id of ids.filter((item) => item.startsWith("usb:"))) {
+        const profile = profiles.find((item) => item.id === id);
+        if (!profile || !profile.hardware_tested) {
+          const device = state.deviceList.find((item) => item.id === id);
+          window.alert(`${profile?.name || device?.name || id}: support has not been tested in hardware.`);
+        }
+      }
+    }
     await useDevice(ids[0]);
     for (const id of ids.slice(1)) {
       const status = await api({ cmd: "attach_device", id, session: state.active });
