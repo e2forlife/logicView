@@ -45,9 +45,9 @@ impl Engine {
         };
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            let spec = channels.get(*name).ok_or_else(|| {
-                EngineError::Decode(format!("{protocol} needs a {name} channel"))
-            })?;
+            let spec = channels
+                .get(*name)
+                .ok_or_else(|| EngineError::Decode(format!("{protocol} needs a {name} channel")))?;
             resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
         }
         let instance_id = format!("{protocol}-{}", slot.next_decoder);
@@ -79,8 +79,9 @@ impl Engine {
         let id = self.resolve(&state, session)?;
         let slot = state.slot_mut(&id)?;
         let before = slot.decoders.len();
-        slot.decoders
-            .retain(|decoder| decoder.id != decoder_id && decoder.stack_on.as_deref() != Some(decoder_id));
+        slot.decoders.retain(|decoder| {
+            decoder.id != decoder_id && decoder.stack_on.as_deref() != Some(decoder_id)
+        });
         if slot.decoders.len() == before {
             return Err(EngineError::Decode(format!("unknown decoder {decoder_id}")));
         }
@@ -111,9 +112,9 @@ impl Engine {
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            let spec = channels.get(*name).ok_or_else(|| {
-                EngineError::Decode(format!("{protocol} needs a {name} channel"))
-            })?;
+            let spec = channels
+                .get(*name)
+                .ok_or_else(|| EngineError::Decode(format!("{protocol} needs a {name} channel")))?;
             resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
         }
         let stack = if schema.stack_on.is_some() {
@@ -153,15 +154,13 @@ impl Engine {
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?)
     }
 
-    pub async fn list_decoders(&self, session: Option<&str>) -> Result<Vec<DecoderInfo>, EngineError> {
+    pub async fn list_decoders(
+        &self,
+        session: Option<&str>,
+    ) -> Result<Vec<DecoderInfo>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, session)?;
-        Ok(state
-            .slot(&id)?
-            .decoders
-            .iter()
-            .map(info_of)
-            .collect())
+        Ok(state.slot(&id)?.decoders.iter().map(info_of).collect())
     }
 
     pub async fn read_annotations(
@@ -254,9 +253,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
     let mut order: Vec<usize> = (0..decoders.len())
         .filter(|index| decoders[*index].stack_on.is_none())
         .collect();
-    order.extend(
-        (0..decoders.len()).filter(|index| decoders[*index].stack_on.is_some()),
-    );
+    order.extend((0..decoders.len()).filter(|index| decoders[*index].stack_on.is_some()));
     for index in order {
         let inst = &decoders[index];
         let lower = inst
@@ -269,12 +266,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
         let bytes: Vec<&[u8]> = inst
             .channels
             .values()
-            .map(|channel| {
-                packed
-                    .get(*channel)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-            })
+            .map(|channel| packed.get(*channel).map(Vec::as_slice).unwrap_or(&[]))
             .collect();
         let pairs: Vec<(&str, &[u8])> = names
             .iter()
@@ -378,9 +370,7 @@ fn resolve_channel(slot: &Slot, spec: &str) -> Result<usize, EngineError> {
         .collect();
     match matches.as_slice() {
         [index] => Ok(*index),
-        [] => Err(EngineError::Decode(format!(
-            "no channel matches {spec}"
-        ))),
+        [] => Err(EngineError::Decode(format!("no channel matches {spec}"))),
         _ => Err(EngineError::Decode(format!(
             "channel {spec} is on more than one device; use device/name"
         ))),

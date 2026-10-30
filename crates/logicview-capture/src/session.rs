@@ -95,8 +95,11 @@ pub struct HostClock {
     pub hw_max_hz: u64,
     pub half_rate_hz: Option<u64>,
     pub quarter_rate_hz: Option<u64>,
-    /// 1 on the Plus. 5 on the U3Pro32. The arm record stores the post-divider.
+    /// 1 on the Plus. 5 on the U3Pro32. The high half of the divider word holds
+    /// the pre-divider stage.
     pub pre_divider: u64,
+    /// A 32-channel pod sends the second trigger record on every capture.
+    pub ext_record: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +242,7 @@ impl Session {
                 half_rate_hz: None,
                 quarter_rate_hz: None,
                 pre_divider: 1,
+                ext_record: false,
             },
         )?;
         self.resolve_edges = true;
@@ -534,6 +538,14 @@ fn build_arm(
     if clock.quarter_rate_hz == Some(config.sample_rate_hz) {
         mode.insert(ModeFlags::QUARTER_RATE);
     }
+    let channels = u64::from(enable.count_ones().max(1));
+    let bytes_per_ms = config
+        .sample_rate_hz
+        .saturating_mul(channels)
+        .div_ceil(8_000);
+    if bytes_per_ms < 1024 {
+        mode.insert(ModeFlags::SLOW_ACQUISITION);
+    }
     let divider = logicview_proto::logic_divider(
         clock.hw_max_hz,
         config.sample_rate_hz,
@@ -594,6 +606,9 @@ fn build_arm(
     } else {
         0
     };
+    if clock.ext_record && upper.is_none() {
+        upper = Some([UpperStage::default(); 16]);
+    }
     let arm = ArmConfig {
         mode,
         divider,
@@ -691,6 +706,7 @@ mod tests {
                 half_rate_hz: None,
                 quarter_rate_hz: None,
                 pre_divider: 1,
+                ext_record: false,
             },
         )
         .unwrap();
@@ -729,6 +745,7 @@ mod tests {
                 half_rate_hz: None,
                 quarter_rate_hz: None,
                 pre_divider: 1,
+                ext_record: false,
             },
         )
         .unwrap();
@@ -744,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn u3_pre_divider_is_stored_in_the_low_half() {
+    fn u3_pre_divider_stage_sits_in_the_high_half() {
         let config = SessionConfig {
             sample_rate_hz: 1_000_000,
             duration_ms: 1,
@@ -756,16 +773,47 @@ mod tests {
             true,
             1,
             &HostClock {
-                hw_max_hz: 1_000_000_000,
-                half_rate_hz: None,
-                quarter_rate_hz: None,
+                hw_max_hz: 500_000_000,
+                half_rate_hz: Some(500_000_000),
+                quarter_rate_hz: Some(1_000_000_000),
                 pre_divider: 5,
+                ext_record: true,
             },
         )
         .unwrap();
         let armed = decode_arm(&bytes).unwrap();
-        assert_eq!(armed.divider, 200);
-        assert_eq!(armed.divider >> 16, 0);
+        assert_eq!(armed.divider & 0xffff, 100);
+        assert_eq!(armed.divider >> 16, 0x0400);
+        assert!(armed.mode.contains(ModeFlags::SLOW_ACQUISITION));
+        assert!(armed.upper.is_some());
+    }
+
+    #[test]
+    fn a_wide_u3_megahertz_capture_is_not_the_slow_bit() {
+        let config = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 100,
+            ..SessionConfig::default()
+        };
+        let bytes = build_arm(
+            &config,
+            64_000,
+            false,
+            u32::MAX,
+            &HostClock {
+                hw_max_hz: 500_000_000,
+                half_rate_hz: Some(500_000_000),
+                quarter_rate_hz: Some(1_000_000_000),
+                pre_divider: 5,
+                ext_record: true,
+            },
+        )
+        .unwrap();
+        let armed = decode_arm(&bytes).unwrap();
+        assert_eq!(armed.divider, 100 | (0x0400 << 16));
+        assert!(!armed.mode.contains(ModeFlags::SLOW_ACQUISITION));
+        assert!(!armed.mode.contains(ModeFlags::HALF_RATE));
+        assert!(armed.upper.is_some());
     }
 
     #[test]

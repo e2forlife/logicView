@@ -161,18 +161,21 @@ fn plugged_in_pods_are_listed_before_demo_devices() {
             name: "Demo".into(),
             kind: "demo".into(),
             connected: true,
+            super_speed: false,
         },
         DeviceInfo {
             id: "usb:2a0e:0020".into(),
             name: "DSLogic Plus".into(),
             kind: "usb".into(),
             connected: true,
+            super_speed: false,
         },
         DeviceInfo {
             id: "demo:spi".into(),
             name: "Demo SPI".into(),
             kind: "demo".into(),
             connected: true,
+            super_speed: false,
         },
     ]);
     assert_eq!(
@@ -562,6 +565,8 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
     assert_eq!(plus.buffer_rates[0].max_hz, 400_000_000);
     assert_eq!(wide.buffer_rates.last().unwrap().max_channels, 32);
     assert_eq!(wide.stream_rates.last().unwrap().max_hz, 10_000_000);
+    assert_eq!(wide.super_stream_rates.last().unwrap().max_hz, 50_000_000);
+    assert_eq!(wide.super_stream_rates[0].max_hz, 1_000_000_000);
 }
 
 #[tokio::test]

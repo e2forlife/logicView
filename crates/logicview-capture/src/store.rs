@@ -309,9 +309,8 @@ impl LogicStore {
         let mut flips = 0u64;
         let mut start = len;
         while index > 0 {
-            let flipped = (0..width).all(|channel| {
-                self.level(channel, index) != self.level(channel, index - 1)
-            });
+            let flipped = (0..width)
+                .all(|channel| self.level(channel, index) != self.level(channel, index - 1));
             if !flipped {
                 break;
             }
@@ -588,7 +587,12 @@ mod tests {
         assert!(span.toggled);
     }
 
-    fn push_levels(store: &mut LogicStore, channel: usize, samples: u64, high: impl Fn(u64) -> bool) {
+    fn push_levels(
+        store: &mut LogicStore,
+        channel: usize,
+        samples: u64,
+        high: impl Fn(u64) -> bool,
+    ) {
         let mut bytes = vec![0u8; (samples / 8) as usize];
         for sample in 0..samples {
             if high(sample) {
@@ -619,7 +623,8 @@ mod tests {
 
         let end = store.tile(1, (signal - 32) as f64, 32, 1.0).unwrap();
         assert!(
-            end.iter().all(|column| column.valid && !column.toggled && !column.last),
+            end.iter()
+                .all(|column| column.valid && !column.toggled && !column.last),
             "the last samples must be the stored low signal, not the fill"
         );
         let clock = store.tile(0, (signal - 32) as f64, 32, 1.0).unwrap();

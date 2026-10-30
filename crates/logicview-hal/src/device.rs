@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Out, Recipient};
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
 use nusb::{MaybeFuture, Speed};
 
 use crate::profile::{
@@ -42,6 +42,7 @@ const BIT_WORDWIDE: u8 = 1;
 const HDL_ADDR: u16 = 0x04;
 const VTH_ADDR: u16 = 0x78;
 const CTR0_ADDR: u16 = 0x70;
+const ADCC_ADDR: u16 = 0x48;
 const FORCE_RDY: u8 = 1 << 1;
 const FORCE_STOP: u8 = 1 << 2;
 
@@ -57,6 +58,8 @@ pub struct ListedPod {
     pub id: String,
     pub name: String,
     pub product_id: u16,
+    /// The bus enumerated this pod at SuperSpeed or SuperSpeedPlus.
+    pub super_speed: bool,
 }
 
 /// A plugged-in high-speed Plus is vendor `0x2A0E` product `0x0020`.
@@ -122,7 +125,21 @@ pub(crate) fn describe_listed(
         id: format!("usb:{vendor_id:04x}:{product_id:04x}"),
         name,
         product_id,
+        super_speed: matches!(speed, Some(Speed::Super | Speed::SuperPlus)),
     })
+}
+
+/// The bulk-write length covers the first record. A 32-channel capture then
+/// sends the second record as its own transfer.
+fn split_arm_image(image: &[u8]) -> (&[u8], Option<&[u8]>) {
+    const SYNC: [u8; 4] = u32::to_le_bytes(logicview_proto::OPEN_SYNC);
+    if image.len() > 8 {
+        if let Some(pos) = image[4..].windows(4).position(|window| window == SYNC) {
+            let at = pos + 4;
+            return (&image[..at], Some(&image[at..]));
+        }
+    }
+    (image, None)
 }
 
 fn speed_label(speed: Option<Speed>) -> &'static str {
@@ -188,6 +205,8 @@ impl Pod {
             });
         }
         pod.ensure_fpga()?;
+        pod.init_sample_clock()?;
+        let _ = pod.clear_control();
         Ok(pod)
     }
 
@@ -240,13 +259,21 @@ impl Pod {
         self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_RDY])
     }
 
+    /// Clear the force-ready and force-stop bits before an arm.
+    pub(crate) fn clear_control(&self) -> Result<(), HalError> {
+        self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[0])
+    }
+
     pub(crate) fn force_stop(&self) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_STOP])
     }
 
     pub(crate) fn arm_image(&self, image: &[u8]) -> Result<(), HalError> {
-        self.write(DEST_WORDWIDE, &[BIT_WORDWIDE])?;
-        let words = (image.len() / 2) as u32;
+        if !self.link_is_super() {
+            self.write(DEST_WORDWIDE, &[BIT_WORDWIDE])?;
+        }
+        let (primary, extra) = split_arm_image(image);
+        let words = (primary.len() / 2) as u32;
         let len = words.to_le_bytes();
         self.write(DEST_BULK, &len[..3])?;
         let start = Instant::now();
@@ -260,7 +287,10 @@ impl Pod {
                 ));
             }
         }
-        self.bulk_out(image)?;
+        self.bulk_out(primary)?;
+        if let Some(extra) = extra {
+            self.bulk_out(extra)?;
+        }
         self.write(DEST_INTRDY, &[BIT_INTRDY])?;
         self.wait_status(BIT_GPIF, Duration::from_millis(500))?;
         self.write(DEST_INTRDY, &[!BIT_INTRDY])?;
@@ -279,8 +309,49 @@ impl Pod {
         &self.interface
     }
 
+    /// Bulk IN max packet. High speed is 512. Super speed is 1024. A read
+    /// shorter than this packet is rejected by the host stack.
+    pub(crate) fn bulk_in_packet(&self) -> usize {
+        const FALLBACK: usize = 512;
+        for descriptor in self.interface.descriptors() {
+            for endpoint in descriptor.endpoints() {
+                if endpoint.address() == 0x86 {
+                    let size = endpoint.max_packet_size();
+                    if size >= FALLBACK {
+                        return size;
+                    }
+                }
+            }
+        }
+        FALLBACK
+    }
+
+    /// Reset the bulk pipes. A timed-out capture can leave an endpoint halted,
+    /// and later reads then sit until the host gives up.
+    pub(crate) fn clear_pipes(&self) -> Result<(), HalError> {
+        let mut incoming = self
+            .interface
+            .endpoint::<Bulk, In>(0x86)
+            .map_err(|err| HalError::Usb(err.to_string()))?;
+        incoming
+            .clear_halt()
+            .wait()
+            .map_err(|err| HalError::Usb(err.to_string()))?;
+        let mut outgoing = self
+            .interface
+            .endpoint::<Bulk, Out>(EP_OUT)
+            .map_err(|err| HalError::Usb(err.to_string()))?;
+        outgoing
+            .clear_halt()
+            .wait()
+            .map_err(|err| HalError::Usb(err.to_string()))?;
+        Ok(())
+    }
+
     /// Program the FPGA from the bitstream on disk even when DONE is already set.
     pub fn reload_fpga(&self) -> Result<(), HalError> {
+        let _ = self.force_ready();
+        let _ = self.stop();
         self.load_bitstream()?;
         let status = self.status()?;
         if status & BIT_DONE == 0 {
@@ -288,7 +359,8 @@ impl Pod {
                 "FPGA DONE stayed clear after configuration ({status:#04x})"
             )));
         }
-        self.accept_hdl()
+        self.accept_hdl()?;
+        self.init_sample_clock()
     }
 
     fn ensure_fpga(&self) -> Result<(), HalError> {
@@ -382,6 +454,34 @@ impl Pod {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    pub fn link_is_super(&self) -> bool {
+        matches!(self.speed, Some(Speed::Super | Speed::SuperPlus))
+    }
+
+    /// Program the 500 MHz sample clock on a U3Pro32. The Plus has no synthesizer
+    /// on this path. The last group waits 10 ms so the clock can lock.
+    fn init_sample_clock(&self) -> Result<(), HalError> {
+        if self.product_id != U3PRO32_PID {
+            return Ok(());
+        }
+        self.write_reg(ADCC_ADDR + 2, 0x01)?;
+        for byte in [0x01, 0x61, 0x00, 0x30] {
+            self.write_reg(ADCC_ADDR, byte)?;
+        }
+        for byte in [0x01, 0x40, 0xF1, 0x46] {
+            self.write_reg(ADCC_ADDR, byte)?;
+        }
+        thread::sleep(Duration::from_millis(10));
+        for byte in [0x01, 0x62, 0x3D, 0x40] {
+            self.write_reg(ADCC_ADDR, byte)?;
+        }
+        Ok(())
+    }
+
+    fn write_reg(&self, addr: u16, value: u8) -> Result<(), HalError> {
+        self.write_at(DEST_REG_WRITE, addr, &[value])
     }
 
     fn bulk_out(&self, data: &[u8]) -> Result<(), HalError> {
@@ -551,6 +651,8 @@ mod tests {
         let wide = describe_listed(0x2A0E, 0x002C, Some(Speed::Super), None).unwrap();
         assert_eq!(wide.id, "usb:2a0e:002c");
         assert!(wide.name.starts_with("DSLogic U3Pro32 · USB 3 · 2a0e:002c"));
+        assert!(wide.super_speed);
+        assert!(!plus.super_speed);
         assert!(describe_listed(0x1234, 0x0020, None, None).is_none());
     }
 

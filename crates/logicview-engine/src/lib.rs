@@ -77,6 +77,9 @@ pub struct ProfileInfo {
     /// Inclusive channel ceilings. Enabling more channels moves to a lower band.
     pub buffer_rates: Vec<RateBandInfo>,
     pub stream_rates: Vec<RateBandInfo>,
+    /// Stream ceilings when the bound U3Pro32 enumerated at SuperSpeed.
+    /// High-speed links keep [`Self::stream_rates`].
+    pub super_stream_rates: Vec<RateBandInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,6 +88,8 @@ pub struct DeviceInfo {
     pub name: String,
     pub kind: String,
     pub connected: bool,
+    /// The USB link enumerated at SuperSpeed. Demo and file devices stay false.
+    pub super_speed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -181,6 +186,7 @@ pub(crate) struct BoundDevice {
     id: String,
     name: String,
     kind: String,
+    super_speed: bool,
 }
 
 #[derive(Clone)]
@@ -286,8 +292,9 @@ impl Engine {
                 channels: profile.channels,
                 hardware_tested: profile.hardware_tested,
                 note: profile.note.to_string(),
-                buffer_rates: rate_bands(profile.product_id, false),
-                stream_rates: rate_bands(profile.product_id, true),
+                buffer_rates: rate_bands(profile.product_id, false, false),
+                stream_rates: rate_bands(profile.product_id, true, false),
+                super_stream_rates: rate_bands(profile.product_id, true, true),
             })
             .collect()
     }
@@ -305,6 +312,7 @@ impl Engine {
                         name: pod.name,
                         kind: "usb".into(),
                         connected: true,
+                        super_speed: pod.super_speed,
                     });
                 }
             }
@@ -335,6 +343,7 @@ impl Engine {
             }
             let pod = logicview_hal::Pod::open_product(Some(pid))
                 .map_err(|err| EngineError::Device(err.to_string()))?;
+            let super_speed = pod.link_is_super();
             let info = DeviceInfo {
                 id: id.into(),
                 name: format!(
@@ -347,6 +356,7 @@ impl Engine {
                 ),
                 kind: "usb".into(),
                 connected: true,
+                super_speed,
             };
             drop(pod);
             {
@@ -358,7 +368,8 @@ impl Engine {
             } else {
                 (1u32 << profile.channels) - 1
             };
-            self.use_pod_channels(mask, id, profile.name).await;
+            self.use_pod_channels(mask, id, profile.name, super_speed)
+                .await;
             return Ok(info);
         }
         Err(EngineError::UnknownDevice(format!(
@@ -765,19 +776,21 @@ impl Engine {
                 config.channel_enable
             };
             let clock = if pid == logicview_hal::U3PRO32_PID {
-                let planned = logicview_hal::plan_u3_clock(
+                let planned = logicview_hal::plan_u3_link(
                     config.sample_rate_hz,
                     mask,
                     config.depth == DepthMode::Stream,
+                    bound_link_is_super(&slot_ref.devices),
                 )
                 .map_err(|err| {
                     EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
                 })?;
                 HostClock {
                     hw_max_hz: planned.hw_max_hz,
-                    half_rate_hz: None,
-                    quarter_rate_hz: None,
+                    half_rate_hz: Some(planned.half_rate_hz),
+                    quarter_rate_hz: Some(planned.quarter_rate_hz),
                     pre_divider: planned.pre_divider,
+                    ext_record: true,
                 }
             } else {
                 logicview_hal::plan_clock(
@@ -793,6 +806,7 @@ impl Engine {
                     half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
                     quarter_rate_hz: Some(logicview_hal::QUARTER_RATE_HZ),
                     pre_divider: 1,
+                    ext_record: false,
                 }
             };
             let slot = state.slot_mut(&id)?;
@@ -830,7 +844,7 @@ impl Engine {
                 u64::from(mask.count_ones()),
                 samples,
                 if pid == logicview_hal::U3PRO32_PID {
-                    None
+                    Some(logicview_hal::u3_threshold_code(config.threshold_volts))
                 } else {
                     Some(logicview_hal::threshold_code(config.threshold_volts))
                 },
@@ -1181,6 +1195,7 @@ impl Engine {
             id: "file".into(),
             name: "File".into(),
             kind: "file".into(),
+            super_speed: false,
         }];
         slot.origins = slot
             .channel_names
@@ -1197,7 +1212,13 @@ impl Engine {
         Ok(slot.status(is_active))
     }
 
-    async fn use_pod_channels(&self, mask: u32, device_id: &str, device_name: &str) {
+    async fn use_pod_channels(
+        &self,
+        mask: u32,
+        device_id: &str,
+        device_name: &str,
+        super_speed: bool,
+    ) {
         let mut state = self.shared.state.lock().await;
         let active = state.active;
         if let Some(slot) = state.slots.get_mut(active) {
@@ -1209,6 +1230,7 @@ impl Engine {
                 id: device_id.into(),
                 name: device_name.into(),
                 kind: "usb".into(),
+                super_speed,
             }];
             slot.origins = names
                 .iter()
@@ -1341,6 +1363,7 @@ impl Slot {
                     name: device.name.clone(),
                     kind: device.kind.clone(),
                     connected: true,
+                    super_speed: device.super_speed,
                 })
                 .collect(),
             // A logic pod has no analog input. The demo sine is a synthetic
@@ -1407,11 +1430,12 @@ fn demo_device_info(id: &str) -> DeviceInfo {
             .unwrap_or_else(|| id.to_string()),
         kind: "demo".into(),
         connected: true,
+        super_speed: false,
     }
 }
 
-fn rate_bands(product_id: u16, stream: bool) -> Vec<RateBandInfo> {
-    logicview_hal::rate_limits(product_id, stream)
+fn rate_bands(product_id: u16, stream: bool, super_speed: bool) -> Vec<RateBandInfo> {
+    logicview_hal::link_rate_limits(product_id, stream, super_speed)
         .iter()
         .map(|band| RateBandInfo {
             max_channels: band.max_channels,
@@ -1439,6 +1463,10 @@ fn enabled_channel_count(mask: u32, probes: usize) -> u32 {
     bits.count_ones().max(1)
 }
 
+fn bound_link_is_super(devices: &[BoundDevice]) -> bool {
+    devices.iter().any(|device| device.super_speed)
+}
+
 fn rate_product(devices: &[BoundDevice]) -> u16 {
     devices
         .iter()
@@ -1453,7 +1481,11 @@ fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     let channels = enabled_channel_count(config.channel_enable, probe_count(slot));
     let stream = config.depth == DepthMode::Stream;
     let max = logicview_hal::max_sample_hz(
-        logicview_hal::rate_limits(rate_product(&slot.devices), stream),
+        logicview_hal::link_rate_limits(
+            rate_product(&slot.devices),
+            stream,
+            bound_link_is_super(&slot.devices),
+        ),
         channels,
     );
     if config.sample_rate_hz > max {
@@ -1501,6 +1533,7 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
             id: pod.id.to_string(),
             name: pod.name.to_string(),
             kind: "demo".into(),
+            super_speed: false,
         });
         for channel in pod.channels {
             names.push(channel.name.to_string());

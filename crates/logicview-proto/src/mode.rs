@@ -41,16 +41,24 @@ impl ModeFlags {
     }
 }
 
-/// Logic divider: `ceil(hw_max_rate / requested)`, then split by `pre_divider`.
+/// Divider word stored in the arm record.
 ///
-/// `pre_divider` is 1 on older modes and 5 on the later USB 3 / "3DN2" modes.
-/// The value returned is the post-divider stored in the arm record.
+/// `total` is `ceil(hw_max_rate / requested)`. The high half is
+/// `(min(total, pre_divider) - 1) << 8`, plus any bits of the post-divider
+/// above 16. The low half is `ceil(total / pre_divider)`. `pre_divider` is 1
+/// on the Plus modes and 5 on the later USB 3 modes. A pre-divider of 1 leaves
+/// the high half at 0, so the word is the low half alone.
 pub fn logic_divider(hw_max_rate: u64, requested: u64, pre_divider: u64) -> u32 {
     if requested == 0 || pre_divider == 0 || hw_max_rate == 0 {
         return 1;
     }
     let total = hw_max_rate.div_ceil(requested).max(1);
-    total.div_ceil(pre_divider).max(1) as u32
+    let pre = pre_divider.max(1);
+    let stage = if total >= pre { pre - 1 } else { total - 1 };
+    let post = u32::try_from(total.div_ceil(pre).max(1)).unwrap_or(u32::MAX);
+    let div_l = post & 0xffff;
+    let div_h = (((stage as u32) << 8) + (post >> 16)) & 0xffff;
+    div_l | (div_h << 16)
 }
 
 #[cfg(test)]
@@ -80,8 +88,17 @@ mod tests {
     #[test]
     fn divider_ceils_then_applies_the_pre_divider() {
         assert_eq!(logic_divider(100_000_000, 25_000_000, 1), 4);
-        assert_eq!(logic_divider(400_000_000, 100_000_000, 5), 1);
         assert_eq!(logic_divider(100, 30, 1), 4);
         assert_eq!(logic_divider(100, 0, 1), 1);
+        // 500 MHz clock, pre-divider 5, 1 MHz: low half 100, high half (5-1)<<8.
+        assert_eq!(
+            logic_divider(500_000_000, 1_000_000, 5),
+            100 | (0x0400 << 16)
+        );
+        // The ratio is below the pre-divider, so the high half is (ratio-1)<<8.
+        assert_eq!(
+            logic_divider(400_000_000, 100_000_000, 5),
+            1 | (0x0300 << 16)
+        );
     }
 }

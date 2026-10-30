@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use logicview_proto::{
     actual_payload_bytes, actual_sample_count, parse_logic_header, LogicHeader, ProtoError,
-    LOGIC_HEADER_LEN, LOGIC_HEADER_TRANSFER,
+    LOGIC_HEADER_LEN,
 };
 use nusb::transfer::{Buffer, Bulk, In};
 
@@ -14,6 +14,8 @@ use crate::device::Pod;
 use crate::HalError;
 
 const EP_IN: u8 = 0x86;
+
+const PIPE_DEPTH: usize = 32;
 
 pub struct CaptureJob {
     pub image: Vec<u8>,
@@ -83,12 +85,13 @@ pub fn run_capture(
     let _ = pod.stop();
     pod.arm_image(&job.image)?;
 
+    let bulk = pod.bulk_in_packet();
     let mut ep = pod
         .interface()
         .endpoint::<Bulk, In>(EP_IN)
         .map_err(|err| HalError::Usb(err.to_string()))?;
-    for _ in 0..4 {
-        ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
+    for _ in 0..PIPE_DEPTH {
+        ep.submit(Buffer::new(bulk));
     }
     pod.start()?;
 
@@ -155,91 +158,105 @@ pub fn run_capture(
 
         match ep.wait_next_complete(Duration::from_millis(100)) {
             Some(done) if done.status.is_ok() && done.actual_len > 0 => {
-                if header.is_none() {
-                    if done.actual_len < LOGIC_HEADER_LEN {
-                        failed = Some(HalError::Interrupted(format!(
-                            "header transfer was {} bytes",
-                            done.actual_len
-                        )));
-                        break;
-                    }
-                    if done.buffer[..LOGIC_HEADER_LEN]
-                        .iter()
-                        .skip(4)
-                        .all(|byte| *byte == 0x55)
-                    {
-                        filler += 1;
-                        if filler > 8 {
-                            failed = Some(HalError::Interrupted("header fill stayed 0x55".into()));
+                let received = done.actual_len;
+                let data = done.buffer[..received].to_vec();
+                let mut offset = 0;
+                let mut stop = false;
+                while offset < data.len() && failed.is_none() && !stop {
+                    let end = (offset + bulk).min(data.len());
+                    let packet = &data[offset..end];
+                    let packet_short = packet.len() < bulk;
+                    offset = end;
+                    if header.is_none() {
+                        if packet.len() < LOGIC_HEADER_LEN {
+                            failed = Some(HalError::Interrupted(format!(
+                                "header transfer was {} bytes",
+                                packet.len()
+                            )));
                             break;
                         }
-                        if ep.pending() < 4 {
-                            ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
+                        if packet[..LOGIC_HEADER_LEN]
+                            .iter()
+                            .skip(4)
+                            .all(|byte| *byte == 0x55)
+                        {
+                            filler += 1;
+                            if filler > 8 {
+                                failed =
+                                    Some(HalError::Interrupted("header fill stayed 0x55".into()));
+                            }
+                            continue;
+                        }
+                        match parse_logic_header(&packet[..LOGIC_HEADER_LEN]) {
+                            Ok(parsed) => {
+                                expected_bytes = budget_bytes(job, &parsed);
+                                header = Some(parsed);
+                                if let Err(err) = emit(CaptureEvent::Header(parsed)) {
+                                    failed = Some(err);
+                                    break;
+                                }
+                                deadline = std::time::Instant::now() + Duration::from_secs(2);
+                            }
+                            Err(err) => {
+                                let preview = packet
+                                    .iter()
+                                    .take(32)
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                failed = Some(match err {
+                                    ProtoError::BadCheckWord(word) => HalError::Message(format!(
+                                        "logic header check word was {word:#010x} in {preview}"
+                                    )),
+                                    other => HalError::Message(format!(
+                                        "{other} in {preview}"
+                                    )),
+                                });
+                                break;
+                            }
                         }
                         continue;
                     }
-                    match parse_logic_header(&done.buffer[..LOGIC_HEADER_LEN]) {
-                        Ok(parsed) => {
-                            expected_bytes = budget_bytes(job, &parsed);
-                            header = Some(parsed);
-                            if let Err(err) = emit(CaptureEvent::Header(parsed)) {
-                                failed = Some(err);
-                                break;
-                            }
-                            deadline = std::time::Instant::now() + Duration::from_secs(2);
-                        }
-                        Err(err) => {
-                            failed = Some(match err {
-                                ProtoError::BadCheckWord(word) => HalError::BadCheckWord(word),
-                                other => HalError::Message(other.to_string()),
-                            });
-                            break;
-                        }
-                    }
-                    if ep.pending() < 4 {
-                        ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
-                    }
-                    continue;
-                }
 
-                let budget = read_budget(job, expected_bytes, limit_after_stop);
-                let packet = &done.buffer[..done.actual_len];
-                let payload = take_after_leader(&mut leader, packet);
-                if payload.is_empty() {
-                    if done.actual_len >= LOGIC_HEADER_TRANSFER && ep.pending() < 4 {
-                        ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
+                    let budget = read_budget(job, expected_bytes, limit_after_stop);
+                    let payload = take_after_leader(&mut leader, packet);
+                    if payload.is_empty() {
+                        deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        continue;
                     }
-                    deadline = std::time::Instant::now() + Duration::from_secs(2);
-                    continue;
-                }
-                let room = budget.saturating_sub(kept);
-                if room == 0 {
-                    break;
-                }
-                let take = payload.len().min(room as usize);
-                pending.extend_from_slice(&payload[..take]);
-                kept += take as u64;
-                let whole = pending.len() / atom * atom;
-                if whole > 0 {
-                    let chunk = pending[..whole].to_vec();
-                    if let Err(err) = emit(CaptureEvent::Samples(chunk)) {
-                        failed = Some(err);
+                    let room = budget.saturating_sub(kept);
+                    if room == 0 {
+                        stop = true;
                         break;
                     }
-                    pending.drain(..whole);
+                    let take_n = payload.len().min(room as usize);
+                    pending.extend_from_slice(&payload[..take_n]);
+                    kept += take_n as u64;
+                    let whole = pending.len() / atom * atom;
+                    if whole > 0 {
+                        let chunk = pending[..whole].to_vec();
+                        if let Err(err) = emit(CaptureEvent::Samples(chunk)) {
+                            failed = Some(err);
+                            break;
+                        }
+                        pending.drain(..whole);
+                    }
+                    deadline = std::time::Instant::now()
+                        + if forced {
+                            Duration::from_millis(500)
+                        } else {
+                            Duration::from_secs(2)
+                        };
+                    if packet_short || kept >= budget {
+                        stop = true;
+                    }
                 }
-                let short = done.actual_len < LOGIC_HEADER_TRANSFER;
-                if !short && kept < budget && ep.pending() < 4 {
-                    ep.submit(Buffer::new(LOGIC_HEADER_TRANSFER));
-                }
-                deadline = std::time::Instant::now()
-                    + if forced {
-                        Duration::from_millis(500)
-                    } else {
-                        Duration::from_secs(2)
-                    };
-                if short || kept >= budget {
+                if failed.is_some() || stop {
                     break;
+                }
+                let budget = read_budget(job, expected_bytes, limit_after_stop);
+                if received == bulk && kept < budget && ep.pending() < PIPE_DEPTH {
+                    ep.submit(Buffer::new(bulk));
                 }
             }
             Some(done) if done.status.is_ok() => {
@@ -269,7 +286,9 @@ pub fn run_capture(
         }
     }
 
+    let _ = pod.force_ready();
     let _ = pod.stop();
+    let _ = pod.clear_pipes();
     cancel(&mut ep);
     let hw_status = pod.status().unwrap_or(0);
     if let Some(err) = failed {
@@ -328,6 +347,7 @@ mod hw {
     use std::time::Duration;
 
     use logicview_proto::{capture_length_warning, encode_arm, ArmConfig, ModeFlags};
+    use nusb::MaybeFuture;
 
     use super::*;
 
@@ -482,6 +502,86 @@ mod hw {
     }
 
     #[test]
+    #[ignore = "needs the plugged-in DSLogic U3Pro32"]
+    fn u3pro32_reports_link_speed() {
+        let _pod = pod_lock();
+        let info = nusb::list_devices()
+            .wait()
+            .expect("bus")
+            .find(|dev| dev.vendor_id() == 0x2A0E && dev.product_id() == crate::U3PRO32_PID)
+            .expect("u3 on the bus");
+        let device = info.open().wait().expect("open descriptor");
+        eprintln!(
+            "bcdUSB {:04x} open speed {:?}",
+            device.device_descriptor().usb_version(),
+            device.speed()
+        );
+        if let Ok(config) = device.active_configuration() {
+            for iface in config.interfaces() {
+                for alt in iface.alt_settings() {
+                    for endpoint in alt.endpoints() {
+                        eprintln!(
+                            "cfg ep {:02x} mps {}",
+                            endpoint.address(),
+                            endpoint.max_packet_size()
+                        );
+                    }
+                }
+            }
+        }
+        drop(device);
+        let pod = Pod::open_product(Some(crate::U3PRO32_PID)).expect("open");
+        eprintln!("open speed {:?}", pod.speed());
+        for iface in pod.interface().descriptors() {
+            for endpoint in iface.endpoints() {
+                eprintln!(
+                    "ep {:02x} type {:?} mps {} burst {}",
+                    endpoint.address(),
+                    endpoint.transfer_type(),
+                    endpoint.max_packet_size(),
+                    endpoint.packets_per_microframe()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in super-speed DSLogic U3Pro32"]
+    fn u3pro32_super_internal_pattern_follows_the_header() {
+        let _pod = pod_lock();
+        {
+            let pod = Pod::open_product(Some(crate::U3PRO32_PID)).expect("open");
+            assert_eq!(pod.speed(), Some(nusb::Speed::Super), "link speed");
+            assert_eq!(pod.bulk_in_packet(), 1024, "super-speed bulk packet");
+            eprintln!(
+                "super leader {} packet {}",
+                pod.sample_leader(),
+                pod.bulk_in_packet()
+            );
+        }
+
+        let mut bytes = Vec::new();
+        let report = run_capture(&u3_job(8192), |event| {
+            if let CaptureEvent::Samples(chunk) = event {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(())
+        })
+        .expect("internal-test capture");
+        eprintln!(
+            "super internal {} bytes: {}",
+            bytes.len(),
+            pattern(&bytes)
+        );
+        if bytes.len() >= 16 {
+            eprintln!("first {:02x?}", &bytes[..16]);
+        }
+        assert_eq!(report.header.unwrap().check_word, 0x5555_5555);
+        assert_eq!(bytes.len(), 1024, "8192 samples on one channel is 1024 bytes");
+        assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
+    }
+
+    #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
     fn u3pro32_short_buffer_returns_check_word_and_samples() {
         let _pod = pod_lock();
@@ -525,11 +625,333 @@ mod hw {
         assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
     }
 
+    #[test]
+    #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+    fn u3pro32_one_megahertz_buffer_returns_a_header() {
+        let _pod = pod_lock();
+        // The UI default: 1 MHz, every channel, trigger off. Divider 50
+        // produced no header within 12 s. The planner's divider must return.
+        let clock = crate::plan_u3_clock(1_000_000, u32::MAX, false).unwrap();
+        let divider =
+            logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
+        assert_eq!(divider & 0xffff, 100, "1 MHz low half");
+        assert_eq!(divider >> 16, 0x0400, "pre-divider stage");
+
+        let mut job = armed(2_000_000, 0, divider);
+        job.product_id = Some(crate::U3PRO32_PID);
+        job.threshold = Some(crate::u3_threshold_code(1.6));
+        job.enabled_channels = 32;
+        job.header_wait = Duration::from_secs(6);
+        let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
+        decoded.divider = divider;
+        decoded.mode = ModeFlags(0);
+        decoded.channel_count = 32;
+        decoded.channel_enable = u32::MAX;
+        decoded.upper = Some([logicview_proto::UpperStage::default(); 16]);
+        job.image = logicview_proto::encode_arm(&decoded).unwrap();
+
+        let started = std::time::Instant::now();
+        let report = run_capture(&job, |_| Ok(())).expect("32-channel 1 MHz buffer");
+        let elapsed = started.elapsed();
+        eprintln!("32ch 1 MHz buffer took {elapsed:?}");
+        assert!(report.header.is_some(), "header arrived");
+        assert!(report.sample_bytes > 0, "samples arrived in {elapsed:?}");
+        assert!(
+            elapsed > Duration::from_millis(1200) && elapsed < Duration::from_secs(6),
+            "2e6 samples at 1 MHz took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+    fn u3pro32_one_megahertz_stream_returns_a_header() {
+        let _pod = pod_lock();
+        let clock = crate::plan_u3_clock(1_000_000, u32::MAX, true).unwrap();
+        let divider =
+            logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
+        let mut job = armed(65_536, ModeFlags::STREAM, divider);
+        job.product_id = Some(crate::U3PRO32_PID);
+        job.threshold = Some(crate::u3_threshold_code(1.6));
+        job.enabled_channels = 32;
+        job.header_wait = Duration::from_secs(3);
+        let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
+        decoded.divider = divider;
+        decoded.mode = ModeFlags(ModeFlags::STREAM);
+        decoded.channel_count = 32;
+        decoded.channel_enable = u32::MAX;
+        decoded.upper = Some([logicview_proto::UpperStage::default(); 16]);
+        job.image = logicview_proto::encode_arm(&decoded).unwrap();
+
+        let started = std::time::Instant::now();
+        let report = run_capture(&job, |_| Ok(())).expect("32-channel 1 MHz stream");
+        eprintln!("32ch 1 MHz stream took {:?}", started.elapsed());
+        assert!(report.header.is_some(), "stream header arrived");
+        assert!(report.sample_bytes > 0, "stream samples arrived");
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+    fn u3pro32_buffer_rates_scale_with_the_divider() {
+        let _pod = pod_lock();
+        // 2e6 samples at 1 MHz takes about 2.4 s. Faster rates have to finish
+        // inside that window. A miss clears the bulk pipe on the next open.
+        let mut failed = Vec::new();
+        for (rate, channels, mode, samples) in [
+            (10_000_000, 32, 0, 2_000_000),
+            (100_000_000, 32, 0, 262_144),
+            (250_000_000, 32, 0, 65_536),
+            (250_000_000, 8, 0, 262_144),
+            (500_000_000, 16, ModeFlags::HALF_RATE, 262_144),
+            (1_000_000_000, 8, ModeFlags::QUARTER_RATE, 262_144),
+        ] {
+            match u3_buffer(rate, channels, mode, samples) {
+                Ok(elapsed) => {
+                    eprintln!("{channels}ch {rate} Hz {samples} samples took {elapsed:?}");
+                    if rate == 10_000_000 {
+                        assert!(
+                            elapsed < Duration::from_millis(1500),
+                            "10 MHz took {elapsed:?}"
+                        );
+                    }
+                }
+                Err((elapsed, err)) => {
+                    eprintln!("{channels}ch {rate} Hz failed after {elapsed:?}: {err}");
+                    failed.push(rate);
+                }
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "rates that did not return a header: {failed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in super-speed DSLogic U3Pro32"]
+    fn u3pro32_super_stream_ceilings_return_a_header() {
+        let _pod = pod_lock();
+        let mut failed = Vec::new();
+        for (rate, channels, mode) in [
+            (50_000_000, 32, ModeFlags::STREAM),
+            (100_000_000, 30, ModeFlags::STREAM),
+            (250_000_000, 12, ModeFlags::STREAM),
+            (500_000_000, 6, ModeFlags::STREAM | ModeFlags::HALF_RATE),
+            (1_000_000_000, 3, ModeFlags::STREAM | ModeFlags::QUARTER_RATE),
+        ] {
+            match u3_stream(rate, channels, mode, 65_536) {
+                Ok(elapsed) => {
+                    eprintln!("{channels}ch {rate} Hz stream took {elapsed:?}");
+                }
+                Err((elapsed, err)) => {
+                    eprintln!("{channels}ch {rate} Hz stream failed after {elapsed:?}: {err}");
+                    failed.push(rate);
+                }
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "super-speed stream rates that did not return a header: {failed:?}"
+        );
+    }
+
+    fn u3_buffer(
+        rate_hz: u64,
+        channels: u32,
+        extra_mode: u16,
+        samples: u64,
+    ) -> Result<Duration, (Duration, String)> {
+        let mask = if channels >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << channels) - 1
+        };
+        let clock = crate::plan_u3_clock(rate_hz, mask, false).expect("rate");
+        let divider = logicview_proto::logic_divider(clock.hw_max_hz, rate_hz, clock.pre_divider);
+        let mut job = armed(samples, extra_mode, divider);
+        job.product_id = Some(crate::U3PRO32_PID);
+        job.threshold = Some(crate::u3_threshold_code(1.6));
+        job.enabled_channels = u64::from(channels);
+        job.header_wait = Duration::from_secs(3);
+        let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
+        decoded.divider = divider;
+        decoded.mode = ModeFlags(extra_mode);
+        decoded.channel_count = channels as u8;
+        decoded.channel_enable = mask;
+        decoded.upper = Some([logicview_proto::UpperStage::default(); 16]);
+        job.image = logicview_proto::encode_arm(&decoded).unwrap();
+        eprintln!(
+            "arm {channels}ch {rate_hz} Hz divider {:#010x}",
+            divider
+        );
+        let started = std::time::Instant::now();
+        match run_capture(&job, |_| Ok(())) {
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) => Err((
+                started.elapsed(),
+                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+            )),
+            Err(err) => Err((started.elapsed(), err.to_string())),
+        }
+    }
+
+    fn u3_stream(
+        rate_hz: u64,
+        channels: u32,
+        mode: u16,
+        samples: u64,
+    ) -> Result<Duration, (Duration, String)> {
+        let mask = if channels >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << channels) - 1
+        };
+        let divider = logicview_proto::logic_divider(crate::U3_HW_CLOCK_HZ, rate_hz, crate::U3_PRE_DIVIDER);
+        let mut job = armed(samples, mode, divider);
+        job.product_id = Some(crate::U3PRO32_PID);
+        job.threshold = Some(crate::u3_threshold_code(1.6));
+        job.enabled_channels = u64::from(channels);
+        job.header_wait = Duration::from_secs(3);
+        let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
+        decoded.divider = divider;
+        decoded.mode = ModeFlags(mode);
+        decoded.channel_count = channels as u8;
+        decoded.channel_enable = mask;
+        decoded.upper = Some([logicview_proto::UpperStage::default(); 16]);
+        job.image = logicview_proto::encode_arm(&decoded).unwrap();
+        eprintln!("arm {channels}ch {rate_hz} Hz stream divider {divider:#010x} mode {mode:#06x}");
+        let started = std::time::Instant::now();
+        match run_capture(&job, |_| Ok(())) {
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) => Err((
+                started.elapsed(),
+                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+            )),
+            Err(err) => Err((started.elapsed(), err.to_string())),
+        }
+    }
+
     fn u3_job(samples: u64) -> CaptureJob {
         let mut capture = armed(samples, ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST, 200);
         capture.product_id = Some(crate::U3PRO32_PID);
         capture.threshold = None;
         capture
+    }
+
+    #[test]
+    #[ignore = "needs the plugged-in high-speed DSLogic Plus"]
+    fn plus_reference_modes_return_a_header() {
+        let _pod = pod_lock();
+        {
+            let pod = Pod::open_product(Some(crate::PLUS_PID)).expect("open");
+            pod.reload_fpga().expect("fpga reload");
+            assert_eq!(pod.product_id(), crate::PLUS_PID);
+            assert_eq!(pod.speed(), Some(nusb::Speed::High), "Plus link");
+            assert_eq!(pod.bulk_in_packet(), 512, "high-speed bulk packet");
+            assert_eq!(pod.sample_leader(), 0, "Plus has no sample leader");
+            eprintln!(
+                "plus speed {:?} packet {} leader {}",
+                pod.speed(),
+                pod.bulk_in_packet(),
+                pod.sample_leader()
+            );
+        }
+
+        let mut pattern_bytes = Vec::new();
+        let pattern_report = run_capture(
+            &job(4096, ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST, false),
+            |event| {
+                if let CaptureEvent::Samples(chunk) = event {
+                    pattern_bytes.extend_from_slice(&chunk);
+                }
+                Ok(())
+            },
+        )
+        .expect("internal-test capture");
+        assert_eq!(pattern_report.header.unwrap().check_word, 0x5555_5555);
+        assert_eq!(pattern_bytes.len(), 512);
+        assert!(pattern_bytes.iter().all(|byte| *byte == 0xAA));
+
+        let mut failed = Vec::new();
+        for (rate, channels, stream, samples, min_ms, max_ms) in [
+            (1_000_000, 16, false, 1_000_000, 700, 4_000),
+            (100_000_000, 16, false, 65_536, 0, 1_500),
+            (200_000_000, 8, false, 65_536, 0, 1_500),
+            (400_000_000, 4, false, 65_536, 0, 1_500),
+            (20_000_000, 16, true, 65_536, 0, 1_500),
+            (25_000_000, 12, true, 65_536, 0, 1_500),
+            (50_000_000, 6, true, 65_536, 0, 1_500),
+            (100_000_000, 3, true, 65_536, 0, 1_500),
+        ] {
+            let label = format!(
+                "{channels}ch {rate} Hz {}",
+                if stream { "stream" } else { "buffer" }
+            );
+            match plus_mode(rate, channels, stream, samples) {
+                Ok(elapsed) => {
+                    eprintln!("{label} took {elapsed:?}");
+                    let ms = elapsed.as_millis();
+                    if ms < min_ms || ms > max_ms {
+                        eprintln!("{label} outside {min_ms}..{max_ms} ms");
+                        failed.push(label);
+                    }
+                }
+                Err((elapsed, err)) => {
+                    eprintln!("{label} failed after {elapsed:?}: {err}");
+                    failed.push(label);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "Plus modes that missed the reference: {failed:?}");
+    }
+
+    fn plus_mode(
+        rate_hz: u64,
+        channels: u32,
+        stream: bool,
+        samples: u64,
+    ) -> Result<Duration, (Duration, String)> {
+        let mask = (1u32 << channels) - 1;
+        let plan = crate::plan_clock(rate_hz, mask, stream).expect("rate");
+        let divider = logicview_proto::logic_divider(crate::HW_CLOCK_HZ, rate_hz, 1);
+        assert_eq!(plan.divider, divider, "pre-divider 1 keeps the divider in the low half");
+        let mut mode = 0u16;
+        if stream {
+            mode |= ModeFlags::STREAM;
+        }
+        if plan.half {
+            mode |= ModeFlags::HALF_RATE;
+        }
+        if plan.quarter {
+            mode |= ModeFlags::QUARTER_RATE;
+        }
+        let bytes_per_ms = rate_hz.saturating_mul(u64::from(channels)).div_ceil(8_000);
+        if bytes_per_ms < 1024 {
+            mode |= ModeFlags::SLOW_ACQUISITION;
+        }
+        let mut job = armed(samples, mode, divider);
+        job.threshold = Some(crate::threshold_code(1.6));
+        job.enabled_channels = u64::from(channels);
+        job.header_wait = Duration::from_secs(4);
+        let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
+        decoded.divider = divider;
+        decoded.mode = ModeFlags(mode);
+        decoded.channel_count = channels as u8;
+        decoded.channel_enable = mask;
+        decoded.upper = None;
+        job.image = logicview_proto::encode_arm(&decoded).unwrap();
+        eprintln!(
+            "arm {channels}ch {rate_hz} Hz {} divider {divider:#010x} mode {mode:#06x}",
+            if stream { "stream" } else { "buffer" }
+        );
+        let started = std::time::Instant::now();
+        match run_capture(&job, |_| Ok(())) {
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) => Err((
+                started.elapsed(),
+                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+            )),
+            Err(err) => Err((started.elapsed(), err.to_string())),
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ const state = {
   channelGroup: 0,
   tileView: null,
   planned: 0,
+  captureStarted: 0,
   waitKind: "",
   deviceList: [],
   profiles: [],
@@ -1850,6 +1851,7 @@ async function runCapture() {
   paintStatus();
   try {
     view().userNavigated = false;
+    state.captureStarted = performance.now();
     state.planned = Math.floor(settings.rate * settings.duration / 1000);
     state.planned -= state.planned % 64;
     const status = await api({
@@ -2369,7 +2371,12 @@ function activeRateBands() {
     || (state.profiles || []).find((item) => item.product_id === 0x0020);
   const stream = settings.depth === "stream";
   if (profile) {
-    const bands = stream ? profile.stream_rates : profile.buffer_rates;
+    const usb = (state.devices || []).find((device) => String(device.id).startsWith("usb:"));
+    const bands = stream
+      ? (usb && usb.super_speed && profile.super_stream_rates && profile.super_stream_rates.length
+        ? profile.super_stream_rates
+        : profile.stream_rates)
+      : profile.buffer_rates;
     if (bands && bands.length) return bands;
   }
   return stream ? PLUS_STREAM_RATES : PLUS_BUFFER_RATES;
@@ -3419,6 +3426,7 @@ function onEngineEvent(msg) {
     state.phase = "error";
     statusEl.textContent = msg.message;
     renderChrome();
+    paintWait();
     return;
   }
   if (typeof msg.sample_count === "number") {
@@ -4155,7 +4163,11 @@ function paintWait() {
     dialog.className = "wait-dialog sampling";
     text.textContent = "Sampling";
     const circ = 2 * Math.PI * 46;
-    const frac = Math.max(0, Math.min(1, state.total / state.planned));
+    const duration = Math.max(1, state.durationMs || settings.duration) / 1000;
+    const elapsed = state.captureStarted ? (performance.now() - state.captureStarted) / 1000 : 0;
+    const byTime = elapsed / duration;
+    const bySamples = state.planned > 0 ? state.total / state.planned : 0;
+    const frac = Math.max(0, Math.min(1, Math.max(byTime, bySamples)));
     arc.style.strokeDasharray = String(circ);
     arc.style.strokeDashoffset = String(circ * (1 - frac));
     return;

@@ -66,7 +66,7 @@ const PROFILES: &[LogicProfile] = &[
         name: "DSLogic U3Pro32",
         channels: 32,
         hardware_tested: true,
-        note: "High-speed buffer was checked on one U3Pro32. Super-speed was not tested.",
+        note: "High-speed and Super-speed buffer and stream were checked on one U3Pro32.",
     },
     LogicProfile {
         product_id: 0x002D,

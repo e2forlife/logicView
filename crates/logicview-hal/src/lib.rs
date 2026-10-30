@@ -16,10 +16,12 @@ pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
 pub use catalog::{logic_profile, logic_profiles, LogicProfile};
 pub use device::{list_plus, list_pods, matches_plus, supported_product, Pod};
 pub use profile::{
-    max_sample_hz, plan_clock, plan_u3_clock, rate_limits, threshold_code, u3_channel_max_hz,
-    ClockPlan, RateLimit, U3Clock, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
-    HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, U3PRO32_PID, U3_BITSTREAM_NAME,
-    U3_DEVICE_ID, U3_HDL_VERSION, U3_HS_SAMPLE_LEADER, U3_PRE_DIVIDER, VENDOR_ID,
+    link_rate_limits, max_sample_hz, plan_clock, plan_u3_clock, plan_u3_link, rate_limits,
+    threshold_code, u3_channel_max_hz,
+    u3_threshold_code, ClockPlan, RateLimit, U3Clock, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ,
+    HDL_VERSION, HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, U3PRO32_PID,
+    U3_BITSTREAM_NAME, U3_DEVICE_ID, U3_HALF_RATE_HZ, U3_HDL_VERSION, U3_HS_SAMPLE_LEADER,
+    U3_HW_CLOCK_HZ, U3_PRE_DIVIDER, U3_QUARTER_RATE_HZ, VENDOR_ID,
 };
 
 use thiserror::Error;
