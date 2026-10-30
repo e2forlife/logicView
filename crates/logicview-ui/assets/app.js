@@ -220,56 +220,43 @@ function indexesInOrder(indexes, source) {
   return ordered;
 }
 
+function decodeShownAnalog(id) {
+  return decodeFormat(id) === "analog" || !!(state.spiView[id] && state.spiView[id].analog);
+}
+
+function decodeBusRow(decoder, channel) {
+  const analog = decodeShownAnalog(decoder.id);
+  const name = protocolLabel(decoder.protocol);
+  return {
+    key: "decode:" + decoder.id,
+    kind: "decode",
+    channel,
+    name,
+    color: analog ? "#7dcea0" : "#8eb6ff",
+    device: "",
+    decoderId: decoder.id,
+    bus: {
+      id: "decode:" + decoder.id,
+      name,
+      channels: [],
+      analog,
+      decode: decoder.id,
+    },
+  };
+}
+
 function groupRows(decoder, source) {
   const indexes = indexesInOrder(decoderIndexes(decoder), source);
   const channel = indexes.length ? indexes[0] : 0;
-  if (decoderCondensed(decoder.id)) {
-    return [{
-      key: "condense:" + decoder.id,
-      kind: "condense",
-      channel,
-      name: protocolLabel(decoder.protocol),
-      color: "#8eb6ff",
-      device: "",
-      decoderId: decoder.id,
-    }];
-  }
-  const rows = [];
-  if (!overlayEnabled(decoder.id)) {
-    rows.push({
-      key: "lane:" + decoder.id,
-      kind: "lane",
-      channel,
-      name: protocolLabel(decoder.protocol),
-      color: "#8eb6ff",
-      device: "",
-      decoderId: decoder.id,
-    });
-  }
+  const rows = [decodeBusRow(decoder, channel)];
+  if (decoderCondensed(decoder.id)) return rows;
   const byIndex = new Map(state.channels.map((item) => [item.index, item]));
   for (const index of indexes) {
     const signal = byIndex.get(index);
-    if (signal) rows.push(logicRowModel(signal, decoder.id));
-  }
-  if (decoder.protocol === "spi") {
-    if (!state.spiView[decoder.id]) state.spiView[decoder.id] = { analog: false };
-    const analog = state.spiView[decoder.id].analog;
-    rows.push({
-      key: "decode:" + decoder.id,
-      kind: "bus",
-      channel: Number(decoder.channels.mosi ?? channel) || 0,
-      name: "MOSI/MISO",
-      color: analog ? "#7dcea0" : "#d5deea",
-      device: "",
-      decoderId: decoder.id,
-      bus: {
-        id: "decode:" + decoder.id,
-        name: "MOSI/MISO",
-        channels: [],
-        analog,
-        decode: decoder.id,
-      },
-    });
+    if (!signal) continue;
+    const row = logicRowModel(signal, decoder.id);
+    row.child = true;
+    rows.push(row);
   }
   return rows;
 }
@@ -284,7 +271,12 @@ function displayRows() {
       if (anchor >= 0) return;
       if (row.kind === "logic" && indexes.includes(row.channel)) anchor = index;
     });
-    return { id: decoder.id, anchor, rows: groupRows(decoder, source) };
+    return {
+      id: decoder.id,
+      anchor,
+      stackOn: decoder.stack_on || "",
+      rows: groupRows(decoder, source),
+    };
   });
   const claimed = new Set();
   for (const decoder of decoders) {
@@ -292,17 +284,31 @@ function displayRows() {
   }
   const out = [];
   const placed = new Set();
+  const waitingOnParent = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
+  const placeGroup = (group) => {
+    if (placed.has(group.id)) return;
+    out.push(...group.rows);
+    placed.add(group.id);
+    for (const child of groups) {
+      if (!placed.has(child.id) && child.stackOn === group.id) placeGroup(child);
+    }
+  };
   source.forEach((row, index) => {
     for (const group of groups) {
-      if (group.anchor !== index || placed.has(group.id)) continue;
-      out.push(...group.rows);
-      placed.add(group.id);
+      if (group.anchor !== index || placed.has(group.id) || waitingOnParent(group)) continue;
+      placeGroup(group);
     }
     if (row.kind === "logic" && claimed.has(row.channel)) return;
     out.push(row);
   });
+  let guard = groups.length + 1;
+  while (placed.size < groups.length && guard-- > 0) {
+    const next = groups.find((group) => !placed.has(group.id) && !waitingOnParent(group));
+    if (!next) break;
+    placeGroup(next);
+  }
   for (const group of groups) {
-    if (!placed.has(group.id)) out.push(...group.rows);
+    if (!placed.has(group.id)) placeGroup(group);
   }
   return out;
 }
@@ -321,7 +327,7 @@ function channelIsEnabled(index) {
 }
 
 function rowEnabled(row) {
-  if (row.kind === "lane" || row.kind === "condense") return true;
+  if (row.kind === "lane" || row.kind === "condense" || row.kind === "decode") return true;
   if (row.kind === "bus") {
     if (row.bus && row.bus.decode) return true;
     return row.bus.channels.some((index) => channelIsEnabled(index));
@@ -352,8 +358,12 @@ function orderedRows() {
   return displayRows();
 }
 
+function layoutRows() {
+  return orderedRows().filter((row) => rowEnabled(row) && !rowHiddenByDecoder(row));
+}
+
 function visibleRows() {
-  return orderedRows().filter((row) => !state.hidden.has(row.key) && rowEnabled(row) && !rowHiddenByDecoder(row));
+  return layoutRows().filter((row) => !state.hidden.has(row.key));
 }
 
 function triggerOrigin() {
@@ -576,7 +586,7 @@ function startChannelDrag(key, startY) {
 }
 
 function rowMetrics() {
-  const rows = visibleRows();
+  const rows = layoutRows();
   const stage = document.querySelector(".wave-stage");
   const viewport = Math.max(1, stage ? stage.clientHeight : 1);
   const v = view();
@@ -632,27 +642,61 @@ function startRowResize(key, startY) {
   window.addEventListener("pointerup", up);
 }
 
+let foldAnim = null;
+
+function rowFolded(row) {
+  return row.kind === "decode" && decoderCondensed(row.decoderId);
+}
+
+function foldButton(row, folded) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "fold";
+  button.title = folded ? "Show waveform channels" : "Hide waveform channels";
+  button.setAttribute("aria-expanded", folded ? "false" : "true");
+  button.setAttribute("aria-label", button.title);
+  button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>`;
+  const animate = foldAnim === row.decoderId;
+  if (animate) {
+    button.classList.add("anim");
+    if (folded) button.classList.add("open");
+    foldAnim = null;
+  } else if (!folded) {
+    button.classList.add("open");
+  }
+  button.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    foldAnim = row.decoderId;
+    decodePref(row.decoderId).condensed = !folded;
+    state.gutterSig = "";
+    renderGutter();
+    drawWave();
+    scheduleTiles();
+  });
+  if (animate) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        button.classList.toggle("open", !folded);
+      });
+    });
+  }
+  return button;
+}
+
 function renderGutter() {
   const metrics = rowMetrics();
   const selected = view().selected;
-  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (item.row.key === selected ? "s" : "")).join("|");
+  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.key === selected ? "s" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
   for (const item of metrics.layout) {
     const row = item.row;
-    if (row.kind === "lane") {
-      const lane = document.createElement("div");
-      lane.className = "decode-lane";
-      lane.style.height = item.height + "px";
-      lane.style.flex = "none";
-      lane.dataset.key = row.key;
-      lane.textContent = row.name;
-      gutter.appendChild(lane);
-      continue;
-    }
+    const folded = rowFolded(row);
+    const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
-    el.className = "ch" + (row.key === selected ? " selected" : "") + (state.hidden.has(row.key) ? " dim" : "");
+    el.className = "ch" + (row.child ? " child" : "") + (row.key === selected ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
     el.style.height = item.height + "px";
     el.style.flex = "none";
@@ -689,8 +733,9 @@ function renderGutter() {
     const eye = document.createElement("button");
     eye.type = "button";
     eye.className = "eye";
-    eye.title = state.hidden.has(row.key) ? "Show channel" : "Hide channel";
-    eye.innerHTML = eyeIcon(state.hidden.has(row.key));
+    eye.title = dim ? "Show channel" : "Hide channel";
+    eye.setAttribute("aria-pressed", String(!dim));
+    eye.innerHTML = eyeIcon(dim);
     eye.addEventListener("pointerdown", (ev) => ev.stopPropagation());
     eye.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -698,6 +743,7 @@ function renderGutter() {
       else state.hidden.add(row.key);
       state.gutterSig = "";
       renderGutter();
+      drawWave();
       scheduleTiles();
     });
     const handle = document.createElement("div");
@@ -709,12 +755,13 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    el.append(bar, name, kind, eye, handle);
+    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
       startChannelDrag(row.key, ev.clientY);
     });
-    if (row.kind === "bus") {
+    if ((row.kind === "bus" || row.kind === "decode") && row.bus) {
       el.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         openBusMenu(row.bus, ev.clientX, ev.clientY);
@@ -1087,7 +1134,10 @@ function rowHiddenByDecoder(row) {
 }
 
 function rowKindLabel(row) {
-  if (row.kind === "condense") return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
+  if (row.kind === "condense" || row.kind === "decode") {
+    if (row.bus && row.bus.analog) return "Analog";
+    return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
+  }
   if (row.kind === "analog") return "Analog";
   if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
   return "Digital";
@@ -1134,44 +1184,6 @@ function dataLineTargets(decoder) {
   }
   const first = Object.values(channels)[0];
   return [{ channel: first, label: text }];
-}
-
-function traceRoundRect(ctx, x, y, w, h, r) {
-  const radius = Math.max(0, Math.min(r, w / 2, h / 2));
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.arcTo(x + w, y, x + w, y + h, radius);
-  ctx.arcTo(x + w, y + h, x, y + h, radius);
-  ctx.arcTo(x, y + h, x, y, radius);
-  ctx.arcTo(x, y, x + w, y, radius);
-  ctx.closePath();
-}
-
-function drawValueBoxes(ctx, rows, top, bottom, translucent, canvasW) {
-  const height = Math.max(10, bottom - top);
-  let lastLabel = -1;
-  ctx.lineWidth = 1;
-  for (const row of rows) {
-    const x0 = sampleX(row.start_sample);
-    const x1 = Math.max(x0 + 1, sampleX(row.end_sample));
-    if (x1 < 0 || x0 > canvasW) continue;
-    const width = x1 - x0;
-    traceRoundRect(ctx, x0, top, width, height, 4);
-    ctx.fillStyle = translucent ? "rgba(61, 141, 253, 0.34)" : "rgba(61, 141, 253, 0.72)";
-    ctx.fill();
-    ctx.strokeStyle = translucent ? "rgba(198, 220, 255, 0.8)" : "rgba(214, 230, 255, 0.95)";
-    ctx.stroke();
-    const label = annotationLabel(row);
-    if (width < 36 || x0 < lastLabel) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(x0 + 2, top, Math.max(0, width - 4), height);
-    ctx.clip();
-    ctx.fillStyle = "#f4f7fb";
-    ctx.fillText(label, x0 + 6, translucent ? top + 14 : top + height / 2);
-    ctx.restore();
-    lastLabel = x0 + Math.min(width, ctx.measureText(label).width + 12);
-  }
 }
 
 function traceHexagon(ctx, x, y, w, h) {
@@ -1227,18 +1239,12 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
   for (const decoder of state.decoders || []) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
-    if (decoderCondensed(decoder.id)) continue;
-    if (overlayEnabled(decoder.id)) {
-      for (const target of dataLineTargets(decoder)) {
-        const item = logicRow(layout, target.channel, target.decoderId || decoder.id);
-        if (!item) continue;
-        const pad = Math.max(8, item.height * 0.22);
-        drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
-      }
-    } else {
-      const item = layout.find((entry) => entry.row.kind === "lane" && entry.row.decoderId === decoder.id);
+    if (decoderCondensed(decoder.id) || !overlayEnabled(decoder.id)) continue;
+    for (const target of dataLineTargets(decoder)) {
+      const item = logicRow(layout, target.channel, target.decoderId || decoder.id);
       if (!item) continue;
-      drawValueBoxes(ctx, rows, item.top + 3, item.top + item.height - 3, false, canvasW);
+      const pad = Math.max(8, item.height * 0.22);
+      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
     }
   }
   ctx.restore();
@@ -1293,11 +1299,12 @@ function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
 
 function drawCondensedRows(ctx, canvasW, layout) {
   for (const item of layout) {
-    if (item.row.kind !== "condense") continue;
+    if (item.row.kind !== "condense" && item.row.kind !== "decode") continue;
+    if (state.hidden.has(item.row.key)) continue;
     const decoder = (state.decoders || []).find((row) => row.id === item.row.decoderId);
     if (!decoder) continue;
     const rows = valueAnnotations(decoder);
-    const format = decodeFormat(decoder.id);
+    const format = item.row.bus && item.row.bus.analog ? "analog" : decodeFormat(decoder.id);
     const pad = Math.max(8, item.height * 0.22);
     const bandTop = item.top + pad;
     const bandBot = item.top + item.height - pad;
@@ -1882,7 +1889,7 @@ function panelHtml(name) {
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
       <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Overlay draws on the data lines. With overlay off, that decoder’s lane heads only its channels. Hiding those channels leaves only the decoded data. A channel used by two decoders appears in each group.</p>`;
+      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Each decoder is a bus row with its waveform channels underneath. The arrow beside the decoder name folds those channels into the bus, or shows them again. The eye hides that row’s waveform. Overlay draws decoded values on the data lines while the waveforms are visible. A channel used by two decoders appears in each group.</p>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -3448,7 +3455,7 @@ async function snapMarker(marker, clientX, clientY) {
 
 wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
-  if (!row || row.kind !== "bus" || !row.bus) return;
+  if (!row || (row.kind !== "bus" && row.kind !== "decode") || !row.bus) return;
   ev.preventDefault();
   openBusMenu(row.bus, ev.clientX, ev.clientY);
 });
@@ -4166,8 +4173,12 @@ function openBusMenu(bus, x, y) {
   item.textContent = bus.analog ? "Hex view" : "Analog view";
   item.addEventListener("click", () => {
     if (bus.decode) {
+      const analog = !bus.analog;
       if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
-      state.spiView[bus.decode].analog = !state.spiView[bus.decode].analog;
+      state.spiView[bus.decode].analog = analog;
+      const pref = decodePref(bus.decode);
+      if (analog) pref.format = "analog";
+      else if (pref.format === "analog") pref.format = "hex";
     } else {
       bus.analog = !bus.analog;
     }
