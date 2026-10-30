@@ -657,3 +657,33 @@ async fn imported_capture_bytes_replace_the_open_session() {
         edge
     );
 }
+
+/// Exercises the complete buffered capture pipeline on a connected Plus.
+#[tokio::test]
+#[ignore = "needs a connected DSLogic Plus"]
+async fn plus_ten_ms_capture_pipeline() {
+    let engine = Engine::new();
+    engine.connect("usb:2a0e:0020").await.unwrap();
+    engine.configure(None, SessionConfig {
+        sample_rate_hz: 100_000_000,
+        duration_ms: 10,
+        channel_enable: 0x0f,
+        ..SessionConfig::default()
+    }).await.unwrap();
+    let started = std::time::Instant::now();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let status = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
+    eprintln!("engine capture: {:?}, {} samples, phase {}, error {:?}", started.elapsed(), status.sample_count, status.phase, status.error);
+    assert_eq!(status.phase, "stopped");
+    assert_eq!(status.sample_count, 1_000_000);
+    engine.configure(None, SessionConfig {
+        sample_rate_hz: 100_000_000,
+        duration_ms: 50,
+        channel_enable: 0x0f,
+        ..SessionConfig::default()
+    }).await.unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let long = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
+    assert_eq!(long.phase, "stopped", "{:?}", long.error);
+    assert_eq!(long.sample_count, 5_000_000);
+}

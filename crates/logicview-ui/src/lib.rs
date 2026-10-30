@@ -42,6 +42,8 @@ use tokio_stream::StreamExt;
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
+const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
+const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
 
 /// Shares the same engine across all HTTP and WebSocket handlers.
 #[derive(Clone)]
@@ -67,6 +69,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/", get(index))
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
+        .route("/assets/AppLogo.png", get(app_logo))
+        .route("/assets/E2logo.png", get(e2_logo))
         .route("/api/health", get(health))
         .route("/api/command", post(command))
         .route("/api/events", get(events))
@@ -113,6 +117,16 @@ pub async fn serve_listener(
 /// Serves the embedded application shell without browser caching.
 async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML))
+}
+
+/// Serves the embedded splash artwork to the desktop webview.
+async fn app_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], APP_LOGO)
+}
+
+/// Serves the embedded E2 artwork for the About dialog.
+async fn e2_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], E2_LOGO)
 }
 
 /// Serves the embedded styles used by the waveform workspace.
@@ -830,6 +844,10 @@ fn metrics_json(metrics: PulseMetrics) -> Value {
     json!({
         "sample": metrics.sample,
         "level_high": metrics.level_high,
+        "pulse_start": metrics.pulse_start,
+        "pulse_end": metrics.pulse_end,
+        "period_start": metrics.period_start,
+        "period_end": metrics.period_end,
         "pulse_width_samples": metrics.pulse_width_samples,
         "period_samples": metrics.period_samples,
         "high_samples": metrics.high_samples,
@@ -1137,6 +1155,19 @@ mod tests {
             .await
             .unwrap();
         assert!(res.status().is_success());
+        let logo = app.clone()
+            .oneshot(Request::builder().uri("/assets/AppLogo.png").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(logo.status(), StatusCode::OK);
+        assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
+        let logo_bytes = logo.into_body().collect().await.unwrap().to_bytes();
+        assert!(logo_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let e2_logo = app.clone()
+            .oneshot(Request::builder().uri("/assets/E2logo.png").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(e2_logo.status(), StatusCode::OK);
+        assert_eq!(e2_logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(e2_logo.into_body().collect().await.unwrap().to_bytes().starts_with(b"\x89PNG\r\n\x1a\n"));
         let page = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1238,6 +1269,10 @@ mod tests {
         )
         .await;
         assert_eq!(metrics["level_high"], false);
+        assert_eq!(metrics["pulse_start"], 1000);
+        assert_eq!(metrics["pulse_end"], 1050);
+        assert_eq!(metrics["period_start"], 950);
+        assert_eq!(metrics["period_end"], 1050);
         assert_eq!(metrics["pulse_width_samples"], 50);
         assert_eq!(metrics["period_samples"], 100);
         assert_eq!(metrics["frequency_hz"], 10_000.0);

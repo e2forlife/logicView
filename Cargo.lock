@@ -1426,6 +1426,7 @@ dependencies = [
  "logicview-mcp",
  "logicview-ui",
  "rfd",
+ "rightkit-overlay-win",
  "tao",
  "tokio",
  "tracing",
@@ -2276,6 +2277,26 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rightkit-overlay"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d80bdc9880c338f6ddf08a3c7168865ae1499977f238f5f06f51c8ffa506b990"
+dependencies = [
+ "serde",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rightkit-overlay-win"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e557625a8485244eee1d4e2d4f39ef91caae9e800dbb7dbed900d1460100112"
+dependencies = [
+ "rightkit-overlay",
  "windows-sys 0.61.2",
 ]
 

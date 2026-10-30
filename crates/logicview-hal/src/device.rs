@@ -114,16 +114,8 @@ pub(crate) fn describe_listed(
     let profile_name = crate::logic_profile(product_id)
         .map(|profile| profile.name)
         .unwrap_or("DreamSourceLab");
-    let link = speed_label(speed);
-    let extra = product_string
-        .map(str::trim)
-        .filter(|text| !text.is_empty() && *text != profile_name);
-    let name = match extra {
-        Some(text) => {
-            format!("{profile_name} · {link} · {vendor_id:04x}:{product_id:04x} · {text}")
-        }
-        None => format!("{profile_name} · {link} · {vendor_id:04x}:{product_id:04x}"),
-    };
+    let _ = product_string;
+    let name = profile_name.to_string();
     Some(ListedPod {
         id: format!("usb:{vendor_id:04x}:{product_id:04x}"),
         name,
@@ -143,17 +135,6 @@ fn split_arm_image(image: &[u8]) -> (&[u8], Option<&[u8]>) {
         }
     }
     (image, None)
-}
-
-/// Formats the discovered USB link speed for the device drawer.
-fn speed_label(speed: Option<Speed>) -> &'static str {
-    match speed {
-        Some(Speed::High) => "USB 2",
-        Some(Speed::Super | Speed::SuperPlus) => "USB 3",
-        Some(Speed::Full) => "full speed",
-        Some(Speed::Low) => "low speed",
-        _ => "USB",
-    }
 }
 
 impl Pod {
@@ -679,14 +660,11 @@ mod tests {
         .unwrap();
         assert_eq!(plus.id, "usb:2a0e:0020");
         assert_eq!(plus.product_id, 0x0020);
-        assert_eq!(
-            plus.name,
-            "DSLogic Plus · USB 2 · 2a0e:0020 · USB-based DSL Instrument v2"
-        );
+        assert_eq!(plus.name, "DSLogic Plus");
 
         let wide = describe_listed(0x2A0E, 0x002C, Some(Speed::Super), None).unwrap();
         assert_eq!(wide.id, "usb:2a0e:002c");
-        assert!(wide.name.starts_with("DSLogic U3Pro32 · USB 3 · 2a0e:002c"));
+        assert_eq!(wide.name, "DSLogic U3Pro32");
         assert!(wide.super_speed);
         assert!(!plus.super_speed);
         assert!(describe_listed(0x1234, 0x0020, None, None).is_none());

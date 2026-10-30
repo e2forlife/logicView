@@ -19,6 +19,12 @@ pub struct PulseMetrics {
     pub sample: u64,
     /// Whether the measured run is high rather than low.
     pub level_high: bool,
+    /// Inclusive start and exclusive end of the measured run.
+    pub pulse_start: u64,
+    pub pulse_end: u64,
+    /// Rising edges bounding the cycle, when both are available.
+    pub period_start: Option<u64>,
+    pub period_end: Option<u64>,
     /// Length of the current high or low run, in samples.
     pub pulse_width_samples: u64,
     /// Rising-to-rising cycle length when the surrounding cycle is known.
@@ -170,6 +176,10 @@ pub fn measure_pulse(bytes: &[u8], len: u64, sample: u64, rate_hz: u64) -> Optio
     Some(PulseMetrics {
         sample,
         level_high: level,
+        pulse_start: start,
+        pulse_end: end,
+        period_start: if next_rise.is_some() { rise_at } else { None },
+        period_end: next_rise,
         pulse_width_samples: pulse_width,
         period_samples: period,
         high_samples,
@@ -385,6 +395,8 @@ mod tests {
         let bytes = clock_bytes(10_000);
         let high = measure_pulse(&bytes, 10_000, 75, 1_000_000).unwrap();
         assert!(high.level_high);
+        assert_eq!((high.pulse_start, high.pulse_end), (50, 100));
+        assert_eq!((high.period_start, high.period_end), (Some(50), Some(150)));
         assert_eq!(high.pulse_width_samples, 50);
         assert_eq!(high.period_samples, Some(100));
         assert_eq!(high.high_samples, Some(50));
@@ -395,6 +407,8 @@ mod tests {
 
         let low = measure_pulse(&bytes, 10_000, 1000, 1_000_000).unwrap();
         assert!(!low.level_high);
+        assert_eq!((low.pulse_start, low.pulse_end), (1000, 1050));
+        assert_eq!((low.period_start, low.period_end), (Some(950), Some(1050)));
         assert_eq!(low.pulse_width_samples, 50);
         assert_eq!(low.period_samples, Some(100));
         assert_eq!(low.duty, Some(0.5));

@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
@@ -82,6 +83,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     let event_loop = EventLoop::new();
     let mut builder = WindowBuilder::new()
         .with_title("LogicView")
+        .with_visible(false)
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(960.0, 640.0))
         .with_theme(Some(tao::window::Theme::Dark));
@@ -92,12 +94,12 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .build(&event_loop)
         .map_err(|err| format!("could not open the LogicView window: {err}"))?;
 
-    let origin = origin.to_string();
+    let navigation_origin = origin.to_string();
     let builder = WebViewBuilder::new()
         .with_url(start_url)
         .with_background_color((0x0c, 0x10, 0x16, 0xff))
         .with_clipboard(true)
-        .with_navigation_handler(move |url| allows_navigation(&origin, &url));
+        .with_navigation_handler(move |url| allows_navigation(&navigation_origin, &url));
 
     #[cfg(not(target_os = "linux"))]
     let webview = builder
@@ -115,15 +117,81 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             .map_err(|err| format!("could not open the LogicView window: {err}"))?
     };
 
+    let mut splash_builder = WindowBuilder::new()
+        .with_title("LogicView")
+        .with_inner_size(LogicalSize::new(780.0, 260.0))
+        .with_decorations(false)
+        .with_transparent(!cfg!(windows))
+        .with_always_on_top(true)
+        .with_resizable(false)
+        .with_focusable(false)
+        .with_visible(false);
+    #[cfg(target_os = "windows")]
+    {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        splash_builder = splash_builder.with_skip_taskbar(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use tao::platform::unix::WindowBuilderExtUnix;
+        splash_builder = splash_builder.with_skip_taskbar(true);
+    }
+    let splash = splash_builder.build(&event_loop)
+        .map_err(|err| format!("could not open the startup splash: {err}"))?;
+    if let Some(monitor) = splash.current_monitor() {
+        let origin = monitor.position();
+        let screen = monitor.size();
+        let size = splash.outer_size();
+        let x = origin.x + (i64::from(screen.width) - i64::from(size.width)).max(0) as i32 / 2;
+        let y = origin.y + (i64::from(screen.height) - i64::from(size.height)).max(0) as i32 / 2;
+        splash.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
+    }
+    #[cfg(not(windows))]
+    let html = format!(r#"<!doctype html><html><head><style>
+        html,body {{ margin:0; width:100%; height:100%; overflow:hidden; background:transparent; }}
+        img {{ width:100%; height:100%; object-fit:contain; }}
+        </style></head><body><img src="{origin}/assets/AppLogo.png" alt="LogicView"></body></html>"#);
+    #[cfg(not(windows))]
+    let splash_builder = WebViewBuilder::new()
+        .with_html(html)
+        .with_transparent(true)
+        .with_background_color((0, 0, 0, 0));
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    let splash_view = splash_builder.build(&splash)
+        .map_err(|err| format!("could not display the startup splash: {err}"))?;
+    #[cfg(target_os = "linux")]
+    let splash_view = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        let vbox = splash.default_vbox().ok_or_else(|| "startup splash has no GTK container".to_string())?;
+        splash_builder.build_gtk(vbox)
+            .map_err(|err| format!("could not display the startup splash: {err}"))?
+    };
+    #[cfg(windows)]
+    let splash_view = layered_splash::show(&splash)?;
+    #[cfg(not(windows))]
+    splash.set_visible(true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut splash = Some((splash_view, splash));
+
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = if splash.is_some() { ControlFlow::WaitUntil(deadline) } else { ControlFlow::Wait };
         let _keep_webview = &webview;
+        if splash.is_some() && Instant::now() >= deadline {
+            splash.take();
+            window.set_visible(true);
+            window.set_focus();
+            *control_flow = ControlFlow::Wait;
+        }
         if let Event::WindowEvent {
+            window_id,
             event: WindowEvent::CloseRequested,
             ..
         } = event
         {
-            *control_flow = ControlFlow::Exit;
+            if window_id == window.id() {
+                *control_flow = ControlFlow::Exit;
+            }
         }
     });
 }
@@ -187,3 +255,7 @@ mod tests {
         assert!(!allows_navigation(origin, "http://127.0.0.1:4173.example/"));
     }
 }
+
+#[cfg(windows)]
+#[path = "splash_windows.rs"]
+mod layered_splash;

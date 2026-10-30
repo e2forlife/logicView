@@ -32,3 +32,5 @@ workspace = true
 
 [target."cfg(windows)".dependencies]
 rfd = { version = "0.17.2", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rightkit-overlay-win = "0.1.0"

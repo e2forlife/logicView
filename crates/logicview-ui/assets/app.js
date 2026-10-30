@@ -23,6 +23,7 @@ const state = {
   sessions: [],
   active: null,
   phase: "idle",
+  error: null,
   total: 0,
   rate: 1_000_000,
   durationMs: 2000,
@@ -34,6 +35,8 @@ const state = {
   overviewCols: null,
   req: 0,
   hoverText: "",
+  hoverSequence: 0,
+  hoverBounds: null,
   hoverX: null,
   hoverChannel: 0,
   hoverKey: null,
@@ -46,6 +49,7 @@ const state = {
   probes: [],
   edgeChannel: null,
   annotations: [],
+  waveformAnnotations: [],
   decoders: [],
   selectedDecoder: null,
   decodeQuery: "",
@@ -55,6 +59,7 @@ const state = {
   nextMarker: 1,
   nextMeasure: 1,
   channelGroup: 0,
+  channelsAllDisabled: false,
   tileView: null,
   planned: 0,
   captureStarted: 0,
@@ -137,11 +142,11 @@ async function api(body) {
   return json.data;
 }
 
-function logicRowModel(channel, decoderId) {
+function logicRowModel(channel, decoderId, lane) {
   const index = channel.index;
   const tileKey = "logic:" + index;
   return {
-    key: decoderId ? "logic:" + index + "@" + decoderId : tileKey,
+    key: decoderId ? "logic:" + index + "@" + decoderId + (lane ? ":" + lane : "") : tileKey,
     tileKey,
     kind: "logic",
     channel: index,
@@ -149,6 +154,7 @@ function logicRowModel(channel, decoderId) {
     color: storedColor(tileKey, channel.color),
     device: channel.device_name || "",
     decoderId: decoderId || "",
+    lane: lane || "",
   };
 }
 
@@ -235,9 +241,9 @@ function decodeLanes(decoder, fallbackChannel) {
   const channels = decoder.channels || {};
   if (decoder.protocol === "spi") {
     const lanes = [];
-    if (Number.isFinite(Number(channels.mosi))) lanes.push({ id: "mosi", name: "MOSI", channel: Number(channels.mosi) });
-    if (Number.isFinite(Number(channels.miso))) lanes.push({ id: "miso", name: "MISO", channel: Number(channels.miso) });
-    if (lanes.length > 1) return lanes;
+    if (channels.mosi != null && Number.isFinite(Number(channels.mosi))) lanes.push({ id: "mosi", name: "MOSI", channel: Number(channels.mosi) });
+    if (channels.miso != null && Number.isFinite(Number(channels.miso))) lanes.push({ id: "miso", name: "MISO", channel: Number(channels.miso) });
+    return lanes;
   }
   return [{ id: "", name: protocolLabel(decoder.protocol), channel: fallbackChannel }];
 }
@@ -269,15 +275,28 @@ function decodeBusRow(decoder, lane, header) {
 function groupRows(decoder, source) {
   const indexes = indexesInOrder(decoderIndexes(decoder), source);
   const channel = indexes.length ? indexes[0] : 0;
-  const rows = decodeLanes(decoder, channel).map((lane, index) => decodeBusRow(decoder, lane, index === 0));
-  if (decoderCondensed(decoder.id)) return rows;
+  const lanes = decodeLanes(decoder, channel);
   const byIndex = new Map(state.channels.map((item) => [item.index, item]));
-  for (const index of indexes) {
-    const signal = byIndex.get(index);
-    if (!signal) continue;
-    const row = logicRowModel(signal, decoder.id);
-    row.child = true;
-    rows.push(row);
+  const rows = [];
+  for (const [position, lane] of lanes.entries()) {
+    rows.push(decodeBusRow(decoder, lane, position === 0));
+    if (decoderCondensed(decoder.id, lane.id)) continue;
+    const channels = decoder.channels || {};
+    const laneIndexes = decoder.protocol === "spi" && lane.id
+      ? (lane.id === "miso" ? [channels.sck, channels.miso, channels.cs] : [channels.mosi, channels.sck, channels.cs])
+      : indexes;
+    const seen = new Set();
+    for (const value of laneIndexes) {
+      if (value == null || value === "") continue;
+      const index = Number(value);
+      if (!Number.isFinite(index) || seen.has(index)) continue;
+      seen.add(index);
+      const signal = byIndex.get(index);
+      if (!signal) continue;
+      const row = logicRowModel(signal, decoder.id, lane.id);
+      row.child = true;
+      rows.push(row);
+    }
   }
   return rows;
 }
@@ -343,6 +362,7 @@ function probeForRow(row) {
 }
 
 function channelIsEnabled(index) {
+  if (state.channelsAllDisabled) return false;
   if (!settings.channelEnable) return true;
   return (settings.channelEnable & (1 << index)) !== 0;
 }
@@ -388,14 +408,11 @@ function visibleRows() {
 }
 
 function triggerOrigin() {
-  if (!settings.trigger || state.total <= 0) return 0;
-  const percent = Number(settings.percent) || 0;
-  if (percent > 0) {
-    const raw = Math.floor(state.total * (percent / 100));
-    return raw - (raw % 64);
-  }
-  if (typeof state.triggerSample === "number" && state.triggerSample > 0) return state.triggerSample;
-  return 0;
+  // A requested pre-trigger percentage is only a target; the capture reports
+  // the position that belongs to its samples. Do not invent a trigger marker
+  // before that position is available.
+  return typeof state.triggerSample === "number" && state.triggerSample >= 0
+    ? state.triggerSample : 0;
 }
 
 function sampleSeconds(sample) {
@@ -412,6 +429,7 @@ function persistOrder(keys) {
 function applyStatus(status, fromLive) {
   const previous = state.phase;
   state.phase = status.phase;
+  if ("error" in status) state.error = status.error;
   state.rate = status.sample_rate_hz || state.rate;
   state.durationMs = status.duration_ms || state.durationMs;
   if (status.channels) state.channels = status.channels;
@@ -456,7 +474,7 @@ function fitView() {
   }
   const fit = state.total / width;
   v.start = 0;
-  v.spp = Math.min(fit, 8);
+  v.spp = fit;
 }
 
 function clampView() {
@@ -503,10 +521,17 @@ function paintStatus() {
   stopBtn.disabled = !live || commandBusy;
   const name = document.getElementById("device-name");
   if (name) name.textContent = settings.deviceName;
+  if (state.error) {
+    statusEl.textContent = `Error: ${state.error}`;
+    statusEl.title = state.error;
+    return;
+  }
+  statusEl.title = "";
   const count = state.total.toLocaleString();
   const trigger = state.triggerSample == null ? "" : ` · trigger @ ${state.triggerSample}`;
   const hover = state.hoverText ? ` · ${state.hoverText}` : "";
-  statusEl.textContent = `${state.phase} · ${count} samples · ${formatHz(state.rate)}${trigger}${hover}`;
+  const captured = state.total > 0 ? ` | ${formatSeconds(state.total / Math.max(1, state.rate))} captured` : "";
+  statusEl.textContent = `${state.phase} | ${count} samples | ${formatHz(state.rate)}${captured}${trigger}${hover}`;
 }
 
 function renderTabs() {
@@ -666,7 +691,7 @@ function startRowResize(key, startY) {
 let foldAnim = null;
 
 function rowFolded(row) {
-  return row.kind === "decode" && decoderCondensed(row.decoderId);
+  return row.kind === "decode" && decoderCondensed(row.decoderId, row.lane);
 }
 
 function foldButton(row, folded) {
@@ -677,7 +702,7 @@ function foldButton(row, folded) {
   button.setAttribute("aria-expanded", folded ? "false" : "true");
   button.setAttribute("aria-label", button.title);
   button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>`;
-  const animate = foldAnim === row.decoderId;
+  const animate = foldAnim === row.key;
   if (animate) {
     button.classList.add("anim");
     if (folded) button.classList.add("open");
@@ -688,8 +713,12 @@ function foldButton(row, folded) {
   button.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   button.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    foldAnim = row.decoderId;
-    decodePref(row.decoderId).condensed = !folded;
+    foldAnim = row.key;
+    const pref = decodePref(row.decoderId);
+    if (row.lane) {
+      if (!pref.lanes) pref.lanes = {};
+      pref.lanes[row.lane] = !folded;
+    } else pref.condensed = !folded;
     state.gutterSig = "";
     renderGutter();
     drawWave();
@@ -731,6 +760,7 @@ function renderGutter() {
     el.title = row.device ? `${signalName(row)} · ${row.device}` : signalName(row);
     const bar = document.createElement("span");
     bar.className = "bar";
+    el.style.setProperty("--channel-color", row.color);
     bar.style.background = row.color;
     bar.title = "Channel color";
     bar.addEventListener("mousedown", (ev) => {
@@ -745,7 +775,7 @@ function renderGutter() {
     const name = document.createElement("span");
     name.className = "name";
     name.textContent = signalName(row);
-    name.style.color = row.color;
+
     if (row.kind === "logic") {
       name.title = "Double-click to rename";
       name.addEventListener("mousedown", (ev) => ev.stopPropagation());
@@ -783,8 +813,7 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    if (row.kind === "decode" && row.header) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
-    else if (row.kind === "decode") el.append(bar, foldSpacer(), name, kind, eye, handle);
+    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
@@ -909,7 +938,7 @@ function drawRuler() {
       lastLabel = x;
     }
   }
-  if (settings.trigger && state.total > 0) {
+  if (typeof state.triggerSample === "number" && state.triggerSample >= 0 && state.total > 0) {
     const x = (triggerOrigin() - v.start) / v.spp;
     if (x >= -8 && x <= w + 8) drawDiamond(ctx, x, h / 2, "#f0c14d");
   }
@@ -980,6 +1009,7 @@ function drawWave() {
     ctx.fillText("L", 8, top + item.height - pad);
   }
   drawMeasureSpan(ctx, w, h);
+  drawHoverBoundaries(ctx, w, layout);
   drawMarkerLines(ctx, h);
   if (pointer && pointer.kind === "cursors") {
     const v = view();
@@ -1002,6 +1032,59 @@ function drawWave() {
     ctx.lineTo(state.hoverX + 0.5, h);
     ctx.stroke();
   }
+}
+
+// Temporary dimension lines connect the exact boundaries used by the hover values.
+function drawHoverBoundaries(ctx, width, layout) {
+  const bounds = state.hoverBounds;
+  if (!bounds) return;
+  const item = layout.find((entry) => entry.row.key === bounds.key);
+  if (!item) return;
+  const v = view();
+  ctx.save();
+  ctx.lineWidth = 0.65;
+  ctx.beginPath();
+  ctx.rect(0, item.top, width, item.height);
+  ctx.clip();
+  for (const [samples, color, dash, position] of [
+    [[bounds.periodStart, bounds.periodEnd], "#5ac8ff", [2, 4], 0.72],
+    [[bounds.pulseStart, bounds.pulseEnd], "#ffca5e", [5, 3], 0.28],
+  ]) {
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.setLineDash(dash);
+    for (const sample of samples) {
+      if (typeof sample !== "number") continue;
+      const x = (sample - v.start) / v.spp;
+      if (x < 0 || x > width) continue;
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, item.top);
+      ctx.lineTo(x + 0.5, item.top + item.height);
+      ctx.stroke();
+    }
+    if (samples.every((sample) => typeof sample === "number") && samples[1] > samples[0]) {
+      const x0 = (samples[0] - v.start) / v.spp;
+      const x1 = (samples[1] - v.start) / v.spp;
+      if (x1 < 0 || x0 > width) continue;
+      const y = item.top + item.height * position;
+      const head = Math.min(4, (x1 - x0) / 3);
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(Math.max(0, x0), y);
+      ctx.lineTo(Math.min(width, x1), y);
+      ctx.stroke();
+      for (const [x, direction] of [[x0, 1], [x1, -1]]) {
+        if (x < 0 || x > width) continue;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + direction * head, y - head * 0.55);
+        ctx.lineTo(x + direction * head, y + head * 0.55);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+  ctx.restore();
 }
 
 function drawGrid(ctx, w, h, layout) {
@@ -1145,8 +1228,10 @@ function overlayEnabled(id) {
   return !pref || pref.overlay !== false;
 }
 
-function decoderCondensed(id) {
-  return !!(state.decodeView[id] && state.decodeView[id].condensed);
+function decoderCondensed(id, lane) {
+  const pref = state.decodeView[id];
+  if (!pref) return false;
+  return lane && pref.lanes && lane in pref.lanes ? !!pref.lanes[lane] : !!pref.condensed;
 }
 
 function decodeFormat(id) {
@@ -1159,7 +1244,7 @@ function decoderChannelIndexes(decoder) {
 }
 
 function rowHiddenByDecoder(row) {
-  return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId);
+  return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId, row.lane);
 }
 
 function rowKindLabel(row) {
@@ -1173,7 +1258,7 @@ function rowKindLabel(row) {
 }
 
 function valueAnnotations(decoder) {
-  const rows = (state.annotations || []).filter((row) => row.decoder === decoder.id);
+  const rows = (state.waveformAnnotations || []).filter((row) => row.decoder === decoder.id);
   const values = rows.filter((row) => !FRAME_CLASS.has(row.class));
   return values.length ? values : rows;
 }
@@ -1185,12 +1270,12 @@ function annotationLabel(row) {
   return row.text || row.class || "";
 }
 
-function logicRow(layout, channel, decoderId) {
+function logicRow(layout, channel, decoderId, lane) {
   const index = Number(channel);
   if (!Number.isFinite(index)) return null;
   const matches = layout.filter((item) => item.row.kind === "logic" && item.row.channel === index && !state.hidden.has(item.row.key));
   if (decoderId) {
-    const owned = matches.find((item) => item.row.decoderId === decoderId);
+    const owned = matches.find((item) => item.row.decoderId === decoderId && (!lane || item.row.lane === lane));
     if (owned) return owned;
   }
   return matches.find((item) => !item.row.decoderId) || matches[0] || null;
@@ -1201,8 +1286,8 @@ function dataLineTargets(decoder) {
   const text = annotationLabel;
   if (decoder.protocol === "spi") {
     return [
-      { channel: channels.mosi, label: (row) => (row.fields && row.fields.mosi ? "0x" + row.fields.mosi : text(row)) },
-      { channel: channels.miso, label: (row) => (row.fields && row.fields.miso ? "0x" + row.fields.miso : text(row)) },
+      { channel: channels.mosi, lane: "mosi", label: (row) => (row.fields && row.fields.mosi ? "0x" + row.fields.mosi : text(row)) },
+      { channel: channels.miso, lane: "miso", label: (row) => (row.fields && row.fields.miso ? "0x" + row.fields.miso : text(row)) },
     ];
   }
   if (decoder.protocol === "i2c") return [{ channel: channels.sda, label: text }];
@@ -1268,9 +1353,10 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
   for (const decoder of state.decoders || []) {
     const rows = valueAnnotations(decoder);
     if (!rows.length) continue;
-    if (decoderCondensed(decoder.id) || !overlayEnabled(decoder.id)) continue;
+    if (!overlayEnabled(decoder.id)) continue;
     for (const target of dataLineTargets(decoder)) {
-      const item = logicRow(layout, target.channel, target.decoderId || decoder.id);
+      if (target.channel == null || decoderCondensed(decoder.id, target.lane)) continue;
+      const item = logicRow(layout, target.channel, target.decoderId || decoder.id, target.lane);
       if (!item) continue;
       const pad = Math.max(8, item.height * 0.22);
       drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
@@ -1376,7 +1462,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
 }
 
 function spiWords(decoderId) {
-  return (state.annotations || []).filter((row) => row.decoder === decoderId && row.class === "word" && row.fields);
+  return (state.waveformAnnotations || []).filter((row) => row.decoder === decoderId && row.class === "word" && row.fields);
 }
 
 function hexByte(text) {
@@ -1638,6 +1724,7 @@ function drawOverview() {
 }
 
 function scheduleTiles() {
+  scheduleWaveformAnnotations();
   tileAgain = true;
   if (tileFlight) return;
   tileFlight = true;
@@ -1833,10 +1920,13 @@ async function refreshSessions() {
 async function selectSession(id) {
   await api({ cmd: "select_session", id });
   state.active = id;
+  state.channelsAllDisabled = false;
   state.gutterSig = "";
   const status = await api({ cmd: "status", session: id });
   applyStatus(status, false);
   await refreshSessions();
+  await refreshDecoders();
+  await loadAnnotations();
   if (state.tab === "cursors" || state.tab === "measure") selectTab(state.tab);
 }
 
@@ -1847,7 +1937,12 @@ async function addSession() {
 
 async function runCapture() {
   if (commandBusy || isLive(state.phase)) return;
+  if (state.channelsAllDisabled) {
+    statusEl.textContent = "Enable at least one channel before capture.";
+    return;
+  }
   commandBusy = true;
+  state.error = null;
   paintStatus();
   try {
     view().userNavigated = false;
@@ -1880,7 +1975,7 @@ async function runCapture() {
     const started = await api({ cmd: "start", session: state.active, instant: false });
     applyStatus(started, true);
   } catch (err) {
-    statusEl.textContent = err.message;
+    state.error = err.message;
   } finally {
     commandBusy = false;
     paintStatus();
@@ -1917,22 +2012,25 @@ function panelHtml(name) {
   if (name === "device") return devicePanel();
   if (name === "decode") {
     const query = escapeHtml(state.decodeQuery || "");
-    return `<h2>Decode</h2>
-      <label class="field">Protocol
+    return `<div class="decode-heading"><h2>Decode</h2>
+        <button class="decode-help" type="button" aria-label="Decoder panel help" title="Choose a protocol and press plus to add it. Select an enabled decoder to show its table; use its gear to configure channels, options, and overlay, or its trash icon to remove it. The arrow beside each decoded bus folds or shows its waveform channels, and the eye hides a row. A channel used by multiple decoders appears in each group.">?</button>
+      </div>
+      <label class="decode-protocol-label" for="decoder-kind">Protocol</label>
+      <div class="decode-add-row">
         <select id="decoder-kind">
           <option value="i2c">I2C</option>
           <option value="spi">SPI</option>
           <option value="uart">UART</option>
           <option value="eeprom24">EEPROM 24xx on I2C</option>
         </select>
-      </label>
-      <button class="block" id="add-decoder" type="button">Add decoder</button>
-      <ul id="decoder-list" class="decoder-list"></ul>
+        <button id="add-decoder" class="decode-add" type="button" title="Add decoder" aria-label="Add decoder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
+      </div>
+      <div class="decode-list-label">Enabled decoders</div>
+      <ul id="decoder-list" class="decoder-list" aria-label="Enabled decoders"></ul>
       <label class="field">Search
         <input id="decode-search" type="search" placeholder="MOSI, 0xA5, or address" value="${query}" aria-label="Search decoded rows">
       </label>
-      <div id="decode-table" class="decode-scroll"></div>
-      <p class="hint">Select a decoder to show its table. The gear sets each signal’s channel and the mode. Each data lane is its own hex bus, stacked at the top of the decoder, with the waveform channels underneath. The arrow beside the first bus folds those waveforms into the buses, or shows them again. The eye hides that row’s waveform. Overlay draws decoded values on the data lines while the waveforms are visible. A channel used by two decoders appears in each group.</p>`;
+      <div id="decode-table" class="decode-scroll"></div>`;
   }
   if (name === "cursors") {
     return `<h2>Cursors</h2>
@@ -1989,17 +2087,17 @@ function devicePanel() {
   const analogRow = state.analog.length
     ? `<div class="acq-row"><span>Analog channels</span><span class="value">${state.analog.length} · ${analog}</span></div>`
     : "";
-  return `<h2>Device</h2>
+  return `<h2>Device Settings</h2>
     <button type="button" class="device-card" id="device-card">
       <svg class="pod" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 6V4M12 6V4M17 6V4M7 20v-2M12 20v-2M17 20v-2"></path></svg>
       <div>
         <strong>${title}</strong>
         <span class="connected"><i class="dot"></i> Connected</span>
-        <p class="hint">${hardware ? "Opened pod. The name is the one the engine reports." : "Software demo. No pod serial number."}</p>
+        <p class="hint">${hardware ? "DreamSourceLab" : "Software demo"}</p>
       </div>
     </button>
     <p id="plugged-in" class="hint">Looking for a DreamSourceLab pod.</p>
-    <p id="profile-note" class="hint">Choose the source from the device menu. A plugged-in pod is listed above the demo devices. Demo and Demo SPI can be stacked. Untested product ids stay closed.</p>
+
     <h3>Acquisition</h3>
     <label class="acq-row">Sample rate
       <select id="set-rate" aria-label="Sample rate">${rateOptionsHtml()}</select>
@@ -2095,7 +2193,9 @@ function channelChecks(probes) {
     const color = storedColor("logic:" + probe.index, probe.color || "#8eb6ff");
     return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${probe.index}">${probe.index}</button>`;
   }).join("");
-  return `<div class="ch-tabs">${tabs}</div><div class="ch-enables">${buttons}</div>`;
+  const allOn = probes.every((probe) => channelIsEnabled(probe.index));
+  const groupOn = groups[state.channelGroup].every((probe) => channelIsEnabled(probe.index));
+  return `<div class="ch-tabs">${tabs}<button type="button" class="ch-all" data-scope="device" aria-pressed="${allOn}" title="Toggle all channels">All</button></div><div class="ch-enable-row"><div class="ch-enables">${buttons}</div><button type="button" class="ch-all" data-scope="group" aria-pressed="${groupOn}" title="Toggle this group">All</button></div>`;
 }
 
 function bindPanel(name) {
@@ -2156,38 +2256,34 @@ function bindPanel(name) {
         selectTab("device");
       });
     }
-    const sampleButtons = [...document.querySelectorAll("#channel-enable .ch-en")];
-    const writeSampleMask = () => {
-      const probes = state.probes.length ? state.probes : state.channels;
-      const on = probes.filter((probe) => channelIsEnabled(probe.index));
-      if (on.length === probes.length) settings.channelEnable = 0;
-      else {
-        let mask = 0;
-        for (const probe of on) mask |= 1 << probe.index;
-        settings.channelEnable = mask || 1;
+    const probes = state.probes.length ? state.probes : state.channels;
+    const setEnabled = (indices, enabled) => {
+      const selected = new Set(probes.filter((probe) => channelIsEnabled(probe.index)).map((probe) => probe.index));
+      for (const index of indices) {
+        if (enabled) selected.add(index);
+        else selected.delete(index);
       }
+      state.channelsAllDisabled = selected.size === 0;
+      let mask = 0;
+      for (const index of selected) mask = (mask | (1 << index)) >>> 0;
+      settings.channelEnable = selected.size === probes.length ? 0 : mask;
+      clampSampleRate();
+      state.gutterSig = "";
+      renderGutter();
+      scheduleTiles();
+      drawWave();
+      selectTab("device");
     };
-    for (const button of sampleButtons) {
+    for (const button of document.querySelectorAll("#channel-enable .ch-en")) {
       button.addEventListener("click", () => {
         const bit = Number(button.dataset.bit);
-        const probes = state.probes.length ? state.probes : state.channels;
-        const enabled = probes.filter((probe) => channelIsEnabled(probe.index));
-        const isOn = channelIsEnabled(bit);
-        if (isOn && enabled.length <= 1) return;
-        if (settings.channelEnable === 0) {
-          let mask = 0;
-          for (const probe of probes) mask |= 1 << probe.index;
-          settings.channelEnable = mask;
-        }
-        if (isOn) settings.channelEnable &= ~(1 << bit);
-        else settings.channelEnable |= 1 << bit;
-        writeSampleMask();
-        clampSampleRate();
-        state.gutterSig = "";
-        renderGutter();
-        scheduleTiles();
-        drawWave();
-        selectTab("device");
+        setEnabled([bit], !channelIsEnabled(bit));
+      });
+    }
+    for (const button of document.querySelectorAll("#channel-enable .ch-all")) {
+      button.addEventListener("click", () => {
+        const selected = button.dataset.scope === "device" ? probes : probes.slice(state.channelGroup * 8, state.channelGroup * 8 + 8);
+        setEnabled(selected.map((probe) => probe.index), !selected.every((probe) => channelIsEnabled(probe.index)));
       });
     }
     bindCheck("set-rle", "rle");
@@ -2225,7 +2321,7 @@ function bindPanel(name) {
     }
   }
   if (name === "decode") {
-    document.getElementById("add-decoder").addEventListener("click", addDecoder);
+    document.getElementById("add-decoder").addEventListener("click", () => addDecoder());
     const search = document.getElementById("decode-search");
     search.addEventListener("input", () => {
       state.decodeQuery = search.value;
@@ -2554,7 +2650,7 @@ async function loadDeviceChoices() {
     const plugged = document.getElementById("plugged-in");
     if (plugged) {
       plugged.textContent = hardware.length
-        ? `Plugged in: ${hardware.map((device) => device.name).join(", ")}. Pick it in the device menu to capture.`
+        ? `Detected: ${hardware.map((device) => device.name).join(", ")}.`
         : "No DreamSourceLab pod is plugged in.";
     }
     syncDeviceSelect();
@@ -2605,6 +2701,7 @@ async function applyDeviceChoice(value) {
 
 async function useDevice(id) {
   const connected = await api({ cmd: "connect", id });
+  state.channelsAllDisabled = false;
   settings.device = connected.id;
   settings.deviceName = connected.name;
   const status = await api({ cmd: "status", session: state.active });
@@ -2634,8 +2731,8 @@ function protocolLabel(protocol) {
   return PROTOCOL_LABEL[protocol] || protocol;
 }
 
-async function addDecoder() {
-  const protocol = document.getElementById("decoder-kind").value;
+async function addDecoder(protocol) {
+  protocol = protocol || document.getElementById("decoder-kind").value;
   try {
     const created = await api({
       cmd: "add_decoder",
@@ -2666,6 +2763,12 @@ function renderDecoderList() {
   const host = document.getElementById("decoder-list");
   if (!host) return;
   host.replaceChildren();
+  if (!state.decoders.length) {
+    const empty = document.createElement("li");
+    empty.className = "decoder-empty";
+    empty.textContent = "No decoders added";
+    host.append(empty);
+  }
   for (const row of state.decoders) {
     const item = document.createElement("li");
     item.className = "decoder-row" + (row.id === state.selectedDecoder ? " selected" : "");
@@ -2704,6 +2807,42 @@ function renderDecoderList() {
   }
 }
 
+let waveformAnnotationTimer = null;
+let waveformAnnotationRequest = 0;
+
+function scheduleWaveformAnnotations() {
+  const request = ++waveformAnnotationRequest;
+  clearTimeout(waveformAnnotationTimer);
+  if (!state.active || !state.total || !state.decoders.length) {
+    state.waveformAnnotations = [];
+    return;
+  }
+  const session = state.active;
+  const v = view();
+  const start = Math.max(0, Math.floor(v.start));
+  const end = Math.max(start + 1, Math.ceil(v.start + Math.max(1, wave.clientWidth) * v.spp));
+  const decoders = state.decoders.map((decoder) => decoder.id);
+  waveformAnnotationTimer = setTimeout(async () => {
+    try {
+      const pages = await Promise.all(decoders.map(async (decoder) => {
+        const rows = [];
+        let page;
+        do {
+          page = await api({ cmd: "read_annotations", session, decoder, start, end, offset: rows.length, limit: 5000 });
+          if (request !== waveformAnnotationRequest || state.active !== session) return [];
+          rows.push(...page);
+        } while (page.length === 5000);
+        return rows;
+      }));
+      if (request !== waveformAnnotationRequest || state.active !== session) return;
+      state.waveformAnnotations = pages.flat();
+      drawWave();
+    } catch (err) {
+      if (request === waveformAnnotationRequest) statusEl.textContent = err.message;
+    }
+  }, 100);
+}
+
 async function loadAnnotations() {
   if (!state.active) return;
   try {
@@ -2722,6 +2861,7 @@ async function loadAnnotations() {
   renderDecodeTable();
   state.gutterSig = "";
   renderGutter();
+  scheduleWaveformAnnotations();
   drawWave();
 }
 
@@ -3352,6 +3492,7 @@ async function openCaptureFile(file) {
   }
   state.tiles = {};
   state.annotations = [];
+  state.waveformAnnotations = [];
   state.decoders = [];
   state.selectedDecoder = null;
   state.decodeView = {};
@@ -3436,7 +3577,7 @@ function onEngineEvent(msg) {
   }
   if (msg.type === "error") {
     state.phase = "error";
-    statusEl.textContent = msg.message;
+    state.error = msg.message || "Capture failed";
     renderChrome();
     paintWait();
     return;
@@ -3644,6 +3785,10 @@ wave.addEventListener("pointermove", (ev) => {
   if (pointer && pointer.kind === "measure") {
     pointer.b = sampleAt(ev.clientX);
     drawWave();
+    if (ev.clientX < rect.left || ev.clientX >= rect.right || ev.clientY < rect.top || ev.clientY >= rect.bottom) {
+      hideHover();
+      return;
+    }
     const seconds = Math.abs(pointer.b - pointer.a) / Math.max(1, state.rate);
     showHover(ev, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(pointer.b - pointer.a)} samples`);
     return;
@@ -3696,12 +3841,10 @@ wave.addEventListener("pointerup", async (ev) => {
 });
 
 wave.addEventListener("pointerleave", () => {
-  if (!pointer) {
-    state.hoverX = null;
-    state.hoverKey = null;
-    hideHover();
-    drawWave();
-  }
+  state.hoverX = null;
+  state.hoverKey = null;
+  hideHover();
+  drawWave();
 });
 
 overview.addEventListener("pointerdown", (ev) => {
@@ -3718,16 +3861,53 @@ overview.addEventListener("pointerdown", (ev) => {
 });
 
 function queueHover(ev) {
+  state.hoverSequence += 1;
   state.hoverEvent = { clientX: ev.clientX, clientY: ev.clientY };
   if (hoverTimer) return;
   hoverTimer = setTimeout(() => {
     hoverTimer = null;
     const current = state.hoverEvent;
-    if (current) runHover(current);
+    if (current) runHover(current, state.hoverSequence);
   }, 40);
 }
 
-async function runHover(ev) {
+// A decoder row represents annotation spans, not a single physical channel.
+async function decodedHoverBounds(row, sample, session, sequence) {
+  let offset = 0;
+  let current = null;
+  for (;;) {
+    const page = await api({ cmd: "read_annotations", session, decoder: row.decoderId, start: sample, offset, limit: 5000 });
+    if (sequence !== state.hoverSequence || session !== state.active || pointer) return null;
+    for (const item of page) {
+      if (FRAME_CLASS.has(item.class)) continue;
+      if (row.lane && (!item.fields || item.fields[row.lane] == null)) continue;
+      if (!current) {
+        if (item.start_sample <= sample && sample < item.end_sample) current = item;
+        else if (item.start_sample > sample) return null;
+      } else if (item.start_sample >= current.end_sample) {
+        return { start: current.start_sample, end: current.end_sample, next: item.start_sample };
+      }
+    }
+    if (page.length < 5000) break;
+    offset += page.length;
+  }
+  return current ? { start: current.start_sample, end: current.end_sample, next: null } : null;
+}
+
+async function busHoverBounds(row, sample, session) {
+  const channels = [...new Set(row.bus.channels || [])];
+  if (!channels.length) return null;
+  const metrics = await Promise.all(channels.map((channel) => api({ cmd: "measure", session, channel, sample })));
+  const starts = metrics.map((item) => item.pulse_start);
+  const ends = metrics.map((item) => item.pulse_end);
+  if (starts.some((value) => typeof value !== "number") || ends.some((value) => typeof value !== "number")) return null;
+  const start = Math.max(...starts);
+  const end = Math.min(...ends);
+  return { start, end, next: end < state.total ? end : null };
+}
+
+async function runHover(ev, sequence) {
+  const session = state.active;
   const rect = wave.getBoundingClientRect();
   const x = ev.clientX - rect.left;
   const y = ev.clientY - rect.top;
@@ -3748,6 +3928,8 @@ async function runHover(ev) {
   const sample = Math.min(state.total - 1, Math.max(0, Math.floor(view().start + x * view().spp)));
   state.hoverKey = row.key;
   if (row.kind === "analog") {
+    state.hoverBounds = null;
+    drawWave();
     const cols = state.tiles[row.key] || [];
     const column = cols[Math.floor(x)];
     if (!column || column.valid === false || pastCapture(Math.floor(x))) {
@@ -3759,7 +3941,30 @@ async function runHover(ev) {
     return;
   }
   try {
-    const metrics = await api({ cmd: "measure", session: state.active, channel: row.channel, sample });
+    if (row.kind === "decode" || row.kind === "bus") {
+      const bounds = row.kind === "decode"
+        ? await decodedHoverBounds(row, sample, session, sequence)
+        : await busHoverBounds(row, sample, session);
+      if (sequence !== state.hoverSequence || session !== state.active || pointer) return;
+      if (!bounds) { hideHover(); return; }
+      const width = formatSeconds((bounds.end - bounds.start) / state.rate);
+      const gap = bounds.next == null ? null : formatSeconds((bounds.next - bounds.end) / state.rate);
+      state.lastMeasure = null;
+      state.hoverBounds = { key: row.key, pulseStart: bounds.start, pulseEnd: bounds.end,
+        periodStart: bounds.next == null ? null : bounds.end, periodEnd: bounds.next };
+      drawWave();
+      const line = `${row.name} ? width ${width}${gap == null ? "" : ` ? gap ${gap}`}`;
+      const html = `<b style="color:${row.color}">${escapeHtml(row.name)}</b><br><span class="width-key">Width</span> ${width}${gap == null ? "" : `<br><span class="period-key">Gap</span> ${gap}`}`;
+      showHover(ev, line, html);
+      const readout = document.getElementById("measure-readout");
+      if (readout) readout.textContent = line;
+      return;
+    }
+    if (row.kind !== "logic") { hideHover(); return; }
+    const metrics = await api({ cmd: "measure", session, channel: row.channel, sample });
+    if (sequence !== state.hoverSequence || session !== state.active || pointer) return;
+    state.hoverBounds = { key: row.key, pulseStart: metrics.pulse_start, pulseEnd: metrics.pulse_end, periodStart: metrics.period_start, periodEnd: metrics.period_end };
+    drawWave();
     state.hoverChannel = row.channel;
     const level = metrics.level_high ? "high" : "low";
     const width = formatSeconds(metrics.width_secs);
@@ -3768,12 +3973,12 @@ async function runHover(ev) {
     const duty = metrics.duty == null ? "—" : `${(metrics.duty * 100).toFixed(1)}%`;
     state.lastMeasure = { channel: row.channel, sample };
     const line = `${row.name} ${level} · width ${width} · period ${period} · ${freq} · duty ${duty}`;
-    const html = `<b style="color:${row.color}">${row.name}</b> <span class="muted">${level}</span><br>Width ${width}<br>Period ${period}<br>${freq} · duty ${duty}`;
+    const html = `<b style="color:${row.color}">${row.name}</b> <span class="muted">${level}</span><br><span class="width-key">Width</span> ${width}<br><span class="period-key">Period</span> ${period}<br>${freq} · duty ${duty}`;
     showHover(ev, line, html);
     const readout = document.getElementById("measure-readout");
     if (readout) readout.textContent = line;
   } catch (_) {
-    hideHover();
+    if (sequence === state.hoverSequence) hideHover();
   }
 }
 
@@ -3795,10 +4000,16 @@ function showHover(ev, line, html) {
 }
 
 function hideHover() {
-  if (!state.hoverText && hoverEl.classList.contains("hidden")) return;
+  state.hoverSequence += 1;
+  state.hoverEvent = null;
+  if (hoverTimer) clearTimeout(hoverTimer);
+  hoverTimer = null;
+  const hadBounds = !!state.hoverBounds;
+  state.hoverBounds = null;
   state.hoverText = "";
   hoverEl.classList.add("hidden");
   paintStatus();
+  if (hadBounds) drawWave();
 }
 
 function setTool(name) {
@@ -3824,7 +4035,7 @@ function syncTimebaseLabel() {
     }
   });
   if (document.activeElement !== slider) slider.value = String(best);
-  label.textContent = formatDiv(TIME_DIVS[Number(slider.value)]);
+  label.textContent = formatDiv(seconds);
 }
 
 function formatDiv(seconds) {
@@ -3897,7 +4108,7 @@ const MENUS = {
     ["Zoom in", () => stepZoom(false)],
     ["Zoom out", () => stepZoom(true)],
   ],
-  decode: [["Open decode", () => selectTab("decode")]],
+  decode: [],
   measure: [["Add measurement", () => setTool("measure")]],
   tools: [
     ["Previous edge", () => stepEdge(false)],
@@ -3905,7 +4116,7 @@ const MENUS = {
     ["Add marker", () => setTool("marker")],
     ["Group channels as a bus", () => openBusDialog()],
   ],
-  help: [["About this demo", () => { statusEl.textContent = "LogicView demo source. Run starts a capture. Stop ends it."; }]],
+  help: [["About...", () => document.getElementById("about-dialog").showModal()]],
 };
 
 function closeMenu() {
@@ -3923,6 +4134,36 @@ function openMenu(button) {
   state.menu = name;
   const pop = document.getElementById("menu-pop");
   pop.replaceChildren();
+  if (name === "decode") {
+    const wrapper = document.createElement("div");
+    wrapper.className = "decode-menu-sub";
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "Add new decoder ?";
+    add.setAttribute("aria-haspopup", "true");
+    const submenu = document.createElement("div");
+    submenu.className = "decode-menu-choices";
+    for (const [protocol, label] of Object.entries(PROTOCOL_LABEL)) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.textContent = label;
+      choice.addEventListener("click", () => { closeMenu(); addDecoder(protocol); });
+      submenu.append(choice);
+    }
+    add.addEventListener("click", () => wrapper.classList.toggle("open"));
+    wrapper.append(add, submenu);
+    pop.append(wrapper);
+    const separator = document.createElement("div");
+    separator.className = "menu-separator";
+    pop.append(separator);
+    for (const decoder of state.decoders.slice(0, 10)) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.textContent = protocolLabel(decoder.protocol) + " (" + decoder.id + ")";
+      item.addEventListener("click", () => { closeMenu(); state.selectedDecoder = decoder.id; selectTab("decode"); openDecodeConfig(decoder); });
+      pop.append(item);
+    }
+  }
   for (const [label, fn] of MENUS[name]) {
     const item = document.createElement("button");
     item.type = "button";
@@ -3952,7 +4193,6 @@ document.getElementById("device-select").addEventListener("click", (ev) => {
   ev.stopPropagation();
   openDeviceMenu(document.querySelector(".device-chip"));
 });
-document.getElementById("channel-add").addEventListener("click", () => openSidebar("device"));
 document.getElementById("tool-marker").addEventListener("click", () => setTool("marker"));
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
 document.getElementById("zoom-in").addEventListener("click", () => stepZoom(false));
@@ -4035,7 +4275,10 @@ document.addEventListener("click", (ev) => {
   if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
 });
 
+document.getElementById("about-close").addEventListener("click", () => document.getElementById("about-dialog").close());
+
 window.addEventListener("keydown", (ev) => {
+  if (document.getElementById("about-dialog").open) return;
   if (ev.target.matches("input, select, textarea")) return;
   const key = ev.key;
   if (key === " " || key === "s" || key === "S") {
@@ -4173,13 +4416,9 @@ function paintWait() {
   if (sampling) {
     state.waitKind = "sampling";
     dialog.className = "wait-dialog sampling";
-    text.textContent = "Sampling";
+    text.textContent = state.phase === "arming" ? "Acquiring" : "Reading samples";
     const circ = 2 * Math.PI * 46;
-    const duration = Math.max(1, state.durationMs || settings.duration) / 1000;
-    const elapsed = state.captureStarted ? (performance.now() - state.captureStarted) / 1000 : 0;
-    const byTime = elapsed / duration;
-    const bySamples = state.planned > 0 ? state.total / state.planned : 0;
-    const frac = Math.max(0, Math.min(1, Math.max(byTime, bySamples)));
+    const frac = Math.max(0, Math.min(1, state.total / state.planned));
     arc.style.strokeDasharray = String(circ);
     arc.style.strokeDashoffset = String(circ * (1 - frac));
     return;
@@ -4276,7 +4515,7 @@ function channelSpec(channel) {
 }
 
 function channelOptions(selectedIndex) {
-  return state.channels.map((channel) => {
+  return `<option value=""${selectedIndex == null ? " selected" : ""}>NC</option>` + state.channels.map((channel) => {
     const label = channel.device_name ? channel.device_name + " / " + channel.name : channel.name;
     const selected = channel.index === selectedIndex ? " selected" : "";
     return `<option value="${escapeHtml(channelSpec(channel))}"${selected}>${escapeHtml(label)}</option>`;
@@ -4306,7 +4545,8 @@ function openDecodeConfig(decoder) {
         <select id="decode-format">${options}</select>
       </label>`);
   }
-  parts.push(...Object.keys(channels).map((name) => signalField(name, channels[name])));
+  const signals = { spi: ["sck", "mosi", "miso", "cs"], i2c: ["scl", "sda"], uart: ["rx"] };
+  parts.push(...(signals[decoder.protocol] || []).map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
     const cpha = options.cpha === "1" || options.cpha === "true" || options.cpha === "high";
@@ -4366,7 +4606,15 @@ async function boot() {
   const status = await api({ cmd: "status" });
   applyStatus(status, false);
   selectTab("device");
-  loadDeviceChoices();
+  await refreshDecoders();
+  await loadAnnotations();
+  await loadDeviceChoices();
+  const profiles = await api({ cmd: "list_profiles" }).catch(() => []);
+  const pod = state.deviceList.find((device) => device.kind === "usb" && profiles.some((profile) => profile.id === device.id && profile.hardware_tested));
+  if (pod && !(state.devices || []).some((device) => device.id === pod.id)) {
+    try { await useDevice(pod.id); }
+    catch (err) { statusEl.textContent = `Could not open ${pod.name}: ${err.message}`; }
+  }
   connectSocket();
   drawWave();
   syncTimebaseLabel();
@@ -4440,7 +4688,7 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
   const formatBox = document.getElementById("decode-format");
   const pref = decodePref(id);
   if (overlayBox) pref.overlay = overlayBox.checked;
-  if (condenseBox) pref.condensed = condenseBox.checked;
+  if (condenseBox && pref.condensed !== condenseBox.checked) { pref.condensed = condenseBox.checked; pref.lanes = {}; }
   if (formatBox && DECODE_FORMATS[formatBox.value]) pref.format = formatBox.value;
   state.gutterSig = "";
   try {

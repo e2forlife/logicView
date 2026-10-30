@@ -88,7 +88,6 @@
           <div class="gutter-col">
             <div class="gutter-head">
               <span>Channels</span>
-              <button id="channel-add" type="button" title="Devices">+</button>
             </div>
             <div id="gutter"></div>
           </div>
@@ -113,25 +112,25 @@
         <div id="status" class="status">idle</div>
       </div>
       <div id="split-side" class="v-split" role="separator" aria-orientation="vertical" title="Resize side panel"></div>
-      <aside class="side-panel" id="side-panel">
+      <aside class="side-panel open" id="side-panel">
         <div class="side-rail" role="tablist" aria-label="Side panel">
           <button id="side-pin" type="button" title="Pin sidebar" aria-label="Pin sidebar" aria-pressed="false">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3zM12 15v5"></path></svg>
           </button>
           <button type="button" data-tab="device" class="active" title="Device" aria-label="Device">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg><span>Device</span>
           </button>
           <button type="button" data-tab="decode" title="Decode" aria-label="Decode">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h4l2 4 2-6 2 8 2-6h4"></path></svg>
+            <svg class="decode-tab-icon" viewBox="0 0 24 24" aria-hidden="true"><text x="12" y="10">01</text><text x="12" y="21">10</text></svg><span>Decode</span>
           </button>
           <button type="button" data-tab="cursors" title="Cursors" aria-label="Cursors">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18M7 4h10l-3 4 3 4H7"></path></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18M7 4h10l-3 4 3 4H7"></path></svg><span>Cursors</span>
           </button>
           <button type="button" data-tab="measure" title="Measure" aria-label="Measure">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v8M19 8v8M5 12h14"></path></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8v8M19 8v8M5 12h14"></path></svg><span>Measure</span>
           </button>
           <button type="button" data-tab="export" title="Export" aria-label="Export">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10M8 10l4 4 4-4M5 19h14"></path></svg>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10M8 10l4 4 4-4M5 19h14"></path></svg><span>Export</span>
           </button>
         </div>
         <div class="side-sheet">
@@ -192,6 +191,21 @@
       </div>
     </form>
   </div>
+  <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
+    <div class="about-card">
+      <div class="about-logo" aria-label="E2 and LogicView logos">
+        <img class="about-logo-e2" src="/assets/E2logo.png" alt="">
+        <img class="about-logo-app" src="/assets/AppLogo.png" alt="">
+      </div>
+      <h2 id="about-title">About LogicView</h2>
+      <p>LogicView is an open-source workspace for capturing and exploring signals. It brings logic analysis, waveform measurements, and protocol decoding together, with demo devices for exploring without hardware.</p>
+      <h3 id="about-contributors-title">Contributors</h3>
+      <div class="about-credits" aria-labelledby="about-contributors-title">
+        <ul><li>Chuck</li></ul>
+      </div>
+      <button type="button" id="about-close">Close</button>
+    </div>
+  </dialog>
   <script src="/assets/app.js"></script>
 </body>
 </html>

@@ -106,6 +106,11 @@ impl<'a> SampleSlice<'a> {
         logicview_analysis::bit_at(bytes, index)
     }
 
+    /// Returns whether a named input is connected.
+    pub fn has_channel(&self, name: &str) -> bool {
+        self.channels.iter().any(|(channel, _)| *channel == name)
+    }
+
     /// Returns the exclusive end of this decoding slice in capture sample coordinates.
     pub fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
@@ -167,7 +172,7 @@ pub fn catalog() -> Vec<DecoderSchema> {
             id: "uart",
             name: "UART",
             channels: &["rx"],
-            optional_channels: &[],
+            optional_channels: &["rx"],
             stack_on: None,
             classes: &["data", "frame", "error"],
         },
@@ -175,7 +180,7 @@ pub fn catalog() -> Vec<DecoderSchema> {
             id: "i2c",
             name: "I2C",
             channels: &["scl", "sda"],
-            optional_channels: &[],
+            optional_channels: &["scl", "sda"],
             stack_on: None,
             classes: &["start", "address", "data", "ack", "nack", "stop"],
         },
@@ -183,7 +188,7 @@ pub fn catalog() -> Vec<DecoderSchema> {
             id: "spi",
             name: "SPI",
             channels: &["sck", "mosi", "miso", "cs"],
-            optional_channels: &[],
+            optional_channels: &["sck", "mosi", "miso", "cs"],
             stack_on: None,
             classes: &["word", "select"],
         },

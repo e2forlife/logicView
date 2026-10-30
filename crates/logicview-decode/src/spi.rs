@@ -113,14 +113,14 @@ impl Decoder for SpiDecoder {
                 return out;
             }
             self.prev_sck = slice.bit("sck", index);
-            self.prev_selected = self.selected(slice.bit("cs", index));
+            self.prev_selected = (!slice.has_channel("cs")) || self.selected(slice.bit("cs", index));
             self.primed = true;
             index += 1;
         }
         let width = self.bits_per_word.max(1);
         while index < end {
             let sck = slice.bit("sck", index);
-            let selected = self.selected(slice.bit("cs", index));
+            let selected = (!slice.has_channel("cs")) || self.selected(slice.bit("cs", index));
             if selected && !self.prev_selected {
                 self.select_start = index;
                 self.words_in_select = 0;
@@ -147,7 +147,7 @@ impl Decoder for SpiDecoder {
                 }
                 self.got += 1;
                 if self.got == width {
-                    out.push(word(self.word_start, index + 1, self.mosi_acc, self.miso_acc));
+                    out.push(word(self.word_start, index + 1, self.mosi_acc, self.miso_acc, slice.has_channel("mosi"), slice.has_channel("miso")));
                     self.words_in_select += 1;
                     self.got = 0;
                     self.mosi_acc = 0;
@@ -226,18 +226,19 @@ fn parse_bit(value: &str) -> Result<bool, DecodeError> {
 }
 
 /// Creates a decoded SPI word with structured values for both transfer directions.
-fn word(start: u64, end: u64, mosi: u8, miso: u8) -> Annotation {
+fn word(start: u64, end: u64, mosi: u8, miso: u8, has_mosi: bool, has_miso: bool) -> Annotation {
     let mut fields = BTreeMap::new();
-    fields.insert("mosi".into(), format!("{mosi:02X}"));
-    fields.insert("miso".into(), format!("{miso:02X}"));
-    fields.insert("data".into(), format!("{mosi:02X}"));
-    Annotation::new(
-        start,
-        end,
-        "word",
-        format!("MOSI 0x{mosi:02X} MISO 0x{miso:02X}"),
-        fields,
-    )
+    let mut labels = Vec::new();
+    if has_mosi {
+        fields.insert("mosi".into(), format!("{mosi:02X}"));
+        fields.insert("data".into(), format!("{mosi:02X}"));
+        labels.push(format!("MOSI 0x{mosi:02X}"));
+    }
+    if has_miso {
+        fields.insert("miso".into(), format!("{miso:02X}"));
+        labels.push(format!("MISO 0x{miso:02X}"));
+    }
+    Annotation::new(start, end, "word", labels.join(" "), fields)
 }
 
 #[cfg(test)]
@@ -329,4 +330,21 @@ mod tests {
         assert_eq!(words[0].text, "MOSI 0xA5 MISO 0x3C");
         assert!(output.annotations.iter().any(|row| row.class == "select"));
     }
+    #[test]
+    fn spi_decodes_one_data_line_without_chip_select() {
+        let mut rows = vec![[false, false, false, false]; 4];
+        for shift in (0..8).rev() {
+            push_bit(&mut rows, false, (0x3Cu8 >> shift) & 1 == 1);
+        }
+        let sck = pack(&rows, 0);
+        let miso = pack(&rows, 2);
+        let channels = [("sck", sck.as_slice()), ("miso", miso.as_slice())];
+        let len = rows.len() as u64;
+        let result = run(&DecodeRequest { protocol: "spi", channels: &channels, options: &[], region: 0..len, sample_len: len, lower: &[] }, &AtomicBool::new(false)).unwrap();
+        let word = result.annotations.iter().find(|row| row.class == "word").unwrap();
+        assert_eq!(word.fields.get("miso").map(String::as_str), Some("3C"));
+        assert!(!word.fields.contains_key("mosi"));
+        assert_eq!(word.text, "MISO 0x3C");
+    }
+
 }

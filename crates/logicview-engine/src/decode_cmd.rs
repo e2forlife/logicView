@@ -48,10 +48,9 @@ impl Engine {
         };
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            let spec = channels
-                .get(*name)
-                .ok_or_else(|| EngineError::Decode(format!("{protocol} needs a {name} channel")))?;
-            resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            if let Some(spec) = channels.get(*name).filter(|spec| !spec.is_empty()) {
+                resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            }
         }
         let instance_id = format!("{protocol}-{}", slot.next_decoder);
         slot.next_decoder += 1;
@@ -117,10 +116,9 @@ impl Engine {
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            let spec = channels
-                .get(*name)
-                .ok_or_else(|| EngineError::Decode(format!("{protocol} needs a {name} channel")))?;
-            resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            if let Some(spec) = channels.get(*name).filter(|spec| !spec.is_empty()) {
+                resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            }
         }
         let stack = if schema.stack_on.is_some() {
             Some(if stack_on.is_some() {
@@ -270,6 +268,13 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
     order.extend((0..decoders.len()).filter(|index| decoders[*index].stack_on.is_some()));
     for index in order {
         let inst = &decoders[index];
+        let ready = match inst.protocol.as_str() {
+            "spi" => inst.channels.contains_key("sck") && (inst.channels.contains_key("mosi") || inst.channels.contains_key("miso")),
+            "i2c" => inst.channels.contains_key("scl") && inst.channels.contains_key("sda"),
+            "uart" => inst.channels.contains_key("rx"),
+            _ => true,
+        };
+        if !ready { continue; }
         let lower = inst
             .stack_on
             .as_ref()

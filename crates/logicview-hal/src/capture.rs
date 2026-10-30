@@ -15,7 +15,11 @@ use crate::HalError;
 
 const EP_IN: u8 = 0x86;
 
-const PIPE_DEPTH: usize = 32;
+// DSView uses 1 MiB transfers for buffered captures. Smaller streaming
+// transfers keep low-rate live captures responsive.
+const PIPE_DEPTH: usize = 4;
+const BUFFER_TRANSFER_BYTES: usize = 1024 * 1024;
+const STREAM_TRANSFER_BYTES: usize = 64 * 1024;
 
 /// Prepared arm bytes, transfer policy, and cancellation state for one physical acquisition.
 pub struct CaptureJob {
@@ -107,9 +111,8 @@ pub fn run_capture(
         .interface()
         .endpoint::<Bulk, In>(EP_IN)
         .map_err(|err| HalError::Usb(err.to_string()))?;
-    for _ in 0..PIPE_DEPTH {
-        ep.submit(Buffer::new(bulk));
-    }
+    // The trigger header is a separate, packet-sized transfer.
+    ep.submit(Buffer::new(bulk));
     pod.start()?;
 
     let atom = (job.enabled_channels as usize).saturating_mul(8).max(1);
@@ -123,14 +126,12 @@ pub fn run_capture(
     let mut limit_after_stop: Option<u64> = None;
     let mut filler = 0u32;
     let mut leader = pod.sample_leader();
-    let overall = std::time::Instant::now() + job.header_wait + Duration::from_secs(4);
+    let initial_leader = leader;
+    let mut scheduled = 0u64;
+    let data_transfer = if job.stream || job.continuous { STREAM_TRANSFER_BYTES } else { BUFFER_TRANSFER_BYTES };
     let mut deadline = std::time::Instant::now() + job.header_wait;
 
     loop {
-        if std::time::Instant::now() > overall {
-            failed = Some(HalError::Interrupted("capture exceeded its wait".into()));
-            break;
-        }
         if !forced && !discarded && job.stop.load(Ordering::Relaxed) {
             match job.on_stop {
                 OnStop::Cancel => {
@@ -176,76 +177,46 @@ pub fn run_capture(
         match ep.wait_next_complete(Duration::from_millis(100)) {
             Some(done) if done.status.is_ok() && done.actual_len > 0 => {
                 let received = done.actual_len;
-                let data = done.buffer[..received].to_vec();
-                let mut offset = 0;
-                let mut stop = false;
-                while offset < data.len() && failed.is_none() && !stop {
-                    let end = (offset + bulk).min(data.len());
-                    let packet = &data[offset..end];
-                    let packet_short = packet.len() < bulk;
-                    offset = end;
-                    if header.is_none() {
-                        if packet.len() < LOGIC_HEADER_LEN {
-                            failed = Some(HalError::Interrupted(format!(
-                                "header transfer was {} bytes",
-                                packet.len()
-                            )));
-                            break;
-                        }
-                        if packet[..LOGIC_HEADER_LEN]
-                            .iter()
-                            .skip(4)
-                            .all(|byte| *byte == 0x55)
-                        {
-                            filler += 1;
-                            if filler > 8 {
-                                failed =
-                                    Some(HalError::Interrupted("header fill stayed 0x55".into()));
-                            }
-                            continue;
-                        }
-                        match parse_logic_header(&packet[..LOGIC_HEADER_LEN]) {
-                            Ok(parsed) => {
-                                expected_bytes = budget_bytes(job, &parsed);
-                                header = Some(parsed);
-                                if let Err(err) = emit(CaptureEvent::Header(parsed)) {
-                                    failed = Some(err);
-                                    break;
-                                }
-                                deadline = std::time::Instant::now() + Duration::from_secs(2);
-                            }
-                            Err(err) => {
-                                let preview = packet
-                                    .iter()
-                                    .take(32)
-                                    .map(|byte| format!("{byte:02x}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                failed = Some(match err {
-                                    ProtoError::BadCheckWord(word) => HalError::Message(format!(
-                                        "logic header check word was {word:#010x} in {preview}"
-                                    )),
-                                    other => HalError::Message(format!(
-                                        "{other} in {preview}"
-                                    )),
-                                });
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-
-                    let budget = read_budget(job, expected_bytes, limit_after_stop);
-                    let payload = take_after_leader(&mut leader, packet);
-                    if payload.is_empty() {
-                        deadline = std::time::Instant::now() + Duration::from_secs(2);
-                        continue;
-                    }
-                    let room = budget.saturating_sub(kept);
-                    if room == 0 {
-                        stop = true;
+                let data = &done.buffer[..received];
+                if header.is_none() {
+                    if data.len() < LOGIC_HEADER_LEN {
+                        failed = Some(HalError::Interrupted(format!(
+                            "header transfer was {} bytes", data.len()
+                        )));
                         break;
                     }
+                    if data[..LOGIC_HEADER_LEN].iter().skip(4).all(|byte| *byte == 0x55) {
+                        filler += 1;
+                        if filler > 8 {
+                            failed = Some(HalError::Interrupted("header fill stayed 0x55".into()));
+                            break;
+                        }
+                        ep.submit(Buffer::new(bulk));
+                        continue;
+                    }
+                    match parse_logic_header(&data[..LOGIC_HEADER_LEN]) {
+                        Ok(parsed) => {
+                            expected_bytes = budget_bytes(job, &parsed);
+                            header = Some(parsed);
+                            if let Err(err) = emit(CaptureEvent::Header(parsed)) {
+                                failed = Some(err);
+                                break;
+                            }
+                            deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        }
+                        Err(err) => {
+                            let preview = data.iter().take(32).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
+                            failed = Some(match err {
+                                ProtoError::BadCheckWord(word) => HalError::Message(format!("logic header check word was {word:#010x} in {preview}")),
+                                other => HalError::Message(format!("{other} in {preview}")),
+                            });
+                            break;
+                        }
+                    }
+                } else {
+                    let budget = read_budget(job, expected_bytes, limit_after_stop);
+                    let payload = take_after_leader(&mut leader, data);
+                    let room = budget.saturating_sub(kept);
                     let take_n = payload.len().min(room as usize);
                     pending.extend_from_slice(&payload[..take_n]);
                     kept += take_n as u64;
@@ -258,23 +229,35 @@ pub fn run_capture(
                         }
                         pending.drain(..whole);
                     }
-                    deadline = std::time::Instant::now()
-                        + if forced {
-                            Duration::from_millis(500)
-                        } else {
-                            Duration::from_secs(2)
-                        };
-                    if packet_short || kept >= budget {
-                        stop = true;
+                    deadline = std::time::Instant::now() + if forced {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(2)
+                    };
+                    if kept >= budget {
+                        break;
+                    }
+                    if received < done.buffer.requested_len() {
+                        if !forced {
+                            failed = Some(HalError::Interrupted(format!(
+                                "sample transfer ended early ({kept} of {budget} bytes)"
+                            )));
+                        }
+                        break;
                     }
                 }
-                if failed.is_some() || stop {
-                    break;
+                if job.abort_after_header && header.is_some() {
+                    continue;
                 }
                 let budget = read_budget(job, expected_bytes, limit_after_stop);
-                if received == bulk && kept < budget && ep.pending() < PIPE_DEPTH {
-                    ep.submit(Buffer::new(bulk));
+                let target = budget.saturating_add(initial_leader);
+                while ep.pending() < PIPE_DEPTH {
+                    let size = next_transfer_size(target, scheduled, data_transfer, bulk);
+                    if size == 0 { break; }
+                    ep.submit(Buffer::new(size));
+                    scheduled = scheduled.saturating_add(size as u64);
                 }
+                if ep.pending() == 0 { break; }
             }
             Some(done) if done.status.is_ok() => {
                 if header.is_some() {
@@ -321,6 +304,14 @@ pub fn run_capture(
         hw_status,
         discarded,
     })
+}
+
+/// Limits the last USB request to the remaining budget, rounded to a packet.
+fn next_transfer_size(target: u64, scheduled: u64, max_size: usize, packet: usize) -> usize {
+    let remaining = target.saturating_sub(scheduled);
+    if remaining == 0 { return 0; }
+    let wanted = remaining.min(max_size as u64) as usize;
+    wanted.div_ceil(packet) * packet
 }
 
 /// Combines capture mode, sample limits, and stop behavior into the remaining transfer ceiling.
@@ -409,6 +400,34 @@ mod hw {
             sample_limit: None,
             product_id: Some(crate::PLUS_PID),
         }
+    }
+
+    /// Measures the same 100 MHz, 10 ms, four-channel buffer workload used in the UI.
+    #[test]
+    #[ignore = "needs a connected DSLogic Plus"]
+    fn plus_four_channel_ten_ms_upload() {
+        let _guard = pod_lock();
+        let mut config = ArmConfig::default();
+        config.divider = 1;
+        config.sample_count = 1_000_000;
+        config.channel_count = 4;
+        config.channel_enable = 0x0f;
+        let mut job = armed(1_000_000, 0, 1);
+        job.image = encode_arm(&config).unwrap();
+        job.enabled_channels = 4;
+        let started = std::time::Instant::now();
+        let mut received = 0usize;
+        let mut chunks = 0usize;
+        let report = run_capture(&job, |event| {
+            if let CaptureEvent::Samples(data) = event {
+                received += data.len();
+                chunks += 1;
+            }
+            Ok(())
+        }).expect("capture and upload");
+        eprintln!("100 MHz 10 ms: {:?}, {} bytes in {} chunks", started.elapsed(), received, chunks);
+        assert_eq!(report.sample_bytes, 500_000);
+        assert_eq!(received, 500_000);
     }
 
     /// Summarizes received test data to help diagnose transfer alignment and internal-test
@@ -1182,7 +1201,16 @@ fn cancel(ep: &mut nusb::Endpoint<Bulk, In>) {
 
 #[cfg(test)]
 mod leader {
-    //! Checks that transport padding is removed without discarding real all-low samples.
+    #[test]
+    fn transfer_sizes_cover_budget_without_small_packet_requests() {
+        use super::next_transfer_size;
+        assert_eq!(next_transfer_size(500_000, 0, 1024 * 1024, 512), 500_224);
+        assert_eq!(next_transfer_size(500_000, 500_224, 1024 * 1024, 512), 0);
+        assert_eq!(next_transfer_size(2_000_000, 0, 1024 * 1024, 512), 1024 * 1024);
+        assert_eq!(next_transfer_size(500_512, 0, 1024 * 1024, 512), 500_736);
+    }
+
+    // Checks that transport padding is removed without discarding real all-low samples.
 
     use super::take_after_leader;
 
