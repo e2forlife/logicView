@@ -21,6 +21,7 @@
 
 mod eeprom;
 mod i2c;
+mod lua_host;
 mod runtime;
 mod script;
 mod spi;
@@ -52,6 +53,9 @@ pub struct Annotation {
     pub class: String,
     /// Readable description shown in tables and waveform overlays.
     pub text: String,
+    /// Longer and shorter forms of `text`, longest first, when a script provides more than one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<String>,
     /// Structured protocol values used by stacked decoders, searches, and exports.
     pub fields: BTreeMap<String, String>,
 }
@@ -71,6 +75,7 @@ impl Annotation {
             end_sample,
             class: class.into(),
             text: text.into(),
+            texts: Vec::new(),
             fields,
         }
     }
@@ -149,7 +154,40 @@ pub trait Decoder: Send {
     fn set_option(&mut self, key: &str, value: &str) -> Result<(), DecodeError>;
 }
 
-/// Describes a decoder's channel roles and output classes for discovery by clients.
+/// A required or optional decoder input, with the label and description shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ChannelDesc {
+    pub id: String,
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub desc: String,
+}
+
+/// One annotation class. `id` is the value stored on each annotation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AnnotationClass {
+    pub id: String,
+    #[serde(default)] pub desc: String,
+}
+
+/// A display row that groups annotation classes by their index in `annotation_classes`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AnnotationRowGroup {
+    pub id: String,
+    pub name: String,
+    pub classes: Vec<u32>,
+}
+
+/// A named binary stream a script can emit with `put`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct BinaryFormat {
+    pub id: String,
+    #[serde(default)] pub desc: String,
+}
+
+/// Describes a decoder's channel roles, options, and output classes for discovery by clients.
+///
+/// The fields after `options` carry the registration metadata used by sigrok protocol
+/// decoders. Clients that only know `channels`, `classes`, and `options` can ignore them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct DecoderSchema {
     pub id: String,
@@ -159,6 +197,18 @@ pub struct DecoderSchema {
     #[serde(default)] pub stack_on: Option<String>,
     #[serde(default)] pub classes: Vec<String>,
     #[serde(default)] pub options: Vec<DecoderOption>,
+    #[serde(default)] pub api_version: u32,
+    #[serde(default)] pub longname: String,
+    #[serde(default)] pub desc: String,
+    #[serde(default)] pub license: String,
+    #[serde(default)] pub inputs: Vec<String>,
+    #[serde(default)] pub outputs: Vec<String>,
+    #[serde(default)] pub tags: Vec<String>,
+    #[serde(default)] pub channel_details: Vec<ChannelDesc>,
+    #[serde(default)] pub optional_channel_details: Vec<ChannelDesc>,
+    #[serde(default)] pub annotation_classes: Vec<AnnotationClass>,
+    #[serde(default)] pub annotation_rows: Vec<AnnotationRowGroup>,
+    #[serde(default)] pub binary: Vec<BinaryFormat>,
 }
 
 /// A script-configurable setting. Values are transported as strings.
@@ -168,6 +218,8 @@ pub struct DecoderOption {
     pub name: String,
     pub default: String,
     #[serde(default)] pub values: Vec<String>,
+    /// Longer description. `name` remains the label used by the settings dialog.
+    #[serde(default)] pub desc: String,
 }
 
 /// Lists built-in and external scripted decoders.
@@ -184,9 +236,18 @@ pub fn catalog() -> Vec<DecoderSchema> {
     entries
 }
 fn schema(id: &str, name: &str, channels: &[&str], stack: Option<&str>, classes: &[&str]) -> DecoderSchema {
-    DecoderSchema { id: id.into(), name: name.into(), channels: channels.iter().map(|v| (*v).into()).collect(),
-        optional_channels: channels.iter().map(|v| (*v).into()).collect(), stack_on: stack.map(str::to_string),
-        classes: classes.iter().map(|v| (*v).into()).collect(), options: Vec::new() }
+    let channels: Vec<String> = channels.iter().map(|v| (*v).into()).collect();
+    let classes: Vec<String> = classes.iter().map(|v| (*v).into()).collect();
+    let details = |ids: &[String]| ids.iter().map(|id| ChannelDesc { id: id.clone(), name: id.clone(), desc: String::new() }).collect();
+    DecoderSchema {
+        id: id.into(), name: name.into(), optional_channels: channels.clone(),
+        channel_details: details(&channels), optional_channel_details: details(&channels), channels,
+        stack_on: stack.map(str::to_string),
+        inputs: vec![stack.unwrap_or("logic").into()], outputs: vec![id.into()],
+        annotation_classes: classes.iter().map(|id| AnnotationClass { id: id.clone(), desc: String::new() }).collect(),
+        classes, options: Vec::new(), api_version: 1, longname: String::new(), desc: String::new(),
+        license: String::new(), tags: Vec::new(), annotation_rows: Vec::new(), binary: Vec::new(),
+    }
 }
 
 /// Constructs a decoder with default options, returning `None` for unknown protocol identifiers.
@@ -241,6 +302,24 @@ pub struct ProtocolPacket {
     pub data: serde_json::Value,
 }
 
+/// Bytes emitted by a script for a later save or download action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryPayload {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub format: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A named measurement or property emitted by a script.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetaItem {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
 /// Annotations completed by a decoding pass, with an indication of cancellation.
 #[derive(Clone, Debug)]
 pub struct DecodeOutput {
@@ -248,8 +327,19 @@ pub struct DecodeOutput {
     pub annotations: Vec<Annotation>,
     /// Structured events consumed by a stacked decoder.
     pub packets: Vec<ProtocolPacket>,
+    /// Binary streams from a session script. The application does not display these yet.
+    pub binary: Vec<BinaryPayload>,
+    /// Named metadata from a session script. The application does not display these yet.
+    pub meta: Vec<MetaItem>,
     /// Whether processing stopped because the caller requested cancellation.
     pub cancelled: bool,
+}
+
+impl DecodeOutput {
+    /// A finished pass that did not emit binary or metadata.
+    pub fn new(annotations: Vec<Annotation>, packets: Vec<ProtocolPacket>, cancelled: bool) -> Self {
+        Self { annotations, packets, binary: Vec::new(), meta: Vec::new(), cancelled }
+    }
 }
 
 /// Run one decoder over `region`, checking `cancel` between slices.

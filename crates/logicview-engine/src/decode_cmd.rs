@@ -324,8 +324,12 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64, sample_rat
         );
         let output = match output {
             Ok(item) => item,
-            Err(err) => { tracing::warn!(decoder = %inst.id, "decoder failed: {err}"); DecodeOutput { annotations: Vec::new(), packets: Vec::new(), cancelled: false } }
+            Err(err) => { tracing::warn!(decoder = %inst.id, "decoder failed: {err}"); DecodeOutput::new(Vec::new(), Vec::new(), false) }
         };
+        // The session stores annotation rows. `output.binary`, `output.meta`, and
+        // `annotation_rows` from the decoder catalog are available on this pass; when the
+        // application grows a place to show binary downloads, metadata readouts, or row
+        // layout, read them here instead of adding a second decoder result.
         for annotation in &output.annotations {
             rows.push(AnnotationRow {
                 decoder: inst.id.clone(),
@@ -334,6 +338,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64, sample_rat
                 end_sample: annotation.end_sample,
                 class: annotation.class.clone(),
                 text: annotation.text.clone(),
+                texts: annotation.texts.clone(),
                 fields: annotation.fields.clone(),
             });
         }
@@ -482,13 +487,14 @@ fn filtered(
 fn group_rows(rows: &[AnnotationRow]) -> Vec<(String, Vec<Annotation>)> {
     let mut groups: Vec<(String, Vec<Annotation>)> = Vec::new();
     for row in rows {
-        let annotation = Annotation::new(
+        let mut annotation = Annotation::new(
             row.start_sample,
             row.end_sample,
             row.class.clone(),
             row.text.clone(),
             row.fields.clone(),
         );
+        annotation.texts = row.texts.clone();
         if let Some((_, bucket)) = groups.iter_mut().find(|(id, _)| id == &row.decoder) {
             bucket.push(annotation);
         } else {

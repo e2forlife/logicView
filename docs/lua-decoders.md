@@ -151,8 +151,74 @@ This example assumes `first < last`. Packet ranges follow the same bounds as ann
 - If a decoder is missing, check its ID, Lua syntax, script directory, and Preferences refresh. If it produces no rows, check channel bindings, parent selection, capture region, and the application logs. Script errors are logged and the failed run yields no annotations.
 - The runtime limits Lua memory and instructions. It exposes a limited set of standard libraries; scripts should not depend on arbitrary file, process, or network access. Avoid unnecessary per-sample work and excessive output on large captures.
 
+## 7. Use the session API
+
+Set `api_version` to `3` when a decoder should follow the same shape as a [sigrok protocol decoder](https://sigrok.org/wiki/Protocol_decoder_API). The global `logicview` table provides the output-type and metadata constants. Call methods with a colon (`self:wait()`), or with a dot (`self.wait()`); both pass the arguments through.
+
+[`session_edges.lua`](../examples/decoders/session_edges.lua) is a complete example. A session script declares the same kind of registration metadata sigrok uses:
+
+| Field | Role |
+| --- | --- |
+| `api_version` | `3` selects this host. Omitted, `1`, and `2` keep the functional `decode(first, last, bit, options, context)` callback. |
+| `id`, `name`, `longname`, `desc`, `license` | Identity and the license notice stored with the script. |
+| `inputs`, `outputs`, `tags` | `logic` means samples. Any other input is the parent protocol id and sets the stack parent when `stack_on` is omitted. |
+| `channels`, `optional_channels` | A list of ids, or tables `{ id, name, desc }`. For version 3, omitted optional channels mean there are none. |
+| `options` | `{ id, desc, default, values }`. `name` is accepted as well. Numbers and booleans are stored as strings. |
+| `annotations` | `{ { "id", "Description" }, ... }`. The index in this list is the class passed to `put`. `classes` still accepts a list of ids. |
+| `annotation_rows` | `{ { "id", "Label", { 0, 1 } }, ... }`. The numbers are annotation-class indexes. |
+| `binary` | `{ { "id", "Description" }, ... }` for byte streams. |
+
+The host calls `metadata`, then `start`, then `reset`, then `decode`. `metadata(self, key, value)` is called with `logicview.SRD_CONF_SAMPLERATE` when the capture has a sample rate. `start` is where the script calls `register`. `reset` clears protocol state and should leave registered output ids in place.
+
+```lua
+local lv = logicview
+
+start = function(self)
+  self.out_ann = self:register(lv.OUTPUT_ANN)
+  self.out_python = self:register(lv.OUTPUT_PYTHON)
+  self.out_binary = self:register(lv.OUTPUT_BINARY)
+  self.out_meta = self:register(lv.OUTPUT_META, "bitrate")
+end
+```
+
+`register` returns the id passed back to `put`. The four output types match sigrok:
+
+- `OUTPUT_ANN` data is `{ class_index, { "Longest text", "Short" } }`. The first string is shown today. Further strings are kept, longest first, for a later zoom-dependent label.
+- `OUTPUT_PYTHON` data is any JSON-compatible value. A list whose first item is a string becomes the packet kind, and the whole value is delivered to a stacked decoder. Register one Python output for the stack.
+- `OUTPUT_BINARY` data is `{ format_index, bytes }`. `bytes` is a Lua string or a list of numbers from 0 to 255.
+- `OUTPUT_META` data is a JSON-compatible value. The name passed to `register` identifies it.
+
+`put(start_sample, end_sample, output_id, data)` uses sigrok's inclusive end. A marker on one sample uses the same number for both ends. LogicView stores that marker as the half-open range `[start_sample, end_sample + 1)`. The functional callback's returned ranges stay exclusive.
+
+`wait` blocks until a condition matches, then sets `self.samplenum` and `self.matched` and returns the pin levels. Pins are ordered as required channels, then optional channels, one-based. A connected pin is `true` or `false`. A disconnected optional pin is `nil`.
+
+```lua
+local pins = self:wait({ [0] = "r" })       -- rising edge on the first channel
+local pins = self:wait({ data = "f" })      -- falling edge by channel id
+local pins = self:wait({ [0] = "h", [1] = "f" })
+local pins = self:wait({ { [0] = "e" }, { skip = 100 } })
+local pins = self:wait({ skip = 8 })
+local pins = self:wait()                    -- the next sample
+```
+
+Terms inside one table are combined with and. A list of tables is combined with or. `self.matched[i]` is true when condition `i` matched. The pin letters are `l`, `h`, `r`, `f`, `e`, and `n` (stable, the opposite of an edge); `0` and `1` mean low and high. `skip` counts samples forward from the previous position.
+
+Before the first sample, `samplenum` is one less than the region start. At the beginning of a capture the previous level is the first sample, so that sample is not itself an edge. When the region starts later, the previous level is the sample just before the region. `wait` raises the end of the capture when no later sample can match; let that propagate out of `decode` so the `while true` loop stops. Output emitted before that point is kept.
+
+A stacked session decoder implements `decode(self, start_sample, end_sample, data)` instead of calling `wait`. `start_sample` is inclusive and `end_sample` is exclusive, which is the range sigrok walks with `start_sample` through `end_sample - 1`. `data` is a list of the parent's Python outputs that overlap the region. Each item has `start_sample`, exclusive `end_sample`, `kind`, and `data`.
+
+The host also sets `self.options`, `self.connected`, and `self.sample_rate_hz` when a rate is known.
+
+## 8. Expose new application features here
+
+The session host is the place to grow the decoder API. When LogicView adds a capture or interface feature a script could use, expose it on this host instead of inventing a parallel callback. Likely additions are a user-chosen initial pin level, a saved binary download, a metadata readout, annotation rows in the waveform, and streamed sample chunks. Each one should arrive as a `metadata` key, an output type, or a field on the decoder instance, next to the constants in the `logicview` table.
+
+Binary payloads and metadata values are produced and returned to the decode pass today. The waveform stores annotation rows and passes Python packets up the stack; it does not yet show binary downloads, metadata readouts, or annotation-row layout.
+
 ## Porting a DSView decoder
 
-Read the source decoder's channels, defaults, input and output packet formats, timing assumptions, and annotations before translating its state machine. Keep attribution and license notices from the source. Map DSView sample positions to LogicView's absolute, exclusive-end ranges, and decide what happens when a frame starts before or ends after the selected region. Compare results against known captures or independently constructed protocol fixtures.
+Read the source decoder's channels, defaults, input and output packet formats, timing assumptions, and annotations before translating its state machine. Keep attribution and license notices from the source. A Python `decode(self)` loop that calls `self.wait()` and `self.put()` maps onto the session methods above. Translate `sigrokdecode.OUTPUT_ANN` and the other constants to `logicview.OUTPUT_ANN` and its siblings, and translate `SRD_CONF_SAMPLERATE` to `logicview.SRD_CONF_SAMPLERATE`.
 
-LogicView's Lua API is not a drop-in implementation of DSView's Python `sigrokdecode` API. In particular, the current interface does not provide DSView's `wait`, `put`, and `register` methods or all of its packet types. Built-in packet production currently covers SPI data and chip-select events; other built-in protocols do not yet supply equivalent typed streams. Some ports therefore need additional runtime or parent-decoder work before they can reproduce all DSView behavior.
+`put` keeps sigrok's inclusive end. Annotation ranges returned from the functional callback, and the `end_sample` on a stacked `data` item, use LogicView's exclusive end. Decide what happens when a frame starts before or ends after the selected region. Compare results against known captures or independently constructed protocol fixtures.
+
+The host is Lua and covers the same jobs as DSView's Python `sigrokdecode` module. A `.py` decoder still has to be translated. Built-in packet production currently covers SPI data and chip-select events. UART, I2C, and the other built-in decoders still need Python output before a stacked port can consume their bytes.

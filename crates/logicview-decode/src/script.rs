@@ -1,4 +1,8 @@
 ﻿//! Discovery and execution of user-provided Lua decoder modules.
+//!
+//! A script returns a registration table. Without `api_version` 3 it implements
+//! `decode(start, end, bit, options, context)`. With `api_version` 3 or higher
+//! the session host in `lua_host` supplies `register`, `wait`, and `put`.
 use std::{collections::BTreeMap, path::PathBuf, sync::atomic::{AtomicBool, Ordering}};
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value};
 use super::{Annotation, DecodeError, DecodeOutput, DecodeRequest, DecoderSchema};
@@ -23,29 +27,15 @@ fn lua() -> Result<Lua, DecodeError> {
             Err(mlua::Error::RuntimeError("decoder instruction limit exceeded".into()))
         } else { Ok(mlua::VmState::Continue) }
     }).map_err(|e| DecodeError::Message(e.to_string()))?;
+    super::lua_host::install(&lua)?;
     Ok(lua)
 }
 fn module(lua: &Lua, path: &PathBuf) -> Result<Table, DecodeError> {
     let source = std::fs::read_to_string(path).map_err(|e| DecodeError::Message(e.to_string()))?;
     lua.load(source.trim_start_matches('\u{feff}')).set_name(path.to_string_lossy()).eval().map_err(|e| DecodeError::Message(e.to_string()))
 }
-fn metadata(lua: &Lua, module: &Table) -> Result<DecoderSchema, DecodeError> {
-    let schema = DecoderSchema {
-        id: module.get("id").map_err(|e| DecodeError::Message(e.to_string()))?,
-        name: module.get("name").map_err(|e| DecodeError::Message(e.to_string()))?,
-        channels: module.get::<Option<Vec<String>>>("channels").map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default(),
-        optional_channels: Vec::new(),
-        stack_on: module.get("stack_on").map_err(|e| DecodeError::Message(e.to_string()))?,
-        classes: module.get::<Option<Vec<String>>>("classes").map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default(),
-        options: lua.from_value::<Option<Vec<super::DecoderOption>>>(module.get::<Value>("options").map_err(|e| DecodeError::Message(e.to_string()))?)
-            .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default(),
-    };
-    if schema.id.is_empty() || !schema.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || schema.name.is_empty() {
-        return Err(DecodeError::Message("invalid scripted decoder metadata".into()));
-    }
-    let optional_channels = module.get::<Option<Vec<String>>>("optional_channels")
-        .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_else(|| schema.channels.clone());
-    Ok(DecoderSchema { optional_channels, ..schema })
+fn metadata(_lua: &Lua, module: &Table) -> Result<DecoderSchema, DecodeError> {
+    super::lua_host::read_schema(module)
 }
 pub fn catalog() -> Vec<DecoderSchema> {
     files().into_iter().filter_map(|path| {
@@ -57,12 +47,15 @@ pub fn run_script(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<De
     run_paths(request, cancel, files())
 }
 fn run_paths(request: &DecodeRequest<'_>, cancel: &AtomicBool, paths: Vec<PathBuf>) -> Result<DecodeOutput, DecodeError> {
-    if cancel.load(Ordering::Relaxed) { return Ok(DecodeOutput { annotations: vec![], packets: vec![], cancelled: true }); }
+    if cancel.load(Ordering::Relaxed) { return Ok(DecodeOutput::new(vec![], vec![], true)); }
     for path in paths {
         let lua = lua()?;
         let m = match module(&lua, &path) { Ok(m) => m, Err(_) => continue };
         let schema = match metadata(&lua, &m) { Ok(m) => m, Err(_) => continue };
         if schema.id != request.protocol { continue; }
+        if schema.api_version >= 3 {
+            return super::lua_host::run_session(&lua, &m, &schema, request, cancel);
+        }
         let decode: mlua::Function = m.get("decode").map_err(|e| DecodeError::Message(e.to_string()))?;
         let mut options: BTreeMap<String, String> = schema.options.iter().map(|option| (option.id.clone(), option.default.clone())).collect();
         options.extend(request.options.iter().cloned());
@@ -82,35 +75,45 @@ fn run_paths(request: &DecodeRequest<'_>, cancel: &AtomicBool, paths: Vec<PathBu
             context.set("packets", lua.to_value(request.lower_packets)?)?;
             decode.call::<Value>((start, end, bit, lua.to_value(&options)?, context))
         }).map_err(|e| DecodeError::Message(e.to_string()))?;
-        #[derive(serde::Deserialize)]
-        struct Row { start_sample: u64, end_sample: u64, class: String, text: String, #[serde(default)] fields: BTreeMap<String, String> }
-        let table = match result { Value::Table(table) => table, _ => return Err(DecodeError::Message("script must return a table".into())) };
-        let wrapped = table.contains_key("annotations").map_err(|e| DecodeError::Message(e.to_string()))?
-            || table.contains_key("packets").map_err(|e| DecodeError::Message(e.to_string()))?;
-        let (rows, packets): (Vec<Row>, Vec<super::ProtocolPacket>) = if wrapped {
-            let rows = lua.from_value::<Option<Vec<Row>>>(table.get("annotations").map_err(|e| DecodeError::Message(e.to_string()))?)
-                .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default();
-            let packets = lua.from_value::<Option<Vec<super::ProtocolPacket>>>(table.get("packets").map_err(|e| DecodeError::Message(e.to_string()))?)
-                .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default();
-            (rows, packets)
-        } else {
-            (lua.from_value(Value::Table(table)).map_err(|e| DecodeError::Message(e.to_string()))?, Vec::new())
-        };
-        let mut annotations = Vec::new();
-        for row in rows {
-            if row.start_sample < start || row.end_sample > end || row.start_sample >= row.end_sample {
-                return Err(DecodeError::Message("script returned an invalid annotation range".into()));
-            }
-            annotations.push(Annotation::new(row.start_sample, row.end_sample, row.class, row.text, row.fields));
-        }
-        for packet in &packets {
-            if packet.start_sample < start || packet.end_sample > end || packet.start_sample >= packet.end_sample || packet.kind.is_empty() {
-                return Err(DecodeError::Message("script returned an invalid packet".into()));
-            }
-        }
-        return Ok(DecodeOutput { annotations, packets, cancelled: false });
+        return output_from_value(&lua, result, start, end);
     }
     Err(DecodeError::UnknownProtocol(request.protocol.into()))
+}
+
+pub(crate) fn output_from_value(lua: &Lua, result: Value, start: u64, end: u64) -> Result<DecodeOutput, DecodeError> {
+    #[derive(serde::Deserialize)]
+    struct Row { start_sample: u64, end_sample: u64, class: String, #[serde(default)] text: String, #[serde(default)] texts: Vec<String>, #[serde(default)] fields: BTreeMap<String, String> }
+    let table = match result { Value::Table(table) => table, Value::Nil => return Ok(DecodeOutput::new(Vec::new(), Vec::new(), false)), _ => return Err(DecodeError::Message("script must return a table".into())) };
+    let wrapped = table.contains_key("annotations").map_err(|e| DecodeError::Message(e.to_string()))?
+        || table.contains_key("packets").map_err(|e| DecodeError::Message(e.to_string()))?;
+    let (rows, packets): (Vec<Row>, Vec<super::ProtocolPacket>) = if wrapped {
+        let rows = lua.from_value::<Option<Vec<Row>>>(table.get("annotations").map_err(|e| DecodeError::Message(e.to_string()))?)
+            .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default();
+        let packets = lua.from_value::<Option<Vec<super::ProtocolPacket>>>(table.get("packets").map_err(|e| DecodeError::Message(e.to_string()))?)
+            .map_err(|e| DecodeError::Message(e.to_string()))?.unwrap_or_default();
+        (rows, packets)
+    } else {
+        (lua.from_value(Value::Table(table)).map_err(|e| DecodeError::Message(e.to_string()))?, Vec::new())
+    };
+    let mut annotations = Vec::new();
+    for row in rows {
+        if row.start_sample < start || row.end_sample > end || row.start_sample >= row.end_sample {
+            return Err(DecodeError::Message("script returned an invalid annotation range".into()));
+        }
+        let mut texts = row.texts;
+        let text = if row.text.is_empty() { texts.first().cloned().unwrap_or_default() } else { row.text };
+        if text.is_empty() { return Err(DecodeError::Message("script returned an annotation without text".into())); }
+        if texts.len() <= 1 { texts.clear(); }
+        let mut annotation = Annotation::new(row.start_sample, row.end_sample, row.class, text, row.fields);
+        annotation.texts = texts;
+        annotations.push(annotation);
+    }
+    for packet in &packets {
+        if packet.start_sample < start || packet.end_sample > end || packet.start_sample >= packet.end_sample || packet.kind.is_empty() {
+            return Err(DecodeError::Message("script returned an invalid packet".into()));
+        }
+    }
+    Ok(DecodeOutput::new(annotations, packets, false))
 }
 
 #[cfg(test)]
@@ -269,6 +272,133 @@ mod tests {
             region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &[] };
         let result = run_paths(&req, &AtomicBool::new(false), vec![path]).unwrap();
         assert_eq!(result.annotations[0].text, "1");
+    }
+
+    #[test]
+    fn session_schema_keeps_sigrok_registration_fields() {
+        let lua = lua().unwrap();
+        let module: Table = lua.load(r#"
+            return {
+              api_version = 3, id = 'edge', name = 'Edge', longname = 'Edge detector',
+              desc = 'Marks edges.', license = 'gplv3+', inputs = {'logic'}, outputs = {'edge'},
+              tags = {'Debug/trace'},
+              channels = {{id = 'data', name = 'Data', desc = 'Sampled line'}},
+              optional_channels = {{id = 'gate', name = 'Gate', desc = 'Qualifier'}},
+              options = {{id = 'mode', desc = 'Edge mode', default = 'rising', values = {'rising', 'falling'}}},
+              annotations = {{'edge', 'Edge'}},
+              annotation_rows = {{'edges', 'Edges', {0}}},
+              binary = {{'raw', 'Raw markers'}},
+              decode = function() end,
+            }
+        "#).eval().unwrap();
+        let schema = metadata(&lua, &module).unwrap();
+        assert_eq!(schema.api_version, 3);
+        assert_eq!(schema.longname, "Edge detector");
+        assert_eq!(schema.license, "gplv3+");
+        assert_eq!(schema.channel_details[0].desc, "Sampled line");
+        assert_eq!(schema.optional_channels, ["gate"]);
+        assert!(schema.channels.iter().all(|channel| channel != "gate"));
+        assert_eq!(schema.options[0].name, "Edge mode");
+        assert_eq!(schema.annotation_classes[0].desc, "Edge");
+        assert_eq!(schema.annotation_rows[0].classes, [0]);
+        assert_eq!(schema.binary[0].id, "raw");
+        assert_eq!(schema.tags, ["Debug/trace"]);
+    }
+
+    #[test]
+    fn session_wait_and_put_follow_sigrok_sample_rules() {
+        let path = std::env::temp_dir().join(format!("logicview-session-{}.lua", std::process::id()));
+        std::fs::write(&path, r#"
+            local lv = logicview
+            return {
+              api_version = 3, id = 'edges', name = 'Edges',
+              channels = {{id = 'data'}}, optional_channels = {{id = 'gate'}},
+              annotations = {{'edge', 'Edge'}}, binary = {{'raw', 'Raw'}},
+              start = function(self)
+                self.out_ann = self:register(lv.OUTPUT_ANN)
+                self.out_bin = self:register(lv.OUTPUT_BINARY)
+                self.out_meta = self:register(lv.OUTPUT_META, 'edges')
+                self.out_python = self:register(lv.OUTPUT_PYTHON)
+              end,
+              metadata = function(self, key, value)
+                if key == lv.SRD_CONF_SAMPLERATE then self.rate = value end
+              end,
+              decode = function(self)
+                self:put(0, 0, self.out_meta, self.rate)
+                local pins = self:wait()
+                self:put(self.samplenum, self.samplenum, self.out_ann, {0, {tostring(pins[1]) .. ':' .. tostring(pins[2])}})
+                self:wait({{[0] = 'r'}, {skip = 2}})
+                self:put(self.samplenum, self.samplenum, self.out_ann, {0, {'Rise', 'R'}})
+                self:put(self.samplenum, self.samplenum, self.out_bin, {0, string.char(1)})
+                self:put(self.samplenum, self.samplenum, self.out_python, {'EDGE', 1})
+                self:wait({skip = 4})
+                self:put(self.samplenum, self.samplenum, self.out_ann, {0, {'Skip ' .. self.samplenum}})
+              end,
+            }
+        "#).unwrap();
+        let data = [0b0000_0010u8];
+        let channels = [("data", data.as_slice())];
+        let request = DecodeRequest { protocol: "edges", channels: &channels, options: &[], region: 0..8,
+            sample_len: 8, sample_rate_hz: Some(1_000), lower: &[], lower_packets: &[] };
+        let result = run_paths(&request, &AtomicBool::new(false), vec![path.clone()]).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.annotations[0].text, "false:nil");
+        assert_eq!(result.annotations[1].text, "Rise");
+        assert_eq!(result.annotations[1].texts, ["Rise", "R"]);
+        assert_eq!(result.annotations[1].start_sample, 1);
+        assert_eq!(result.annotations[1].end_sample, 2);
+        assert_eq!(result.annotations[2].text, "Skip 5");
+        assert_eq!(result.binary[0].bytes, vec![1]);
+        assert_eq!(result.meta[0].key, "edges");
+        assert_eq!(result.meta[0].value, 1000);
+        assert_eq!(result.packets[0].kind, "EDGE");
+    }
+
+    #[test]
+    fn session_python_output_is_the_stack_input() {
+        let dir = std::env::temp_dir().join(format!("logicview-session-stack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("parent.lua");
+        let child = dir.join("child.lua");
+        std::fs::write(&parent, r#"
+            return { api_version = 3, id = 'parent', name = 'Parent', inputs = {'logic'}, outputs = {'parent'},
+              start = function(self) self.out = self:register(logicview.OUTPUT_PYTHON) end,
+              decode = function(self) self:put(1, 2, self.out, {'WORD', 7}) end }
+        "#).unwrap();
+        std::fs::write(&child, r#"
+            return { api_version = 3, id = 'child', name = 'Child', inputs = {'parent'},
+              annotations = {{'word', 'Word'}},
+              start = function(self) self.out = self:register(logicview.OUTPUT_ANN) end,
+              decode = function(self, _, _, data)
+                local item = data[1]
+                self:put(item.start_sample, item.end_sample - 1, self.out, {0, {item.data[1] .. ':' .. item.data[2]}})
+              end }
+        "#).unwrap();
+        let request = DecodeRequest { protocol: "parent", channels: &[], options: &[], region: 0..4,
+            sample_len: 4, sample_rate_hz: None, lower: &[], lower_packets: &[] };
+        let parent_out = run_paths(&request, &AtomicBool::new(false), vec![parent.clone()]).unwrap();
+        let request = DecodeRequest { protocol: "child", lower_packets: &parent_out.packets, ..request };
+        let child_out = run_paths(&request, &AtomicBool::new(false), vec![child.clone()]).unwrap();
+        assert_eq!(child_out.annotations[0].text, "WORD:7");
+        assert_eq!((child_out.annotations[0].start_sample, child_out.annotations[0].end_sample), (1, 3));
+        let _ = std::fs::remove_file(&parent);
+        let _ = std::fs::remove_file(&child);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn session_edges_example_marks_rising_edges() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/session_edges.lua");
+        let data = [0b0000_1010u8];
+        let channels = [("data", data.as_slice())];
+        let request = DecodeRequest { protocol: "session_edges", channels: &channels, options: &[], region: 0..8,
+            sample_len: 8, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &[] };
+        let result = run_paths(&request, &AtomicBool::new(false), vec![path]).unwrap();
+        assert_eq!(result.annotations.iter().map(|row| row.start_sample).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(result.annotations[0].texts, ["Rise", "R"]);
+        assert_eq!(result.packets.len(), 2);
+        assert_eq!(result.binary.len(), 2);
+        assert_eq!(result.meta.len(), 2);
     }
 
 }

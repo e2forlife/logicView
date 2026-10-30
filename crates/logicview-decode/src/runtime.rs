@@ -22,30 +22,18 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
     }
     if decoder.stack_on().is_some() {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(DecodeOutput {
-                annotations: Vec::new(),
-                packets: Vec::new(),
-                cancelled: true,
-            });
+            return Ok(DecodeOutput::new(Vec::new(), Vec::new(), true));
         }
         let mut annotations = decoder.feed_lower(request.lower);
         annotations.extend(decoder.finish());
-        return Ok(DecodeOutput {
-            annotations,
-            packets: Vec::new(),
-            cancelled: false,
-        });
+        return Ok(DecodeOutput::new(annotations, Vec::new(), false));
     }
     let end = request.region.end.min(request.sample_len);
     let mut cursor = request.region.start.min(end);
     let mut annotations = Vec::new();
     while cursor < end {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(DecodeOutput {
-                annotations,
-                packets: Vec::new(),
-                cancelled: true,
-            });
+            return Ok(DecodeOutput::new(annotations, Vec::new(), true));
         }
         let len = (end - cursor).min(SLICE);
         let slice = SampleSlice::new(cursor, len, request.channels);
@@ -53,11 +41,7 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         cursor += len;
     }
     if cancel.load(Ordering::Relaxed) {
-        return Ok(DecodeOutput {
-            annotations,
-            packets: Vec::new(),
-            cancelled: true,
-        });
+        return Ok(DecodeOutput::new(annotations, Vec::new(), true));
     }
     annotations.extend(decoder.finish());
     let packets = if request.protocol == "spi" {
@@ -84,11 +68,7 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         packets.sort_by_key(|packet| packet.end_sample);
         packets
     } else { Vec::new() };
-    Ok(DecodeOutput {
-        annotations,
-        packets,
-        cancelled: false,
-    })
+    Ok(DecodeOutput::new(annotations, packets, false))
 }
 
 /// Substring match, or a dash-separated byte pattern such as `A0-10-5A`.

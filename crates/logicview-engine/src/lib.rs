@@ -254,6 +254,9 @@ pub struct AnnotationRow {
     pub end_sample: u64,
     pub class: String,
     pub text: String,
+    /// Alternate annotation strings, longest first. Empty when the decoder supplied one string.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<String>,
     pub fields: BTreeMap<String, String>,
 }
 
