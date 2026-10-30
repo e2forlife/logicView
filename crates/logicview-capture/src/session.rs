@@ -95,6 +95,8 @@ pub struct HostClock {
     pub hw_max_hz: u64,
     pub half_rate_hz: Option<u64>,
     pub quarter_rate_hz: Option<u64>,
+    /// 1 on the Plus. 5 on the U3Pro32. The arm record stores the post-divider.
+    pub pre_divider: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +238,7 @@ impl Session {
                 hw_max_hz: DEMO_HW_MAX_RATE,
                 half_rate_hz: None,
                 quarter_rate_hz: None,
+                pre_divider: 1,
             },
         )?;
         self.resolve_edges = true;
@@ -531,7 +534,11 @@ fn build_arm(
     if clock.quarter_rate_hz == Some(config.sample_rate_hz) {
         mode.insert(ModeFlags::QUARTER_RATE);
     }
-    let divider = logicview_proto::logic_divider(clock.hw_max_hz, config.sample_rate_hz, 1);
+    let divider = logicview_proto::logic_divider(
+        clock.hw_max_hz,
+        config.sample_rate_hz,
+        clock.pre_divider.max(1),
+    );
     let trigger_position = if config.trigger_enabled && !instant {
         align_trigger_position(total, config.trigger_percent, config.depth)
     } else {
@@ -683,6 +690,7 @@ mod tests {
                 hw_max_hz: 100_000_000,
                 half_rate_hz: None,
                 quarter_rate_hz: None,
+                pre_divider: 1,
             },
         )
         .unwrap();
@@ -720,6 +728,7 @@ mod tests {
                 hw_max_hz: 100_000_000,
                 half_rate_hz: None,
                 quarter_rate_hz: None,
+                pre_divider: 1,
             },
         )
         .unwrap();
@@ -732,6 +741,31 @@ mod tests {
         assert_eq!(armed.stages[1].edge, 1);
         assert_eq!(armed.stages[0].count, 1);
         assert_eq!(armed.stages[1].count, 1);
+    }
+
+    #[test]
+    fn u3_pre_divider_is_stored_in_the_low_half() {
+        let config = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 1,
+            ..SessionConfig::default()
+        };
+        let bytes = build_arm(
+            &config,
+            960,
+            true,
+            1,
+            &HostClock {
+                hw_max_hz: 1_000_000_000,
+                half_rate_hz: None,
+                quarter_rate_hz: None,
+                pre_divider: 5,
+            },
+        )
+        .unwrap();
+        let armed = decode_arm(&bytes).unwrap();
+        assert_eq!(armed.divider, 200);
+        assert_eq!(armed.divider >> 16, 0);
     }
 
     #[test]

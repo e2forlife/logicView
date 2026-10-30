@@ -199,6 +199,9 @@ async fn usb_connect_is_refused() {
         .any(|profile| { profile.product_id == 0x0020 && profile.hardware_tested }));
     assert!(profiles
         .iter()
+        .any(|profile| profile.product_id == 0x002C && profile.hardware_tested));
+    assert!(profiles
+        .iter()
         .any(|profile| profile.product_id == 0x0034 && !profile.hardware_tested));
 }
 
@@ -479,6 +482,25 @@ async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
 }
 
 #[tokio::test]
+#[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
+async fn plugged_in_u3pro32_is_listed_before_demo_devices() {
+    let engine = Engine::new();
+    let devices = engine.list_devices().await;
+    assert_eq!(
+        devices.first().map(|device| device.id.as_str()),
+        Some("usb:2a0e:002c")
+    );
+    assert!(devices.iter().any(|device| device.kind == "demo"));
+    let info = engine.connect("usb:2a0e:002c").await.expect("connect");
+    assert!(info.name.contains("U3Pro32"), "{}", info.name);
+    let status = engine.status(None).await.unwrap();
+    assert_eq!(status.channels.len(), 32);
+    assert_eq!(status.channels[0].name, "D0");
+    assert_eq!(status.channels[31].name, "D31");
+    assert_eq!(status.devices[0].id, "usb:2a0e:002c");
+}
+
+#[tokio::test]
 async fn sample_rate_drops_when_more_channels_are_enabled() {
     let engine = Engine::new();
     engine
@@ -492,7 +514,10 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
         )
         .await
         .unwrap();
-    assert_eq!(engine.status(None).await.unwrap().sample_rate_hz, 400_000_000);
+    assert_eq!(
+        engine.status(None).await.unwrap().sample_rate_hz,
+        400_000_000
+    );
     engine.attach_device(None, "demo:spi").await.unwrap();
     engine
         .configure(
@@ -521,7 +546,10 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
         )
         .await
         .unwrap();
-    assert_eq!(engine.status(None).await.unwrap().sample_rate_hz, 400_000_000);
+    assert_eq!(
+        engine.status(None).await.unwrap().sample_rate_hz,
+        400_000_000
+    );
     let profiles = engine.list_profiles().await;
     let plus = profiles
         .iter()
@@ -533,7 +561,7 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
         .unwrap();
     assert_eq!(plus.buffer_rates[0].max_hz, 400_000_000);
     assert_eq!(wide.buffer_rates.last().unwrap().max_channels, 32);
-    assert_eq!(wide.stream_rates.last().unwrap().max_hz, 50_000_000);
+    assert_eq!(wide.stream_rates.last().unwrap().max_hz, 10_000_000);
 }
 
 #[tokio::test]
@@ -602,10 +630,7 @@ async fn imported_capture_bytes_replace_the_open_session() {
     assert_eq!(loaded.sample_count, original.sample_count);
     assert_eq!(loaded.channels[0].name, "CLK");
     assert_eq!(
-        from_dsl
-            .search_edge(None, 0, 0, true, true)
-            .await
-            .unwrap(),
+        from_dsl.search_edge(None, 0, 0, true, true).await.unwrap(),
         edge
     );
 }

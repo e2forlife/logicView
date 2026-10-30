@@ -1,4 +1,4 @@
-//! Vendor control pipe and FPGA bring-up for the Plus pod.
+//! Vendor control pipe and FPGA bring-up for a tested logic pod.
 
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, Out, Recipient};
 use nusb::{MaybeFuture, Speed};
 
-use crate::profile::{BITSTREAM_NAME, HDL_VERSION, PLUS_PID, VENDOR_ID};
+use crate::profile::{
+    BITSTREAM_NAME, HDL_VERSION, PLUS_PID, U3PRO32_PID, U3_BITSTREAM_NAME, U3_HDL_VERSION,
+    U3_HS_SAMPLE_LEADER, VENDOR_ID,
+};
 use crate::HalError;
 
 const REQ_WRITE: u8 = 0xB0;
@@ -46,6 +49,8 @@ pub struct Pod {
     interface: nusb::Interface,
     pub firmware_major: u8,
     pub firmware_minor: u8,
+    product_id: u16,
+    speed: Option<Speed>,
 }
 
 pub struct ListedPod {
@@ -58,6 +63,11 @@ pub struct ListedPod {
 /// Speed is not part of that identity: some hosts omit it until the device is open.
 pub fn matches_plus(vendor_id: u16, product_id: u16) -> bool {
     vendor_id == VENDOR_ID && product_id == PLUS_PID
+}
+
+/// Product ids this build will open and arm.
+pub fn supported_product(product_id: u16) -> bool {
+    product_id == PLUS_PID || product_id == U3PRO32_PID
 }
 
 /// Every DreamSourceLab device on the bus, whether or not this build can open it.
@@ -127,15 +137,33 @@ fn speed_label(speed: Option<Speed>) -> &'static str {
 
 impl Pod {
     pub fn open() -> Result<Self, HalError> {
+        Self::open_product(None)
+    }
+
+    /// Open one tested product. `None` opens the first tested pod on the bus.
+    pub fn open_product(product_id: Option<u16>) -> Result<Self, HalError> {
+        if let Some(pid) = product_id {
+            if !supported_product(pid) {
+                return Err(HalError::Message(format!(
+                    "product {pid:#06x} is not opened"
+                )));
+            }
+        }
         let info = nusb::list_devices()
             .wait()
             .map_err(|err| HalError::Usb(err.to_string()))?
-            .find(|dev| matches_plus(dev.vendor_id(), dev.product_id()))
+            .find(|dev| {
+                dev.vendor_id() == VENDOR_ID
+                    && supported_product(dev.product_id())
+                    && product_id.is_none_or(|pid| dev.product_id() == pid)
+            })
             .ok_or(HalError::NotFound)?;
+        let product_id = info.product_id();
         let device = info
             .open()
             .wait()
             .map_err(|err| HalError::Usb(err.to_string()))?;
+        let speed = device.speed();
         let interface = device
             .claim_interface(0)
             .wait()
@@ -144,6 +172,8 @@ impl Pod {
             interface,
             firmware_major: 0,
             firmware_minor: 0,
+            product_id,
+            speed,
         };
         let version = pod.read(DEST_VERSION, 0, 2)?;
         if version.len() < 2 {
@@ -159,6 +189,25 @@ impl Pod {
         }
         pod.ensure_fpga()?;
         Ok(pod)
+    }
+
+    pub fn product_id(&self) -> u16 {
+        self.product_id
+    }
+
+    pub fn speed(&self) -> Option<Speed> {
+        self.speed
+    }
+
+    /// High-speed U3 uploads insert one 512-byte bulk packet between the
+    /// header and the samples. The packet is structural: skipping it by
+    /// looking for zeros would drop a real all-low capture.
+    pub fn sample_leader(&self) -> u64 {
+        if self.product_id == U3PRO32_PID && self.speed == Some(Speed::High) {
+            U3_HS_SAMPLE_LEADER
+        } else {
+            0
+        }
     }
 
     pub fn status(&self) -> Result<u8, HalError> {
@@ -230,29 +279,80 @@ impl Pod {
         &self.interface
     }
 
-    fn ensure_fpga(&self) -> Result<(), HalError> {
+    /// Program the FPGA from the bitstream on disk even when DONE is already set.
+    pub fn reload_fpga(&self) -> Result<(), HalError> {
+        self.load_bitstream()?;
         let status = self.status()?;
-        if status & BIT_DONE != 0 {
-            let window = self.read(DEST_REG_READ, 0, (HDL_ADDR as u8) + 1)?;
-            let found = window.get(HDL_ADDR as usize).copied().unwrap_or(0);
-            if found != HDL_VERSION {
-                return Err(HalError::HdlMismatch {
-                    found,
-                    expected: HDL_VERSION,
-                });
-            }
-            return Ok(());
+        if status & BIT_DONE == 0 {
+            return Err(HalError::Message(format!(
+                "FPGA DONE stayed clear after configuration ({status:#04x})"
+            )));
         }
-        let path = bitstream_path()?;
+        self.accept_hdl()
+    }
+
+    fn ensure_fpga(&self) -> Result<(), HalError> {
+        if self.status()? & BIT_DONE != 0 {
+            return self.accept_hdl();
+        }
+        self.load_bitstream()
+    }
+
+    fn load_bitstream(&self) -> Result<(), HalError> {
+        let path = bitstream_path(self.bitstream_name())?;
         let image = std::fs::read(&path).map_err(|err| {
             HalError::Message(format!("could not read {}: {err}", path.display()))
         })?;
         self.configure_fpga(&image)
     }
 
+    fn bitstream_name(&self) -> &'static str {
+        if self.product_id == U3PRO32_PID {
+            U3_BITSTREAM_NAME
+        } else {
+            BITSTREAM_NAME
+        }
+    }
+
+    fn hdl_expected(&self) -> u8 {
+        if self.product_id == U3PRO32_PID {
+            U3_HDL_VERSION
+        } else {
+            HDL_VERSION
+        }
+    }
+
+    fn accept_hdl(&self) -> Result<(), HalError> {
+        let found = match self.read(DEST_REG_READ, 0, (HDL_ADDR as u8) + 1) {
+            Ok(window) => window.get(HDL_ADDR as usize).copied().unwrap_or(0),
+            Err(_) if self.product_id == U3PRO32_PID => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let expected = self.hdl_expected();
+        let ok = if self.product_id == U3PRO32_PID {
+            // 0x0E after configuration, 0 after a capture. DONE is the load bit.
+            found == 0 || found == expected
+        } else {
+            found == expected
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(HalError::HdlMismatch { found, expected })
+        }
+    }
+
     fn configure_fpga(&self, image: &[u8]) -> Result<(), HalError> {
-        self.write(DEST_PROG, &[!BIT_PROG])?;
-        self.write(DEST_LED, &[!BIT_GREEN & !BIT_RED])?;
+        if self.product_id == U3PRO32_PID {
+            // The GPIF stays word-wide across PROG unless this is cleared
+            // first, and the bitstream then never sets DONE.
+            self.write(DEST_WORDWIDE, &[0])?;
+            self.write(DEST_PROG, &[!BIT_PROG])?;
+            self.write(DEST_LED, &[0x00])?;
+        } else {
+            self.write(DEST_PROG, &[!BIT_PROG])?;
+            self.write(DEST_LED, &[!BIT_GREEN & !BIT_RED])?;
+        }
         thread::sleep(Duration::from_millis(20));
         self.write(DEST_PROG, &[BIT_PROG])?;
         self.wait_status(BIT_INIT, Duration::from_millis(800))?;
@@ -263,7 +363,7 @@ impl Pod {
         self.write(DEST_INTRDY, &[BIT_INTRDY])?;
         self.wait_status(BIT_GPIF, Duration::from_secs(3))?;
         self.write(DEST_INTRDY, &[!BIT_INTRDY])?;
-        self.wait_status(BIT_DONE, Duration::from_secs(3))?;
+        self.wait_status(BIT_DONE, Duration::from_secs(5))?;
         self.write(DEST_LED, &[BIT_GREEN])?;
         self.write(DEST_WORDWIDE, &[BIT_WORDWIDE])?;
         Ok(())
@@ -363,17 +463,17 @@ impl Pod {
     }
 }
 
-fn bitstream_path() -> Result<PathBuf, HalError> {
+fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
     let mut tried = Vec::new();
     if let Ok(dir) = std::env::var("LOGICVIEW_FIRMWARE_DIR") {
-        let path = PathBuf::from(dir).join(BITSTREAM_NAME);
+        let path = PathBuf::from(dir).join(file_name);
         if path.is_file() {
             return Ok(path);
         }
         tried.push(path);
     }
     for dir in candidate_dirs() {
-        let path = dir.join(BITSTREAM_NAME);
+        let path = dir.join(file_name);
         if path.is_file() {
             return Ok(path);
         }
@@ -385,7 +485,7 @@ fn bitstream_path() -> Result<PathBuf, HalError> {
         .collect::<Vec<_>>()
         .join("; ");
     Err(HalError::FirmwareMissing {
-        file: BITSTREAM_NAME.to_string(),
+        file: file_name.to_string(),
         tried,
     })
 }
@@ -419,7 +519,7 @@ fn dsview_res_dirs(program_files: Option<&str>, program_files_x86: Option<&str>)
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_listed, dsview_res_dirs, matches_plus};
+    use super::{describe_listed, dsview_res_dirs, matches_plus, supported_product};
     use nusb::Speed;
 
     #[test]
@@ -427,6 +527,9 @@ mod tests {
         assert!(matches_plus(0x2A0E, 0x0020));
         assert!(!matches_plus(0x2A0E, 0x0034));
         assert!(!matches_plus(0x1234, 0x0020));
+        assert!(supported_product(0x0020));
+        assert!(supported_product(0x002C));
+        assert!(!supported_product(0x0034));
     }
 
     #[test]

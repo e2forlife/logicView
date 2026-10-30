@@ -1,9 +1,11 @@
 //! USB capture for DreamSourceLab logic pods.
 //!
 //! Scan lists every vendor `0x2A0E` device. This build opens the high-speed
-//! DSLogic Plus, product `0x0020`. Firmware and the FPGA bitstream stay on
-//! disk outside the repo. `LOGICVIEW_FIRMWARE_DIR`, a DSView `res` folder, or
-//! `%LOCALAPPDATA%\Temp\lv-fw` can supply `DSLogicPlus.bin`.
+//! DSLogic Plus (`0x0020`) and the high-speed DSLogic U3Pro32 (`0x002C`).
+//! Firmware and FPGA bitstreams stay on disk outside the repo.
+//! `LOGICVIEW_FIRMWARE_DIR`, a DSView `res` folder, or
+//! `%LOCALAPPDATA%\Temp\lv-fw` can supply `DSLogicPlus.bin` or
+//! `DSLogicU3Pro32.bin`.
 
 mod capture;
 mod catalog;
@@ -12,18 +14,19 @@ mod profile;
 
 pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
 pub use catalog::{logic_profile, logic_profiles, LogicProfile};
-pub use device::{list_plus, list_pods, matches_plus, Pod};
+pub use device::{list_plus, list_pods, matches_plus, supported_product, Pod};
 pub use profile::{
-    max_sample_hz, plan_clock, rate_limits, threshold_code, ClockPlan, RateLimit, BITSTREAM_NAME,
-    DEVICE_ID, HALF_RATE_HZ, HDL_VERSION, HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ,
-    U3PRO32_PID, VENDOR_ID,
+    max_sample_hz, plan_clock, plan_u3_clock, rate_limits, threshold_code, u3_channel_max_hz,
+    ClockPlan, RateLimit, U3Clock, BITSTREAM_NAME, DEVICE_ID, HALF_RATE_HZ, HDL_VERSION,
+    HW_CLOCK_HZ, MEMORY_BITS, PLUS_PID, QUARTER_RATE_HZ, U3PRO32_PID, U3_BITSTREAM_NAME,
+    U3_DEVICE_ID, U3_HDL_VERSION, U3_HS_SAMPLE_LEADER, U3_PRE_DIVIDER, VENDOR_ID,
 };
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum HalError {
-    #[error("no high-speed DSLogic Plus ({DEVICE_ID}) is connected")]
+    #[error("no tested DreamSourceLab logic pod ({DEVICE_ID} or {U3_DEVICE_ID}) is connected")]
     NotFound,
     #[error("USB error: {0}")]
     Usb(String),

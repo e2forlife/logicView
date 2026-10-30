@@ -1,9 +1,10 @@
 //! Logic-pod profiles used to name a device and to know how many channels it
 //! would contribute to a stacked waveform.
 //!
-//! Only the high-speed DSLogic Plus (`0x0020`) has been captured on hardware.
-//! Every other product id is listed so a session can show what a stack would
-//! look like. LogicView refuses to open those ids.
+//! The high-speed DSLogic Plus (`0x0020`) and the high-speed DSLogic U3Pro32
+//! (`0x002C`) have been captured on hardware. Every other product id is listed
+//! so a session can show what a stack would look like. LogicView refuses to
+//! open those ids.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicProfile {
@@ -14,7 +15,8 @@ pub struct LogicProfile {
     pub note: &'static str,
 }
 
-const UNTESTED: &str = "Channel count only. Not tested on hardware; this product id cannot be opened.";
+const UNTESTED: &str =
+    "Channel count only. Not tested on hardware; this product id cannot be opened.";
 
 const PROFILES: &[LogicProfile] = &[
     LogicProfile {
@@ -63,8 +65,8 @@ const PROFILES: &[LogicProfile] = &[
         product_id: 0x002C,
         name: "DSLogic U3Pro32",
         channels: 32,
-        hardware_tested: false,
-        note: UNTESTED,
+        hardware_tested: true,
+        note: "High-speed buffer was checked on one U3Pro32. Super-speed was not tested.",
     },
     LogicProfile {
         product_id: 0x002D,
@@ -108,7 +110,9 @@ pub fn logic_profiles() -> &'static [LogicProfile] {
 }
 
 pub fn logic_profile(product_id: u16) -> Option<&'static LogicProfile> {
-    PROFILES.iter().find(|profile| profile.product_id == product_id)
+    PROFILES
+        .iter()
+        .find(|profile| profile.product_id == product_id)
 }
 
 #[cfg(test)]
@@ -116,16 +120,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_plus_is_marked_tested() {
+    fn tested_profiles_are_the_plus_and_the_u3pro32() {
         let tested: Vec<_> = logic_profiles()
             .iter()
             .filter(|profile| profile.hardware_tested)
             .map(|profile| profile.product_id)
             .collect();
-        assert_eq!(tested, vec![0x0020]);
+        assert_eq!(tested, vec![0x0020, 0x002C]);
         let wide = logic_profile(0x002C).unwrap();
         assert_eq!(wide.channels, 32);
-        assert!(!wide.hardware_tested);
+        assert!(wide.hardware_tested);
+        assert!(wide.note.contains("Super-speed"));
         assert!(logic_profile(0x0021).unwrap().note.contains("Not tested"));
+        assert!(!logic_profile(0x0034).unwrap().hardware_tested);
     }
 }

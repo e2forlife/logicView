@@ -2,14 +2,15 @@
 
 Clean-room Rust logic analyzer. Phases 0–4 are the capture contract, the demo
 engine, the Axum waveform shell, and buffer/stream capture for one high-speed
-DSLogic Plus (`0x2A0E:0x0020`). This tree adds protocol decode (UART, I2C, SPI,
+DSLogic Plus (`0x2A0E:0x0020`) or one high-speed DSLogic U3Pro32
+(`0x2A0E:0x002C`). This tree adds protocol decode (UART, I2C, SPI,
 and a 24xx-style EEPROM stack), the data table, and a stdio MCP server.
 A session can stack the Demo and Demo SPI pods onto one waveform. Other logic
 product ids are listed with their channel counts and are not opened: they have
 not been tested on hardware. Oscilloscope and data acquisition are not in this
 build. Firmware and the FPGA bitstream are not in this repo. Set
-`LOGICVIEW_FIRMWARE_DIR` to the folder that contains `DSLogicPlus.bin` when the
-Plus pod's FPGA is not already configured.
+`LOGICVIEW_FIRMWARE_DIR` to the folder that contains `DSLogicPlus.bin` or
+`DSLogicU3Pro32.bin` when that pod's FPGA is not already configured.
 
 ```
 cargo test --workspace
@@ -57,7 +58,7 @@ written for a pod and have not been run on hardware.
 | Crate | Phase | Role |
 | --- | --- | --- |
 | `logicview-proto` | 0 | Arm record, logic header, sample atoms, `.dsl` header text |
-| `logicview-hal` | 3 | DSLogic Plus USB, FPGA sequencing, buffer capture |
+| `logicview-hal` | 3 | DSLogic Plus and U3Pro32 USB, FPGA sequencing, buffer capture |
 | `logicview-analysis` | 1 | Edge search and pulse measurements |
 | `logicview-decode` | 5 | UART, I2C, SPI, and a 24xx EEPROM stack |
 | `logicview-capture` | 1 | Demo source, session phases, logic mipmap |

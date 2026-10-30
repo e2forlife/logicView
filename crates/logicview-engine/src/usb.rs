@@ -31,6 +31,7 @@ pub(crate) async fn drive(
     discard: bool,
     continuous: bool,
     header_wait: Duration,
+    product_id: Option<u16>,
 ) {
     let mut pass = 0u32;
     loop {
@@ -48,10 +49,15 @@ pub(crate) async fn drive(
             stream,
             continuous,
             stop: Arc::clone(&stop),
-            on_stop: if discard { OnStop::Discard } else { OnStop::Upload },
+            on_stop: if discard {
+                OnStop::Discard
+            } else {
+                OnStop::Upload
+            },
             abort_after_header: false,
             header_wait,
             sample_limit: None,
+            product_id,
         };
         let tx_thread = tx.clone();
         let worker = std::thread::spawn(move || {
@@ -75,7 +81,8 @@ pub(crate) async fn drive(
                     let dropping = discard && stop.load(Ordering::Relaxed);
                     if !dropping {
                         let count = (chunk.len() as u64) * 8 / enabled.max(1);
-                        if let Err(err) = apply_samples(&shared, &id, generation, &chunk, count).await
+                        if let Err(err) =
+                            apply_samples(&shared, &id, generation, &chunk, count).await
                         {
                             failed = Some(err);
                             stop.store(true, Ordering::Relaxed);
@@ -224,13 +231,7 @@ async fn clear_samples(shared: &Shared, id: &str, generation: u64) {
     }
 }
 
-async fn settle(
-    shared: &Shared,
-    id: &str,
-    generation: u64,
-    error: Option<String>,
-    discard: bool,
-) {
+async fn settle(shared: &Shared, id: &str, generation: u64, error: Option<String>, discard: bool) {
     let mut state = shared.lock().await;
     let Some(index) = state.slots.iter().position(|slot| slot.id == id) else {
         return;
@@ -248,7 +249,9 @@ async fn settle(
         state.slots[index].session.finish();
         super::decode_cmd::rerun(&mut state.slots[index]);
     }
-    state.running.retain(|key, run| key != id || run.generation != generation);
+    state
+        .running
+        .retain(|key, run| key != id || run.generation != generation);
     let phase = state.slots[index].session.phase.as_str().to_string();
     let sample_count = state.slots[index].session.store.len();
     let event = if let Some(message) = error {
