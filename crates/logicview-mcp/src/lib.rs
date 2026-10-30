@@ -133,14 +133,20 @@ async fn open_session(attach: Option<PathBuf>) -> Result<McpSession, String> {
 pub async fn serve_attach(engine: Engine, path: &Path) -> std::io::Result<()> {
     let listener = transport::bind(path).await?;
     tracing::info!(endpoint = %listener.label(), "engine attach listening");
+    let mut clients = tokio::task::JoinSet::new();
     loop {
-        let stream = listener.accept().await?;
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            if let Err(err) = socket_client(engine, stream).await {
-                tracing::debug!("attach client closed: {err}");
+        tokio::select! {
+            incoming = listener.accept() => {
+                let stream = incoming?;
+                let engine = engine.clone();
+                clients.spawn(async move {
+                    if let Err(err) = socket_client(engine, stream).await {
+                        tracing::debug!("attach client closed: {err}");
+                    }
+                });
             }
-        });
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+        }
     }
 }
 

@@ -10,6 +10,9 @@ const runBtn = document.getElementById("run");
 const stopBtn = document.getElementById("stop");
 
 const TIME_DIVS = [
+  1e-12, 2e-12, 5e-12, 1e-11, 2e-11, 5e-11,
+  1e-10, 2e-10, 5e-10, 1e-9, 2e-9, 5e-9,
+  1e-8, 2e-8, 5e-8, 1e-7, 2e-7, 5e-7,
   1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4,
   1e-3, 2e-3, 5e-3, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1,
 ];
@@ -51,6 +54,7 @@ const state = {
   annotations: [],
   waveformAnnotations: [],
   decoders: [],
+  decoderCatalog: [],
   selectedDecoder: null,
   decodeQuery: "",
   spiView: {},
@@ -2018,10 +2022,7 @@ function panelHtml(name) {
       <label class="decode-protocol-label" for="decoder-kind">Protocol</label>
       <div class="decode-add-row">
         <select id="decoder-kind">
-          <option value="i2c">I2C</option>
-          <option value="spi">SPI</option>
-          <option value="uart">UART</option>
-          <option value="eeprom24">EEPROM 24xx on I2C</option>
+          ${state.decoderCatalog.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("")}
         </select>
         <button id="add-decoder" class="decode-add" type="button" title="Add decoder" aria-label="Add decoder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
       </div>
@@ -2519,6 +2520,7 @@ function formatSampleRate(hz) {
     return (Number.isInteger(rounded) ? String(rounded) : String(rounded)) + " " + unit;
   };
   if (hz >= 1e9) return text(hz / 1e9, "GS/s");
+  if (hz >= 1e9) return (hz / 1e9).toFixed(3) + " GHz";
   if (hz >= 1e6) return text(hz / 1e6, "MS/s");
   if (hz >= 1e3) return text(hz / 1e3, "kS/s");
   return hz + " S/s";
@@ -2720,7 +2722,7 @@ function decoderChannels(protocol) {
 }
 
 const PROTOCOL_LABEL = { i2c: "I2C", spi: "SPI", uart: "UART", eeprom24: "EEPROM 24xx" };
-const GEAR_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"></path></svg>`;
+const GEAR_ICON = `<span class="settings-icon" aria-hidden="true"></span>`;
 const TRASH_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M8 7l1 13h6l1-13"></path></svg>`;
 
 function escapeHtml(text) {
@@ -2728,7 +2730,7 @@ function escapeHtml(text) {
 }
 
 function protocolLabel(protocol) {
-  return PROTOCOL_LABEL[protocol] || protocol;
+  return state.decoderCatalog.find((item) => item.id === protocol)?.name || PROTOCOL_LABEL[protocol] || protocol;
 }
 
 async function addDecoder(protocol) {
@@ -3490,6 +3492,10 @@ async function openCaptureFile(file) {
     statusEl.textContent = json.error || "could not open capture";
     return;
   }
+  await applyImportedCapture(json.data, file.name);
+}
+
+async function applyImportedCapture(data, name) {
   state.tiles = {};
   state.annotations = [];
   state.waveformAnnotations = [];
@@ -3498,11 +3504,11 @@ async function openCaptureFile(file) {
   state.decodeView = {};
   view().userNavigated = false;
   state.gutterSig = "";
-  applyStatus(json.data, false);
+  applyStatus(data, false);
   await refreshDecoders();
   await loadAnnotations();
-  const count = Number(json.data.sample_count || 0).toLocaleString();
-  statusEl.textContent = `opened ${file.name} · ${count} samples`;
+  const count = Number(data.sample_count || 0).toLocaleString();
+  statusEl.textContent = `opened ${name} · ${count} samples`;
 }
 
 function dragHasFile(ev) {
@@ -3544,7 +3550,7 @@ function bindCaptureDrop() {
   window.addEventListener("drop", (ev) => {
     if (!dragHasFile(ev)) return;
     ev.preventDefault();
-    if (ev.target.closest && ev.target.closest(".wave-stage")) return;
+    if (ev.target.closest && ev.target.closest(".wave-stage, #preferences-dialog")) return;
     statusEl.textContent = "Drop the capture on the waveform";
   });
 }
@@ -4023,6 +4029,7 @@ function syncTimebaseLabel() {
   const label = document.getElementById("timebase-label");
   const slider = document.getElementById("timebase");
   if (!label || !slider) return;
+  slider.max = String(TIME_DIVS.length - 1);
   const px = Math.max(40, (wave.clientWidth || 800) / 10);
   const seconds = (view().spp * px) / Math.max(1, state.rate);
   let best = 0;
@@ -4139,11 +4146,12 @@ function openMenu(button) {
     wrapper.className = "decode-menu-sub";
     const add = document.createElement("button");
     add.type = "button";
-    add.textContent = "Add new decoder ?";
+    add.textContent = "Add new decoder";
+    add.className = "decode-menu-trigger";
     add.setAttribute("aria-haspopup", "true");
     const submenu = document.createElement("div");
     submenu.className = "decode-menu-choices";
-    for (const [protocol, label] of Object.entries(PROTOCOL_LABEL)) {
+    for (const { id: protocol, name: label } of state.decoderCatalog) {
       const choice = document.createElement("button");
       choice.type = "button";
       choice.textContent = label;
@@ -4278,7 +4286,7 @@ document.addEventListener("click", (ev) => {
 document.getElementById("about-close").addEventListener("click", () => document.getElementById("about-dialog").close());
 
 window.addEventListener("keydown", (ev) => {
-  if (document.getElementById("about-dialog").open) return;
+  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open) return;
   if (ev.target.matches("input, select, textarea")) return;
   const key = ev.key;
   if (key === " " || key === "s" || key === "S") {
@@ -4351,8 +4359,8 @@ function formatRulerTick(seconds, step) {
   const sign = seconds < 0 ? "-" : "";
   const magnitude = Math.abs(seconds);
   const basis = step > 0 && isFinite(step) ? step : magnitude || 1;
-  let scale = 1e9;
-  let unit = "ns";
+  let scale = 1e12;
+  let unit = "ps";
   if (basis >= 1) {
     scale = 1;
     unit = "s";
@@ -4362,6 +4370,9 @@ function formatRulerTick(seconds, step) {
   } else if (basis >= 1e-6) {
     scale = 1e6;
     unit = "µs";
+  } else if (basis >= 1e-9) {
+    scale = 1e9;
+    unit = "ns";
   }
   const quantum = basis * scale;
   const snapped = Math.round((magnitude * scale) / quantum) * quantum;
@@ -4378,7 +4389,8 @@ function formatSeconds(seconds) {
   if (a >= 1) return sign + a.toFixed(3) + " s";
   if (a >= 1e-3) return sign + (a * 1e3).toFixed(3) + " ms";
   if (a >= 1e-6) return sign + (a * 1e6).toFixed(3) + " µs";
-  return sign + (a * 1e9).toFixed(1) + " ns";
+  if (a >= 1e-9 || a === 0) return sign + (a * 1e9).toFixed(1) + " ns";
+  return sign + (a * 1e12).toFixed(1) + " ps";
 }
 
 function formatHz(hz) {
@@ -4545,8 +4557,9 @@ function openDecodeConfig(decoder) {
         <select id="decode-format">${options}</select>
       </label>`);
   }
-  const signals = { spi: ["sck", "mosi", "miso", "cs"], i2c: ["scl", "sda"], uart: ["rx"] };
-  parts.push(...(signals[decoder.protocol] || []).map((name) => signalField(name, channels[name])));
+  const schema = state.decoderCatalog.find((item) => item.id === decoder.protocol);
+  const signals = schema ? schema.channels : Object.keys(channels);
+  parts.push(...signals.map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";
     const cpha = options.cpha === "1" || options.cpha === "true" || options.cpha === "high";
@@ -4598,7 +4611,120 @@ function closeDecodeConfig() {
   document.getElementById("decode-config").classList.add("hidden");
 }
 
+let preferences = { firmware_dir: "", scripts_dir: "", theme: "system" };
+const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
+function applyTheme() {
+  const light = preferences.theme === "light" || (preferences.theme === "system" && systemTheme.matches);
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+}
+systemTheme.addEventListener("change", applyTheme);
+async function loadDecoderCatalog() {
+  state.decoderCatalog = await api({ cmd: "decoder_catalog" });
+}
+async function loadPreferences() {
+  const response = await fetch("/api/preferences");
+  if (!response.ok) throw new Error("Could not load preferences");
+  preferences = await response.json();
+  applyTheme();
+}
+document.getElementById("preferences-open").addEventListener("click", () => {
+  document.getElementById("preferences-firmware").value = preferences.firmware_dir;
+  document.getElementById("preferences-scripts").value = preferences.scripts_dir;
+  const theme = document.querySelector(`input[name="preferences-theme"][value="${preferences.theme}"]`);
+  if (theme) theme.checked = true;
+  document.getElementById("preferences-error").textContent = "";
+  document.getElementById("preferences-dialog").showModal();
+});
+document.getElementById("preferences-cancel").addEventListener("click", () => document.getElementById("preferences-dialog").close());
+document.getElementById("preferences-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const next = { firmware_dir: document.getElementById("preferences-firmware").value.trim(),
+    scripts_dir: document.getElementById("preferences-scripts").value.trim(), theme: document.querySelector('input[name="preferences-theme"]:checked').value };
+  try {
+    const response = await fetch("/api/preferences", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
+    if (!response.ok) throw new Error(await response.text());
+    preferences = await response.json();
+    applyTheme();
+    await loadDecoderCatalog();
+    if (state.tab === "decode") selectTab("decode");
+    document.getElementById("preferences-dialog").close();
+  } catch (err) { document.getElementById("preferences-error").textContent = err.message; }
+});
+
+let mcpState = null;
+function paintMcp(data) {
+  mcpState = data;
+  document.getElementById("mcp-enabled").checked = data.enabled;
+  document.getElementById("mcp-port").value = data.port;
+  document.getElementById("mcp-address").textContent = data.address;
+  document.getElementById("mcp-open").classList.toggle("enabled", data.enabled);
+}
+async function updateMcp(enabled, port) {
+  const error = document.getElementById("mcp-error");
+  error.textContent = "";
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    error.textContent = "Enter a port from 1 to 65535.";
+    if (mcpState) document.getElementById("mcp-enabled").checked = mcpState.enabled;
+    return;
+  }
+  try {
+    const response = await fetch("/api/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled, port }) });
+    if (!response.ok) throw new Error(await response.text());
+    paintMcp(await response.json());
+  } catch (err) {
+    error.textContent = err.message;
+    if (mcpState) document.getElementById("mcp-enabled").checked = mcpState.enabled;
+  }
+}
+document.getElementById("mcp-open").addEventListener("click", async () => {
+  const flyout = document.getElementById("mcp-flyout");
+  const open = flyout.classList.toggle("hidden") === false;
+  document.getElementById("mcp-open").setAttribute("aria-expanded", String(open));
+  if (open) {
+    try { const response = await fetch("/api/mcp"); if (!response.ok) throw new Error("Could not read MCP status"); paintMcp(await response.json()); }
+    catch (err) { document.getElementById("mcp-error").textContent = err.message; }
+  }
+});
+document.getElementById("mcp-enabled").addEventListener("change", (ev) => updateMcp(ev.target.checked, Number(document.getElementById("mcp-port").value)));
+document.getElementById("mcp-port").addEventListener("change", (ev) => updateMcp(!!mcpState?.enabled, Number(ev.target.value)));
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest("#mcp-flyout, #mcp-open")) {
+    document.getElementById("mcp-flyout").classList.add("hidden");
+    document.getElementById("mcp-open").setAttribute("aria-expanded", "false");
+  }
+});
+for (const button of document.querySelectorAll(".path-browse")) {
+  button.addEventListener("click", () => {
+    if (window.ipc) window.ipc.postMessage("pick-directory:" + button.dataset.pathTarget);
+    else document.getElementById("preferences-error").textContent = "Folder selection is available in the desktop app; enter a path here.";
+  });
+}
+window.logicviewDirectorySelected = (target, path) => {
+  if (!document.getElementById("preferences-dialog").open) return;
+  if (target === "preferences-firmware" || target === "preferences-scripts") document.getElementById(target).value = path;
+};
+window.logicviewNativeDrop = (path, x, y) => {
+  const target = document.elementFromPoint(x / window.devicePixelRatio, y / window.devicePixelRatio);
+  if (document.getElementById("preferences-dialog").open && target && (target.id === "preferences-firmware" || target.id === "preferences-scripts")) {
+    if (path.isDirectory) window.logicviewDirectorySelected(target.id, path.value);
+    else document.getElementById("preferences-error").textContent = "Drop a folder on the directory field.";
+    return;
+  }
+  if (target && target.closest(".wave-stage") && !path.isDirectory && isCaptureName(path.value)) openNativeCapture(path.value);
+};
+async function openNativeCapture(path) {
+  try {
+    const response = await fetch("/api/import-path", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+    const json = await response.json();
+    if (!response.ok || !json.ok) throw new Error(json.error || "Could not open capture");
+    applyImportedCapture(json.data, path.split(/[\\/]/).pop());
+  } catch (err) { statusEl.textContent = err.message; }
+}
+
 async function boot() {
+  await loadPreferences();
+  try { const response = await fetch("/api/mcp"); if (response.ok) paintMcp(await response.json()); } catch (_) { /* status is available from the flyout */ }
+  await loadDecoderCatalog();
   await refreshSessions();
   const listed = await api({ cmd: "list_sessions" });
   state.active = listed.active;

@@ -14,6 +14,8 @@ path = "src/main.rs"
 logicview-engine = { path = "../logicview-engine" }
 logicview-mcp = { path = "../logicview-mcp" }
 logicview-ui = { path = "../logicview-ui" }
+serde_json.workspace = true
+rfd = { version = "0.17.2", features = ["xdg-portal"] }
 tao = "0.37.2"
 tokio.workspace = true
 tracing.workspace = true
@@ -31,6 +33,5 @@ winresource = "0.1"
 workspace = true
 
 [target."cfg(windows)".dependencies]
-rfd = { version = "0.17.2", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rightkit-overlay-win = "0.1.0"

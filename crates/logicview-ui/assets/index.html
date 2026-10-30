@@ -13,6 +13,7 @@
         <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
       </svg>
       <strong>LogicView</strong>
+      <button id="preferences-open" class="preferences-open" type="button" title="Preferences" aria-label="Preferences"><span class="settings-icon" aria-hidden="true"></span></button>
       <nav class="menubar" aria-label="Menu">
         <button type="button" data-menu="file">File</button>
         <button type="button" data-menu="edit">Edit</button>
@@ -69,7 +70,7 @@
       <button id="zoom-in" class="icon-btn" type="button" title="Zoom in" aria-label="Zoom in">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M10 7v6M7 10h6M14.5 14.5L20 20"></path></svg>
       </button>
-      <input id="timebase" type="range" min="0" max="18" value="14" aria-label="Time per division">
+      <input id="timebase" type="range" min="0" max="36" value="32" aria-label="Time per division">
       <span id="timebase-label">50 ms/div</span>
       <button id="tool-marker" class="icon-btn" type="button" title="Place cursors" aria-label="Place cursors">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v18M6 4h11l-3 4 3 4H6"></path></svg>
@@ -109,7 +110,9 @@
           <div id="tabs" class="tabs"></div>
           <button id="tab-add" class="tab-add" type="button" title="New session">+</button>
         </div>
-        <div id="status" class="status">idle</div>
+        <div class="status-row"><div id="status" class="status">idle</div>
+          <button id="mcp-open" class="mcp-open" type="button" title="MCP server" aria-label="MCP server" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M9 3h6M5 9V7h14v2M4 10h16v10H4zM2 13v4M22 13v4M8 17h8"></path><circle cx="8.5" cy="13" r="1"></circle><circle cx="15.5" cy="13" r="1"></circle></svg></button>
+        </div>
       </div>
       <div id="split-side" class="v-split" role="separator" aria-orientation="vertical" title="Resize side panel"></div>
       <aside class="side-panel open" id="side-panel">
@@ -191,6 +194,29 @@
       </div>
     </form>
   </div>
+  <section id="mcp-flyout" class="mcp-flyout hidden" aria-label="MCP server settings">
+    <div class="mcp-heading"><h2>MCP server</h2><label class="mcp-switch"><input id="mcp-enabled" type="checkbox" role="switch"><span>Enabled</span></label></div>
+    <label class="mcp-field">Server address <output id="mcp-address"></output></label>
+    <label class="mcp-field" for="mcp-port">Port <input id="mcp-port" type="number" min="1" max="65535" step="1"></label>
+    <p class="mcp-note">Port changes apply after disabling and re-enabling the server.</p>
+    <p id="mcp-error" class="mcp-error" role="alert"></p>
+  </section>
+  <dialog id="preferences-dialog" class="preferences-dialog" aria-labelledby="preferences-title">
+    <form id="preferences-form">
+      <h2 id="preferences-title">Preferences</h2>
+      <label for="preferences-firmware">Firmware directory</label>
+      <div class="path-row"><input id="preferences-firmware" type="text" placeholder="Use default search locations"><button type="button" class="path-browse" data-path-target="preferences-firmware" aria-label="Choose firmware directory">...</button></div>
+      <label for="preferences-scripts">Decoder scripts directory</label>
+      <div class="path-row"><input id="preferences-scripts" type="text" placeholder="No external scripts"><button type="button" class="path-browse" data-path-target="preferences-scripts" aria-label="Choose decoder scripts directory">...</button></div>
+      <fieldset class="theme-choices"><legend>Theme</legend>
+        <label><input type="radio" name="preferences-theme" value="light"><span>Light</span></label>
+        <label><input type="radio" name="preferences-theme" value="dark"><span>Dark</span></label>
+        <label><input type="radio" name="preferences-theme" value="system"><span>Follow system</span></label>
+      </fieldset>
+      <p id="preferences-error" role="alert"></p>
+      <div class="preferences-actions"><button id="preferences-cancel" type="button">Cancel</button><button type="submit">OK</button></div>
+    </form>
+  </dialog>
   <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
     <div class="about-card">
       <div class="about-logo" aria-label="E2 and LogicView logos">

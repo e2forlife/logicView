@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Icon, WindowBuilder};
 use wry::WebViewBuilder;
 
@@ -55,14 +55,6 @@ async fn run_server(
         .await
         .map_err(|err| err.to_string())?;
     let local = listener.local_addr().map_err(|err| err.to_string())?;
-    let attached = engine.clone();
-    let socket = logicview_mcp::default_socket_path();
-    tokio::spawn(async move {
-        if let Err(err) = logicview_mcp::serve_attach(attached, &socket).await {
-            tracing::warn!("attach socket: {err}");
-        }
-    });
-    tracing::info!("{}", logicview_mcp::attach_location());
     tx.send(Ok(local))
         .map_err(|_| "LogicView closed before its window was ready".to_string())?;
     if let Err(err) = logicview_ui::serve_listener(engine, listener).await {
@@ -80,7 +72,10 @@ fn window_icon() -> Option<Icon> {
 
 /// Hosts the local UI in a native webview and keeps it alive until the window closes.
 fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
-    let event_loop = EventLoop::new();
+    enum UiEvent { PickDirectory(String), Drop(std::path::PathBuf, i32, i32) }
+    let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
+    let ipc_proxy = event_loop.create_proxy();
+    let drop_proxy = event_loop.create_proxy();
     let mut builder = WindowBuilder::new()
         .with_title("LogicView")
         .with_visible(false)
@@ -99,6 +94,21 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .with_url(start_url)
         .with_background_color((0x0c, 0x10, 0x16, 0xff))
         .with_clipboard(true)
+        .with_ipc_handler(move |request| {
+            if let Some(target) = request.body().strip_prefix("pick-directory:") {
+                if target == "preferences-firmware" || target == "preferences-scripts" {
+                    let _ = ipc_proxy.send_event(UiEvent::PickDirectory(target.to_string()));
+                }
+            }
+        })
+        .with_drag_drop_handler(move |event| {
+            if let wry::DragDropEvent::Drop { paths, position } = event {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = drop_proxy.send_event(UiEvent::Drop(path, position.0, position.1));
+                }
+            }
+            true
+        })
         .with_navigation_handler(move |url| allows_navigation(&navigation_origin, &url));
 
     #[cfg(not(target_os = "linux"))]
@@ -182,6 +192,21 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             window.set_visible(true);
             window.set_focus();
             *control_flow = ControlFlow::Wait;
+        }
+        if let Event::UserEvent(ref request) = event {
+            match request {
+                UiEvent::PickDirectory(target) => {
+                    if let Some(path) = rfd::FileDialog::new().set_title("Choose directory").pick_folder() {
+                        let target = serde_json::to_string(target).unwrap_or_default();
+                        let path = serde_json::to_string(&path.to_string_lossy()).unwrap_or_default();
+                        let _ = webview.evaluate_script(&format!("window.logicviewDirectorySelected({target}, {path})"));
+                    }
+                }
+                UiEvent::Drop(path, x, y) => {
+                    let path = serde_json::json!({"value": path.to_string_lossy(), "isDirectory": path.is_dir()});
+                    let _ = webview.evaluate_script(&format!("window.logicviewNativeDrop({path}, {x}, {y})"));
+                }
+            }
         }
         if let Event::WindowEvent {
             window_id,

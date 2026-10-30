@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/logicview-config",
     "crates/logicview-proto",
     "crates/logicview-hal",
     "crates/logicview-analysis",

@@ -333,7 +333,7 @@ impl Engine {
         logicview_hal::logic_profiles()
             .iter()
             .map(|profile| ProfileInfo {
-                id: format!("usb:2a0e:{:04x}", profile.product_id),
+                id: format!("usb:{:04x}:{:04x}", profile.vendor_id, profile.product_id),
                 product_id: profile.product_id,
                 name: profile.name.to_string(),
                 channels: profile.channels,
@@ -418,7 +418,7 @@ impl Engine {
             } else {
                 (1u32 << profile.channels) - 1
             };
-            self.use_pod_channels(mask, id, profile.name, super_speed)
+            self.use_pod_channels(mask, id, &profile.name, super_speed)
                 .await;
             return Ok(info);
         }

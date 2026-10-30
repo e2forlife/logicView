@@ -7,9 +7,12 @@ publish.workspace = true
 description = "DSLogic Plus USB capture for the connected high-speed pod"
 
 [dependencies]
+logicview-config = { path = "../logicview-config" }
 logicview-proto = { path = "../logicview-proto" }
 nusb = "0.2.9"
 thiserror.workspace = true
+serde.workspace = true
+toml = "0.8"
 
 [lints]
 workspace = true

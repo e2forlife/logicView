@@ -1,0 +1,109 @@
+# Device metadata; only built-in supported capture backends can be opened.
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0001
+name = "DSLogic"
+channels = 16
+hardware_tested = false
+firmware = "DSLogic33.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0003
+name = "DSLogic Pro"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicPro.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0020
+name = "DSLogic Plus"
+channels = 16
+hardware_tested = true
+firmware = "DSLogicPlus.bin"
+note = "High-speed buffer and stream were checked on one Plus. Arming two USB pods at once is not verified."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0021
+name = "DSLogic Basic"
+channels = 16
+hardware_tested = false
+firmware = "DSLogic33.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0029
+name = "DSLogic U2Basic"
+channels = 16
+hardware_tested = false
+firmware = "DSLogic33.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x002A
+name = "DSLogic U3Pro16"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicPro.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x002C
+name = "DSLogic U3Pro32"
+channels = 32
+hardware_tested = true
+firmware = "DSLogicU3Pro32.bin"
+note = "High-speed and Super-speed buffer and stream were checked on one U3Pro32."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x002D
+name = "DSLogic U2Pro16"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicPro.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0030
+name = "DSLogic Plus (Pango)"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicPlus-pgl12.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0031
+name = "DSLogic U2Basic (Pango)"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicU2Basic-pgl12.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0034
+name = "DSLogic Plus (Pango v2)"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicPlus-pgl12-2.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."
+
+[[devices]]
+vendor_id = 0x2a0e
+product_id = 0x0035
+name = "DSLogic U2Basic (Pango v2)"
+channels = 16
+hardware_tested = false
+firmware = "DSLogicU2Basic-pgl12-2.bin"
+note = "Channel count only. Not tested on hardware; this product id cannot be opened."

@@ -112,7 +112,7 @@ pub(crate) fn describe_listed(
         return None;
     }
     let profile_name = crate::logic_profile(product_id)
-        .map(|profile| profile.name)
+        .map(|profile| profile.name.as_str())
         .unwrap_or("DreamSourceLab");
     let _ = product_string;
     let name = profile_name.to_string();
@@ -378,12 +378,10 @@ impl Pod {
     }
 
     /// Selects the external FPGA image required by the opened device model.
-    fn bitstream_name(&self) -> &'static str {
-        if self.product_id == U3PRO32_PID {
-            U3_BITSTREAM_NAME
-        } else {
-            BITSTREAM_NAME
-        }
+    fn bitstream_name(&self) -> &str {
+        crate::logic_profile(self.product_id).map(|p| p.firmware.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(if self.product_id == U3PRO32_PID { U3_BITSTREAM_NAME } else { BITSTREAM_NAME })
     }
 
     /// Selects the FPGA interface version expected by this hardware backend.
@@ -582,6 +580,12 @@ fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
         if path.is_file() {
             return Ok(path);
         }
+        tried.push(path);
+    }
+    let configured = logicview_config::load().firmware_dir;
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured).join(file_name);
+        if path.is_file() { return Ok(path); }
         tried.push(path);
     }
     for dir in candidate_dirs() {

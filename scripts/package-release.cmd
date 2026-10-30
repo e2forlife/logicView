@@ -35,6 +35,13 @@ if errorlevel 1 exit /b 1
 copy /y "target\release\logicview.exe" "%STAGE%\logicview.exe" >nul
 if errorlevel 1 exit /b 1
 
+copy /y "profiles.toml" "%STAGE%\profiles.toml" >nul
+if errorlevel 1 exit /b 1
+
+mkdir "%STAGE%\examples\decoders"
+copy /y "examples\decoders\high_pulses.lua" "%STAGE%\examples\decoders\high_pulses.lua" >nul
+if errorlevel 1 exit /b 1
+
 rem The packaged exe is a Windows GUI binary (subsystem 2). A console
 rem subsystem would flash a terminal when the user launches LogicView.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='%STAGE%\logicview.exe'; $b=[IO.File]::ReadAllBytes((Resolve-Path $p)); $pe=[BitConverter]::ToInt32($b,60); $sub=[BitConverter]::ToUInt16($b,$pe+92); if ($sub -ne 2) { Write-Error ('logicview.exe subsystem is ' + $sub + '; expected 2 (Windows GUI)'); exit 1 }"

@@ -48,8 +48,8 @@ impl Engine {
         };
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            if let Some(spec) = channels.get(*name).filter(|spec| !spec.is_empty()) {
-                resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            if let Some(spec) = channels.get(&name).filter(|spec| !spec.is_empty()) {
+                resolved.insert(name, resolve_channel(slot, spec)?);
             }
         }
         let instance_id = format!("{protocol}-{}", slot.next_decoder);
@@ -116,8 +116,8 @@ impl Engine {
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
         let mut resolved = BTreeMap::new();
         for name in schema.channels {
-            if let Some(spec) = channels.get(*name).filter(|spec| !spec.is_empty()) {
-                resolved.insert((*name).to_string(), resolve_channel(slot, spec)?);
+            if let Some(spec) = channels.get(&name).filter(|spec| !spec.is_empty()) {
+                resolved.insert(name, resolve_channel(slot, spec)?);
             }
         }
         let stack = if schema.stack_on.is_some() {
@@ -312,7 +312,10 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
             },
             &AtomicBool::new(false),
         );
-        let annotations = output.map(|item| item.annotations).unwrap_or_default();
+        let annotations = match output {
+            Ok(item) => item.annotations,
+            Err(err) => { tracing::warn!(decoder = %inst.id, "decoder failed: {err}"); Vec::new() }
+        };
         for annotation in &annotations {
             rows.push(AnnotationRow {
                 decoder: inst.id.clone(),

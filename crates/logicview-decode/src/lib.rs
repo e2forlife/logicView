@@ -22,6 +22,7 @@
 mod eeprom;
 mod i2c;
 mod runtime;
+mod script;
 mod spi;
 mod uart;
 
@@ -149,58 +150,33 @@ pub trait Decoder: Send {
 }
 
 /// Describes a decoder's channel roles and output classes for discovery by clients.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct DecoderSchema {
-    /// Stable identifier accepted by decoder creation and engine commands.
-    pub id: &'static str,
-    /// Readable analyzer name for selection menus.
-    pub name: &'static str,
-    /// Input signal roles declared by the decoder.
-    pub channels: &'static [&'static str],
-    /// Input roles that callers may omit.
-    pub optional_channels: &'static [&'static str],
-    /// Required lower-level protocol for stacked interpretation, if any.
-    pub stack_on: Option<&'static str>,
-    /// Event categories the decoder can emit.
-    pub classes: &'static [&'static str],
+    pub id: String,
+    pub name: String,
+    pub channels: Vec<String>,
+    #[serde(default)] pub optional_channels: Vec<String>,
+    #[serde(default)] pub stack_on: Option<String>,
+    #[serde(default)] pub classes: Vec<String>,
 }
 
-/// Describes the available decoders, their inputs, and the annotation classes clients can expect.
+/// Lists built-in and external scripted decoders.
 pub fn catalog() -> Vec<DecoderSchema> {
-    vec![
-        DecoderSchema {
-            id: "uart",
-            name: "UART",
-            channels: &["rx"],
-            optional_channels: &["rx"],
-            stack_on: None,
-            classes: &["data", "frame", "error"],
-        },
-        DecoderSchema {
-            id: "i2c",
-            name: "I2C",
-            channels: &["scl", "sda"],
-            optional_channels: &["scl", "sda"],
-            stack_on: None,
-            classes: &["start", "address", "data", "ack", "nack", "stop"],
-        },
-        DecoderSchema {
-            id: "spi",
-            name: "SPI",
-            channels: &["sck", "mosi", "miso", "cs"],
-            optional_channels: &["sck", "mosi", "miso", "cs"],
-            stack_on: None,
-            classes: &["word", "select"],
-        },
-        DecoderSchema {
-            id: "eeprom24",
-            name: "EEPROM 24xx",
-            channels: &[],
-            optional_channels: &[],
-            stack_on: Some("i2c"),
-            classes: &["write", "read", "address"],
-        },
-    ]
+    let mut entries = vec![
+        schema("uart", "UART", &["rx"], None, &["data", "frame", "error"]),
+        schema("i2c", "I2C", &["scl", "sda"], None, &["start", "address", "data", "ack", "nack", "stop"]),
+        schema("spi", "SPI", &["sck", "mosi", "miso", "cs"], None, &["word", "select"]),
+        schema("eeprom24", "EEPROM 24xx", &[], Some("i2c"), &["write", "read", "address"]),
+    ];
+    for entry in script::catalog() {
+        if !entries.iter().any(|existing| existing.id == entry.id) { entries.push(entry); }
+    }
+    entries
+}
+fn schema(id: &str, name: &str, channels: &[&str], stack: Option<&str>, classes: &[&str]) -> DecoderSchema {
+    DecoderSchema { id: id.into(), name: name.into(), channels: channels.iter().map(|v| (*v).into()).collect(),
+        optional_channels: channels.iter().map(|v| (*v).into()).collect(), stack_on: stack.map(str::to_string),
+        classes: classes.iter().map(|v| (*v).into()).collect() }
 }
 
 /// Constructs a decoder with default options, returning `None` for unknown protocol identifiers.

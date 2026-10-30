@@ -1,0 +1,5 @@
+﻿Material Symbols Settings icon
+Material Symbols by Google
+Source: https://github.com/google/material-design-icons/tree/master/symbols/web/settings/materialsymbolsoutlined
+Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
+The icon is distributed unchanged.

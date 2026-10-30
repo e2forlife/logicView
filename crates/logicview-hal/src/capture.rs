@@ -1226,7 +1226,7 @@ mod leader {
 
         let mut leader = 512u64;
         let low = [0x00, 0x00];
-        assert_eq!(take_after_leader(&mut leader, &low), &[]);
+        assert!(take_after_leader(&mut leader, &low).is_empty());
         assert_eq!(leader, 510);
         assert_eq!(take_after_leader(&mut leader, &low), &low[..0]);
     }

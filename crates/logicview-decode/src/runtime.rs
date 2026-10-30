@@ -15,7 +15,7 @@ const SLICE: u64 = 4_096;
 /// frames. Stacked decoders consume the supplied lower rows in one call.
 pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOutput, DecodeError> {
     let Some(mut decoder) = create(request.protocol) else {
-        return Err(DecodeError::UnknownProtocol(request.protocol.into()));
+        return super::script::run_script(request, cancel);
     };
     for (key, value) in request.options {
         decoder.set_option(key, value)?;

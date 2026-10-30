@@ -39,16 +39,20 @@ use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+mod mcp_server;
+
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
+const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
 
 /// Shares the same engine across all HTTP and WebSocket handlers.
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+    mcp: mcp_server::Control,
 }
 
 /// The local UI server could not bind or continue serving.
@@ -65,15 +69,23 @@ pub enum UiError {
 /// Builds the application routes around a shared engine, including commands, events, and capture
 /// files.
 pub fn router(engine: Engine) -> Router {
+    router_with_control(engine, mcp_server::Control::default())
+}
+
+fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
+        .route("/assets/settings.svg", get(settings_icon))
         .route("/assets/AppLogo.png", get(app_logo))
         .route("/assets/E2logo.png", get(e2_logo))
+        .route("/api/preferences", get(get_preferences).post(save_preferences))
+        .route("/api/mcp", get(mcp_server::status).post(mcp_server::configure))
         .route("/api/health", get(health))
         .route("/api/command", post(command))
         .route("/api/events", get(events))
+        .route("/api/import-path", post(import_path))
         .route("/api/export/lvcap", get(export_lvcap))
         .route("/api/export/dsl", get(export_dsl))
         .route("/api/export/csv", get(export_csv))
@@ -83,7 +95,7 @@ pub fn router(engine: Engine) -> Router {
             post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/ws", get(ws_upgrade))
-        .with_state(AppState { engine })
+        .with_state(AppState { engine, mcp })
 }
 
 /// Binds the UI server to a local address, rejecting non-loopback listeners.
@@ -110,8 +122,22 @@ pub async fn serve_listener(
 ) -> Result<(), UiError> {
     let local = listener.local_addr()?;
     tracing::info!(%local, "LogicView UI listening");
-    axum::serve(listener, router(engine)).await?;
+    let control = mcp_server::Control::default();
+    if let Err(err) = control.restore(engine.clone()).await { tracing::warn!("MCP server: {err}"); }
+    axum::serve(listener, router_with_control(engine, control)).await?;
     Ok(())
+}
+
+async fn get_preferences() -> Json<logicview_config::Preferences> {
+    Json(logicview_config::load())
+}
+
+async fn save_preferences(Json(mut prefs): Json<logicview_config::Preferences>) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
+    let current = logicview_config::load();
+    prefs.mcp_enabled = current.mcp_enabled;
+    prefs.mcp_port = current.mcp_port;
+    logicview_config::save(&prefs).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(prefs))
 }
 
 /// Serves the embedded application shell without browser caching.
@@ -122,6 +148,11 @@ async fn index() -> impl IntoResponse {
 /// Serves the embedded splash artwork to the desktop webview.
 async fn app_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], APP_LOGO)
+}
+
+/// Serves the locally embedded Material Symbols settings icon.
+async fn settings_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], SETTINGS_ICON)
 }
 
 /// Serves the embedded E2 artwork for the About dialog.
@@ -199,6 +230,20 @@ fn event_name(event: &EngineEvent) -> &'static str {
 struct ImportQuery {
     #[serde(default)]
     name: String,
+}
+
+#[derive(Deserialize)]
+struct ImportPath { path: std::path::PathBuf }
+async fn import_path(State(app): State<AppState>, Json(input): Json<ImportPath>) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = input.path.file_name().and_then(|s| s.to_str()).ok_or((StatusCode::BAD_REQUEST, "Invalid file name".into()))?;
+    if !["lvcap", "dsl"].iter().any(|ext| input.path.extension().is_some_and(|value| value.eq_ignore_ascii_case(ext))) {
+        return Err((StatusCode::BAD_REQUEST, "Expected a .lvcap or .dsl file".into()));
+    }
+    let metadata = std::fs::metadata(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 { return Err((StatusCode::BAD_REQUEST, "Invalid or oversized capture file".into())); }
+    let bytes = std::fs::read(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let result = app.engine.import_capture(None, name, &bytes).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({"ok": true, "data": result})))
 }
 
 /// Loads an uploaded archive into the selected session, using its filename to choose the format.
@@ -1168,6 +1213,13 @@ mod tests {
         assert_eq!(e2_logo.status(), StatusCode::OK);
         assert_eq!(e2_logo.headers()[header::CONTENT_TYPE], "image/png");
         assert!(e2_logo.into_body().collect().await.unwrap().to_bytes().starts_with(b"\x89PNG\r\n\x1a\n"));
+        let settings = app.clone()
+            .oneshot(Request::builder().uri("/assets/settings.svg").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        assert_eq!(settings.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        let svg = settings.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
         let page = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await

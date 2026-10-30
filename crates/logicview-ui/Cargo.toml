@@ -7,6 +7,8 @@ publish.workspace = true
 description = "Axum shell for the LogicView demo UI"
 
 [dependencies]
+logicview-config = { path = "../logicview-config" }
+logicview-mcp = { path = "../logicview-mcp" }
 logicview-engine = { path = "../logicview-engine" }
 logicview-capture = { path = "../logicview-capture" }
 axum.workspace = true

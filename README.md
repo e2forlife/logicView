@@ -32,6 +32,18 @@ The app opens a desktop window and serves its interface on loopback port `4173`.
 
 For supported hardware, firmware and FPGA bitstreams are not included in the repository. If the pod's FPGA is not already configured, set `LOGICVIEW_FIRMWARE_DIR` to a directory containing the appropriate user-supplied `DSLogicPlus.bin` or `DSLogicU3Pro32.bin`. See [Contributing](CONTRIBUTING.md) before working with hardware or reference materials.
 
+## Preferences and extensions
+
+Use the gear in the upper right to set the firmware directory, Lua decoder script directory, and light, dark, or system theme. Preferences persist across launches. A blank firmware directory uses the standard search locations; `LOGICVIEW_FIRMWARE_DIR` takes precedence. On Windows preferences are stored in `%APPDATA%\LogicView\preferences.json`; on Linux they use `XDG_CONFIG_HOME` or `~/.config/LogicView`.
+
+Device identities, USB IDs, channel counts, bitstream filenames, and tested status are in [profiles.toml](profiles.toml). LogicView loads this file at startup from `LOGICVIEW_PROFILES`, the working directory, or beside the executable, and falls back to bundled defaults. Restart after editing it. Profiles describe hardware; the current USB capture implementation still supports only the Plus and U3Pro32 backends. Adding another ID or marking it tested does not implement its hardware protocol or make it safe to open.
+
+### Lua decoders
+
+Lua 5.5 scripts can be used alongside built-in Rust decoders. Set the script directory in Preferences, then add a decoder from the Decode panel or menu and configure its channels. Files ending in `.lua` in that directory are discovered when the application starts and when Preferences are saved. [high_pulses.lua](examples/decoders/high_pulses.lua) is a complete example; copy it into your chosen directory to try it.
+
+Each script returns a table with unique `id`, `name`, `channels`, `classes`, and a `decode(start_sample, end_sample, bit, options)` function. Sample indexes are absolute and the end is exclusive. `bit(channel_name, sample)` returns a Boolean; a disconnected channel reads low. Return an array of annotations with `start_sample`, `end_sample`, `class`, `text`, and an optional string-to-string `fields` table. Ranges must be inside the requested capture region. The built-in decoder IDs take precedence over scripts with the same ID. Scripted stacked decoders and script-specific settings controls are not yet supported. Scripts run with limited standard libraries, memory, and instruction count; errors are logged and yield no annotations.
+
 ## Device support
 
 The following inventory is based on the device profiles in the bundled DSView reference (`libsigrok4DSL/hardware/DSL/dsl.h`). All physical devices use USB vendor ID `2a0e`. **Tested** means buffer and stream capture were checked on one physical device; it does not mean every feature or unit has been verified. **Not implemented** means the reference supports the model, but LogicView cannot open it for capture. Merely identifying a USB device does not constitute capture support.
@@ -82,7 +94,7 @@ The packaging script builds a release executable and writes `dist\logicview-<ver
 cargo run -p logicview-app -- mcp
 ```
 
-The stdio MCP server attaches to a running engine when available; otherwise it starts its own demo engine. On Unix the default endpoint is `/tmp/logicview.sock`. On Windows, the running UI writes its loopback TCP endpoint to `%TEMP%\logicview.sock`. `LOGICVIEW_SOCKET` overrides the Unix socket path or Windows endpoint file path; on Windows a loopback `host:port` value specifies a TCP address instead.
+The robot button in the lower-right corner controls the MCP server. It is off by default; enable it to expose a loopback HTTP endpoint at `http://127.0.0.1:8765/mcp` (or the configured port). Changes to the port take effect after disabling and re-enabling the server. The enabled state and port persist between launches. The stdio MCP server attaches to the running engine when the desktop MCP server is enabled; otherwise it starts its own demo engine. On Unix the default endpoint is `/tmp/logicview.sock`. On Windows, the running UI writes its loopback TCP endpoint to `%TEMP%\logicview.sock`. `LOGICVIEW_SOCKET` overrides the Unix socket path or Windows endpoint file path; on Windows a loopback `host:port` value specifies a TCP address instead.
 
 ## Architecture
 
