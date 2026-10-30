@@ -1,5 +1,8 @@
+//! Reports invalid capture records and payload layouts to callers without depending on USB.
+
 use thiserror::Error;
 
+/// A capture record or sample payload could not be encoded or interpreted.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProtoError {
     #[error("truncated record")]

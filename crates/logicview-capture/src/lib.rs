@@ -2,7 +2,19 @@
 //!
 //! The demo source emits the same feed a device source will: a header, then
 //! atom-packed logic, then analog samples, then end. Tests drive it without
-//! waiting for wall-clock time. USB transfers are not implemented.
+//! waiting for wall-clock time. Hardware USB transfers live in `logicview-hal`;
+//! the engine feeds their results into the session and stores defined here.
+//!
+//! # Data flow
+//!
+//! [`SessionConfig`] is validated and converted into arm bytes by [`Session`].
+//! Sources supply metadata and packed sample blocks; the session updates its
+//! lifecycle and stores the original values in [`LogicStore`] and [`AnalogStore`].
+//! The engine owns scheduling and device selection, so this crate can be tested
+//! without a window or connected instrument.
+//!
+//! The stores also build reduced waveform summaries for drawing. Measurements
+//! and protocol decoding must use original samples rather than those summaries.
 
 mod demo;
 mod error;
@@ -23,4 +35,5 @@ pub use session::{
 };
 pub use store::{AnalogColumn, AnalogStore, Column, LogicStore};
 
+/// Reference clock used to build arm settings for the synthetic capture source.
 pub const DEMO_HW_MAX_RATE: u64 = 100_000_000;

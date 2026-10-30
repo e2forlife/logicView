@@ -1,3 +1,5 @@
+//! Describes capture modes and translates requested sampling rates into device clock settings.
+
 /// Where a trigger is allowed to sit inside the record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthMode {
@@ -32,10 +34,12 @@ impl ModeFlags {
     pub const EXTERNAL_TEST: u16 = 1 << 14;
     pub const INTERNAL_TEST: u16 = 1 << 15;
 
+    /// Checks whether the arm mode enables all of the requested flags.
     pub fn contains(self, bit: u16) -> bool {
         self.0 & bit == bit
     }
 
+    /// Enables capture behavior in the mode word sent when arming the device.
     pub fn insert(&mut self, bit: u16) {
         self.0 |= bit;
     }
@@ -63,8 +67,11 @@ pub fn logic_divider(hw_max_rate: u64, requested: u64, pre_divider: u64) -> u32 
 
 #[cfg(test)]
 mod tests {
+    //! Checks mode selection and sampling-divider behavior against the capture contract.
+
     use super::*;
 
+    /// Locks the mode flags to the capture contract used by arm-record encoding.
     #[test]
     fn mode_bits_follow_the_low_to_high_list() {
         assert_eq!(ModeFlags::TRIGGER_ENABLE, 1 << 0);
@@ -85,6 +92,7 @@ mod tests {
         assert_eq!(ModeFlags::INTERNAL_TEST, 1 << 15);
     }
 
+    /// Checks clock selection for both direct and staged device dividers.
     #[test]
     fn divider_ceils_then_applies_the_pre_divider() {
         assert_eq!(logic_divider(100_000_000, 25_000_000, 1), 4);

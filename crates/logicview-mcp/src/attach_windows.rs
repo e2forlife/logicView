@@ -16,13 +16,17 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(not(windows))]
 compile_error!("Windows TCP attach is compiled only on Windows");
 
+/// Connection type used by the shared MCP attachment protocol on Windows.
 pub type Stream = TcpStream;
 
+/// Owns the local TCP listener and the endpoint description published for clients.
 pub struct Listener {
     inner: TcpListener,
     endpoint: String,
 }
 
+/// Starts a local TCP attachment listener at an explicit address or publishes an assigned port in a
+/// file.
 pub async fn bind(path: &Path) -> std::io::Result<Listener> {
     if let Some(addr) = direct_addr(path) {
         let inner = bind_loopback(addr).await?;
@@ -46,6 +50,7 @@ pub async fn bind(path: &Path) -> std::io::Result<Listener> {
     })
 }
 
+/// Binds a TCP listener only on the local host and verifies the assigned address.
 async fn bind_loopback(addr: SocketAddr) -> std::io::Result<TcpListener> {
     if !addr.ip().is_loopback() {
         return Err(std::io::Error::new(
@@ -64,11 +69,13 @@ async fn bind_loopback(addr: SocketAddr) -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+/// Recognizes an explicit loopback address instead of treating it as an endpoint filename.
 fn direct_addr(path: &Path) -> Option<SocketAddr> {
     let text = path.to_str()?;
     crate::parse_loopback_endpoint(text).ok()
 }
 
+/// Publishes the selected TCP address by replacing a temporary endpoint file.
 fn publish_endpoint(path: &Path, addr: SocketAddr) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_os_string();
     tmp_name.push(".tmp");
@@ -79,6 +86,7 @@ fn publish_endpoint(path: &Path, addr: SocketAddr) -> std::io::Result<()> {
 }
 
 impl Listener {
+    /// Waits for a local client and rejects any connection whose peer is outside loopback.
     pub async fn accept(&self) -> std::io::Result<Stream> {
         loop {
             let (stream, peer) = self.inner.accept().await?;
@@ -89,6 +97,7 @@ impl Listener {
         }
     }
 
+    /// Describes the listener and endpoint source for startup logging.
     pub fn label(&self) -> String {
         match self.inner.local_addr() {
             Ok(addr) => format!("tcp {addr} via {}", self.endpoint),
@@ -97,6 +106,7 @@ impl Listener {
     }
 }
 
+/// Resolves an explicit address or endpoint file and connects to the running local engine.
 pub async fn connect(path: &Path) -> Result<Stream, String> {
     let addr = if let Some(addr) = direct_addr(path) {
         addr
@@ -111,8 +121,11 @@ pub async fn connect(path: &Path) -> Result<Stream, String> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks local TCP attachment using both published files and explicit addresses.
+
     use super::*;
 
+    /// Checks that a published endpoint file connects to the actual local listener.
     #[tokio::test]
     async fn endpoint_file_points_at_the_loopback_listener() {
         let path = std::env::temp_dir().join(format!(
@@ -136,6 +149,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Checks direct-address attachment without endpoint-file discovery.
     #[tokio::test]
     async fn host_port_endpoint_binds_without_a_file() {
         let (listener, port) = bind_free_explicit().await;
@@ -149,6 +163,7 @@ mod tests {
         accept.await.expect("accept task");
     }
 
+    /// Finds a free explicit test address, retrying when another process claims the probed port.
     async fn bind_free_explicit() -> (Listener, u16) {
         for _ in 0..20 {
             let probe = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))

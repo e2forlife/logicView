@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use super::{Annotation, Decoder, DecodeError, SampleSlice};
 
+/// Stateful UART interpreter for idle-high serial data using a configured bit duration.
 #[derive(Clone, Debug)]
 pub struct UartDecoder {
     bit_samples: u64,
@@ -15,6 +16,7 @@ pub struct UartDecoder {
     frame: Option<Frame>,
 }
 
+/// Tracks the next sampling position and partial byte of an in-progress UART frame.
 #[derive(Clone, Debug)]
 struct Frame {
     start: u64,
@@ -24,6 +26,7 @@ struct Frame {
 }
 
 impl Default for UartDecoder {
+    /// Creates an idle UART decoder using the timing of the built-in serial demo.
     fn default() -> Self {
         Self {
             bit_samples: 10,
@@ -35,18 +38,22 @@ impl Default for UartDecoder {
 }
 
 impl Decoder for UartDecoder {
+    /// Returns the stable identifier used to select this protocol in engine commands.
     fn id(&self) -> &'static str {
         "uart"
     }
 
+    /// Returns the display name for this protocol analyzer.
     fn name(&self) -> &'static str {
         "UART"
     }
 
+    /// Lists the signal roles the engine maps to captured channels.
     fn channels(&self) -> &'static [&'static str] {
         &["rx"]
     }
 
+    /// Clears partial protocol state while preserving the selected decoding options.
     fn reset(&mut self) {
         let bit_samples = self.bit_samples;
         *self = Self {
@@ -55,6 +62,7 @@ impl Decoder for UartDecoder {
         };
     }
 
+    /// Finds UART start bits and emits complete bytes or framing errors across capture slices.
     fn feed(&mut self, slice: &SampleSlice<'_>) -> Vec<Annotation> {
         let mut out = Vec::new();
         let mut index = slice.start;
@@ -135,10 +143,12 @@ impl Decoder for UartDecoder {
         out
     }
 
+    /// Produces no extra rows because only complete protocol events are emitted during feeding.
     fn finish(&mut self) -> Vec<Annotation> {
         Vec::new()
     }
 
+    /// Sets the capture samples per UART bit, rejecting unsupported options and unusable timing.
     fn set_option(&mut self, key: &str, value: &str) -> Result<(), DecodeError> {
         if key != "bit_samples" {
             return Err(DecodeError::UnknownOption(key.into()));

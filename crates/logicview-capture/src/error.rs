@@ -1,5 +1,8 @@
+//! Reports capture configuration, state, and sample-storage failures.
+
 use thiserror::Error;
 
+/// A capture could not be configured, started, or added to the session stores.
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("sample rate must be greater than zero")]

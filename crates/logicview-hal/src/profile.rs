@@ -5,13 +5,20 @@
 
 use crate::HalError;
 
+/// USB vendor identifier used to discover the current analyzer family.
 pub const VENDOR_ID: u16 = 0x2A0E;
+/// USB product identifier for the tested Plus backend.
 pub const PLUS_PID: u16 = 0x0020;
+/// Session identifier used to select the tested Plus backend.
 pub const DEVICE_ID: &str = "usb:2a0e:0020";
+/// External FPGA image expected by the Plus backend.
 pub const BITSTREAM_NAME: &str = "DSLogicPlus.bin";
 
+/// USB product identifier for the tested wider analyzer backend.
 pub const U3PRO32_PID: u16 = 0x002C;
+/// Session identifier used to select the wider analyzer backend.
 pub const U3_DEVICE_ID: &str = "usb:2a0e:002c";
+/// External FPGA image expected by the wider analyzer backend.
 pub const U3_BITSTREAM_NAME: &str = "DSLogicU3Pro32.bin";
 
 /// HDL version byte read from a Plus after the FPGA was configured.
@@ -29,7 +36,9 @@ pub const U3_PRE_DIVIDER: u64 = 5;
 /// this clock with the half and quarter mode bits set.
 pub const U3_HW_CLOCK_HZ: u64 = 500_000_000;
 
+/// Requested sampling rate that selects the wider pod's half-rate mode.
 pub const U3_HALF_RATE_HZ: u64 = 500_000_000;
+/// Requested sampling rate that selects the wider pod's quarter-rate mode.
 pub const U3_QUARTER_RATE_HZ: u64 = 1_000_000_000;
 
 /// Bytes of high-speed bulk data that follow the logic header before samples.
@@ -43,7 +52,9 @@ pub const MEMORY_BITS: u64 = 256 * 1024 * 1024;
 /// Hardware clock the divider divides, for every buffer mode on this profile.
 pub const HW_CLOCK_HZ: u64 = 100_000_000;
 
+/// Requested sampling rate that selects the Plus half-rate mode.
 pub const HALF_RATE_HZ: u64 = 200_000_000;
+/// Requested sampling rate that selects the Plus quarter-rate mode.
 pub const QUARTER_RATE_HZ: u64 = 400_000_000;
 
 /// Highest rate for a channel count. Bands are inclusive upper bounds.
@@ -184,6 +195,7 @@ pub fn link_rate_limits(product_id: u16, stream: bool, super_speed: bool) -> &'s
     }
 }
 
+/// Selects the sampling ceiling for a channel count from the chosen device and link limits.
 pub fn max_sample_hz(limits: &[RateLimit], channels: u32) -> u64 {
     let channels = channels.max(1);
     for band in limits {
@@ -194,6 +206,7 @@ pub fn max_sample_hz(limits: &[RateLimit], channels: u32) -> u64 {
     limits.last().map(|band| band.max_hz).unwrap_or(HW_CLOCK_HZ)
 }
 
+/// Validated Plus sampling divider and special rate-mode selections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockPlan {
     pub divider: u32,
@@ -262,6 +275,7 @@ pub fn u3_channel_max_hz(channels: u32) -> u64 {
     max_sample_hz(rate_limits(U3PRO32_PID, false), channels)
 }
 
+/// Clock parameters needed to build an arm record for the wider analyzer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct U3Clock {
     pub hw_max_hz: u64,
@@ -324,6 +338,7 @@ pub fn u3_threshold_code(volts: f64) -> u8 {
     threshold_from_ratio(volts, 1.5 / 2.5)
 }
 
+/// Converts a requested input threshold into the bounded hardware code for the profile.
 fn threshold_from_ratio(volts: f64, ratio: f64) -> u8 {
     if !volts.is_finite() {
         return 0;
@@ -334,8 +349,11 @@ fn threshold_from_ratio(volts: f64, ratio: f64) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    //! Checks that sampling plans, advertised limits, and threshold conversion agree.
+
     use super::*;
 
+    /// Checks supported clock plans and rejects rates that exceed the selected capture mode.
     #[test]
     fn buffer_and_stream_dividers() {
         let one_mhz = plan_clock(1_000_000, 0xFFFF, false).unwrap();
@@ -355,6 +373,7 @@ mod tests {
         assert!(plan_clock(25_000_000, 0xFFFF, true).is_err());
     }
 
+    /// Checks that advertised sampling limits agree with Plus capture validation.
     #[test]
     fn plus_rate_bands_match_plan_clock() {
         for stream in [false, true] {
@@ -374,6 +393,7 @@ mod tests {
         }
     }
 
+    /// Checks the channel-count and link-speed tradeoffs advertised to clients.
     #[test]
     fn wider_pods_use_a_lower_ceiling() {
         assert_eq!(max_sample_hz(rate_limits(PLUS_PID, false), 4), 400_000_000);
@@ -429,6 +449,7 @@ mod tests {
         assert!(plan_u3_clock(50_000_000, u32::MAX, true).is_err());
     }
 
+    /// Checks that advertised sampling limits agree with wider-pod capture validation.
     #[test]
     fn u3_rate_bands_match_plan_u3_clock() {
         for stream in [false, true] {
@@ -452,6 +473,7 @@ mod tests {
         }
     }
 
+    /// Preserves the expected logic-threshold calibration for the tested profiles.
     #[test]
     fn threshold_at_one_point_six_volts() {
         assert_eq!(threshold_code(1.6), 74);
@@ -461,6 +483,7 @@ mod tests {
         assert_eq!(u3_threshold_code(0.0), 0);
     }
 
+    /// Checks that buffer and stream planning use the same staged hardware clock.
     #[test]
     fn u3_buffer_and_stream_share_the_five_hundred_megahertz_clock() {
         let one = plan_u3_clock(1_000_000, 0x1, false).unwrap();

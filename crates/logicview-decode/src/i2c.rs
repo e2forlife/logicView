@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use super::{Annotation, Decoder, DecodeError, SampleSlice};
 
+/// Stateful I2C bus interpreter with an optional address filter.
 #[derive(Clone, Debug)]
 pub struct I2cDecoder {
     primed: bool,
@@ -25,6 +26,7 @@ pub struct I2cDecoder {
 }
 
 impl Default for I2cDecoder {
+    /// Creates an idle I2C decoder that retains transactions for every address.
     fn default() -> Self {
         Self {
             primed: false,
@@ -42,18 +44,22 @@ impl Default for I2cDecoder {
 }
 
 impl Decoder for I2cDecoder {
+    /// Returns the stable identifier used to select this protocol in engine commands.
     fn id(&self) -> &'static str {
         "i2c"
     }
 
+    /// Returns the display name for this protocol analyzer.
     fn name(&self) -> &'static str {
         "I2C"
     }
 
+    /// Lists the signal roles the engine maps to captured channels.
     fn channels(&self) -> &'static [&'static str] {
         &["scl", "sda"]
     }
 
+    /// Clears partial protocol state while preserving the selected decoding options.
     fn reset(&mut self) {
         let address = self.address;
         *self = Self {
@@ -62,6 +68,7 @@ impl Decoder for I2cDecoder {
         };
     }
 
+    /// Tracks bus starts, stops, bytes, and acknowledgments across contiguous capture slices.
     fn feed(&mut self, slice: &SampleSlice<'_>) -> Vec<Annotation> {
         let mut out = Vec::new();
         let mut index = slice.start;
@@ -154,10 +161,12 @@ impl Decoder for I2cDecoder {
         out
     }
 
+    /// Produces no extra rows because only complete protocol events are emitted during feeding.
     fn finish(&mut self) -> Vec<Annotation> {
         Vec::new()
     }
 
+    /// Selects a hexadecimal I2C address filter or restores decoding of all addresses.
     fn set_option(&mut self, key: &str, value: &str) -> Result<(), DecodeError> {
         if key != "address" {
             return Err(DecodeError::UnknownOption(key.into()));
@@ -182,6 +191,7 @@ impl Decoder for I2cDecoder {
     }
 }
 
+/// Creates an I2C annotation using the timing of the observed bus event.
 fn note(
     start: u64,
     end: u64,
@@ -195,22 +205,26 @@ fn note(
 /// Packed SCL/SDA for a 24xx byte write of 0x5A at 0x10, then a random read.
 #[cfg(test)]
 pub(crate) fn fixture_eeprom_bits() -> (Vec<u8>, Vec<u8>, u64) {
+    /// Adds a stable bus interval to the independently generated I2C test fixture.
     fn push_level(scl: &mut Vec<bool>, sda: &mut Vec<bool>, n: usize, sda_level: bool, scl_level: bool) {
         for _ in 0..n {
             scl.push(scl_level);
             sda.push(sda_level);
         }
     }
+    /// Adds one clocked I2C bit to the test fixture.
     fn push_bit(scl: &mut Vec<bool>, sda: &mut Vec<bool>, bit: bool) {
         push_level(scl, sda, 8, bit, false);
         push_level(scl, sda, 8, bit, true);
     }
+    /// Adds a byte and acknowledgment to the test fixture.
     fn push_byte(scl: &mut Vec<bool>, sda: &mut Vec<bool>, byte: u8, ack: bool) {
         for shift in (0..8).rev() {
             push_bit(scl, sda, (byte >> shift) & 1 == 1);
         }
         push_bit(scl, sda, !ack);
     }
+    /// Converts a test bus line into the packed channel format used by decoders.
     fn pack(bits: &[bool]) -> Vec<u8> {
         let mut out = vec![0u8; bits.len().div_ceil(8)];
         for (index, bit) in bits.iter().enumerate() {
@@ -249,11 +263,14 @@ pub(crate) fn fixture_eeprom_bits() -> (Vec<u8>, Vec<u8>, u64) {
 
 #[cfg(test)]
 mod tests {
+    //! Checks I2C event decoding and filtering using an independently generated bus exchange.
+
     use std::sync::atomic::AtomicBool;
 
     use super::*;
     use crate::{run, DecodeRequest};
 
+    /// Checks decoded bus events against an independently generated EEPROM exchange.
     #[test]
     fn i2c_golden_annotations_are_a_write_then_a_read() {
         let (scl, sda, len) = fixture_eeprom_bits();
@@ -304,6 +321,7 @@ mod tests {
         assert!(output.annotations.iter().any(|row| row.class == "nack"));
     }
 
+    /// Checks that the address filter retains matching exchanges and suppresses others.
     #[test]
     fn i2c_address_option_keeps_only_that_address() {
         let (scl, sda, len) = fixture_eeprom_bits();

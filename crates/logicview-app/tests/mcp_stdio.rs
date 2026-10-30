@@ -1,6 +1,9 @@
+//! Checks that the packaged application can expose MCP without connected hardware.
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+/// Starts the actual executable and checks the MCP initialization handshake using a demo engine.
 #[test]
 fn stdio_mcp_initializes_without_a_pod() {
     let socket = std::env::temp_dir().join(format!(

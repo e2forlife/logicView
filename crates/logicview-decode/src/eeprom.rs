@@ -9,45 +9,56 @@ use std::collections::BTreeMap;
 
 use super::{Annotation, Decoder, DecodeError, SampleSlice};
 
+/// Interprets the supported 24xx-style EEPROM operations from I2C annotations.
 #[derive(Clone, Debug, Default)]
 pub struct EepromDecoder;
 
 impl Decoder for EepromDecoder {
+    /// Returns the stable identifier used to select this protocol in engine commands.
     fn id(&self) -> &'static str {
         "eeprom24"
     }
 
+    /// Returns the display name for this protocol analyzer.
     fn name(&self) -> &'static str {
         "EEPROM 24xx"
     }
 
+    /// Requires no direct signal inputs because this decoder consumes I2C annotations.
     fn channels(&self) -> &'static [&'static str] {
         &[]
     }
 
+    /// Declares I2C as the lower-level protocol required for EEPROM interpretation.
     fn stack_on(&self) -> Option<&'static str> {
         Some("i2c")
     }
 
+    /// Leaves this stateless adapter ready for another set of I2C annotations.
     fn reset(&mut self) {}
 
+    /// Ignores raw logic slices because EEPROM interpretation operates on decoded I2C transfers.
     fn feed(&mut self, _slice: &SampleSlice<'_>) -> Vec<Annotation> {
         Vec::new()
     }
 
+    /// Produces no extra rows because only complete protocol events are emitted during feeding.
     fn finish(&mut self) -> Vec<Annotation> {
         Vec::new()
     }
 
+    /// Interprets I2C transfers as EEPROM address selection, writes, and reads.
     fn feed_lower(&mut self, rows: &[Annotation]) -> Vec<Annotation> {
         decode_transfers(rows)
     }
 
+    /// Rejects options because the current EEPROM interpreter has no configurable settings.
     fn set_option(&mut self, key: &str, _value: &str) -> Result<(), DecodeError> {
         Err(DecodeError::UnknownOption(key.into()))
     }
 }
 
+/// Collects the address, direction, and payload of one observed I2C transfer.
 struct Transfer {
     start: u64,
     end: u64,
@@ -56,6 +67,10 @@ struct Transfer {
     data: Vec<u8>,
 }
 
+/// Groups I2C events into transfers and interprets the EEPROM address pointer and payloads.
+///
+/// This models the supported small-device transaction pattern rather than
+/// reconstructing memory contents or every EEPROM variant.
 fn decode_transfers(rows: &[Annotation]) -> Vec<Annotation> {
     let mut transfers = Vec::new();
     let mut current: Option<Transfer> = None;
@@ -174,6 +189,7 @@ fn decode_transfers(rows: &[Annotation]) -> Vec<Annotation> {
     out
 }
 
+/// Creates a higher-level EEPROM event for tables, search, and waveform annotations.
 fn eeprom_row(start: u64, end: u64, class: &str, text: String, pairs: &[(&str, String)]) -> Annotation {
     let mut fields = BTreeMap::new();
     for (key, value) in pairs {
@@ -182,6 +198,7 @@ fn eeprom_row(start: u64, end: u64, class: &str, text: String, pairs: &[(&str, S
     Annotation::new(start, end, class, text, fields)
 }
 
+/// Reads a byte from a structured field emitted by the I2C decoder.
 fn hex_field(row: &Annotation, key: &str) -> Option<u8> {
     let text = row.fields.get(key)?;
     u8::from_str_radix(text, 16).ok()
@@ -189,12 +206,15 @@ fn hex_field(row: &Annotation, key: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks higher-level EEPROM interpretation against independently generated I2C traffic.
+
     use std::sync::atomic::AtomicBool;
 
     use super::*;
     use crate::i2c::fixture_eeprom_bits;
     use crate::{run, DecodeRequest};
 
+    /// Checks that a decoded I2C exchange becomes the expected EEPROM operations.
     #[test]
     fn stack_reports_the_write_and_the_random_read() {
         let (scl, sda, len) = fixture_eeprom_bits();

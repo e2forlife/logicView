@@ -42,25 +42,35 @@ const STAGE_COUNT: usize = 16;
 /// otherwise AND. `invert` flips the stage result. `count` is the hit count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Stage {
+    /// Participating channel conditions in this trigger stage.
     pub mask: u32,
+    /// Required levels, or levels after a selected transition.
     pub value: u32,
+    /// Channels whose conditions require a transition rather than a steady level.
     pub edge: u32,
+    /// Reverses the combined stage condition.
     pub invert: bool,
+    /// Combines channel conditions with OR instead of AND.
     pub logic_or: bool,
+    /// Number of qualifying matches required by the stage.
     pub count: u32,
 }
 
 /// Mask, value, and edge for one stage of channels 16–31.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct UpperStage {
+    /// Channel conditions carried by the extended trigger record.
     pub mask: u32,
+    /// Required levels for the extended-channel stage.
     pub value: u32,
+    /// Extended-channel conditions that require transitions.
     pub edge: u32,
 }
 
 /// Host settings that become one or two arm records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArmConfig {
+    /// Device capture behavior flags.
     pub mode: ModeFlags,
     /// Divider word. The low half is `div_l` and the high half is `div_h`.
     /// On this pod the pre-divider is 1, so a divider below 65536 sits entirely
@@ -68,18 +78,26 @@ pub struct ArmConfig {
     pub divider: u32,
     /// Requested sample count. Encoded as `sample_count >> 4`.
     pub sample_count: u64,
+    /// Requested trigger location in record samples, after alignment and mode limits.
     pub trigger_position: u64,
+    /// Number of enabled sample streams represented by the arm image.
     pub channel_count: u8,
     /// How many stages are active. The arrays below are always 16 long.
     pub stage_count: u8,
+    /// Scope field retained by the record format; logic captures normally leave it unused.
     pub scope_count: u32,
+    /// Mask of physical probes that will contribute packed sample streams.
     pub channel_enable: u32,
+    /// Gain field retained by the record format for device configuration.
     pub fine_gain: u16,
+    /// Ordered trigger conditions in the primary record.
     pub stages: [Stage; STAGE_COUNT],
+    /// Optional companion conditions for extended-channel hardware.
     pub upper: Option<[UpperStage; STAGE_COUNT]>,
 }
 
 impl Default for ArmConfig {
+    /// Creates an inactive arm configuration for callers to fill with validated capture settings.
     fn default() -> Self {
         Self {
             mode: ModeFlags::default(),
@@ -97,6 +115,10 @@ impl Default for ArmConfig {
     }
 }
 
+/// Builds the device arm records from host capture and trigger settings.
+///
+/// Returns an error when a value cannot fit the device record. Sample counts
+/// are stored at the hardware alignment, so their lowest bits are discarded.
 pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     let packed = pack_capture_count(config.sample_count);
     if unpack_capture_count(packed) != (config.sample_count & !0xF) {
@@ -155,6 +177,9 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     Ok(words.into_iter().flat_map(|word| word.to_le_bytes()).collect())
 }
 
+/// Reads capture and trigger settings from an arm record for inspection and tests.
+///
+/// Rejects truncated records, unexpected section markers, and trailing data.
 pub fn decode_arm(bytes: &[u8]) -> Result<ArmConfig, ProtoError> {
     let mut reader = Reader { bytes, i: 0 };
     reader.expect_u32(OPEN_SYNC)?;
@@ -220,6 +245,7 @@ pub fn decode_arm(bytes: &[u8]) -> Result<ArmConfig, ProtoError> {
     Ok(config)
 }
 
+/// Encodes how a trigger stage combines and inverts its channel conditions.
 fn logic_word(stage: &Stage) -> u16 {
     let mut word = 0u16;
     if stage.invert {
@@ -231,6 +257,7 @@ fn logic_word(stage: &Stage) -> u16 {
     word
 }
 
+/// Writes a trigger field across all stages in the device's grouped layout.
 fn push_groups(words: &mut Vec<u16>, field: impl Fn(&Stage) -> u32, stages: &[Stage; STAGE_COUNT]) {
     for stage in stages {
         words.push(field(stage) as u16);
@@ -240,6 +267,7 @@ fn push_groups(words: &mut Vec<u16>, field: impl Fn(&Stage) -> u32, stages: &[St
     }
 }
 
+/// Writes the extended-channel trigger fields in the layout of the second record.
 fn push_upper(
     words: &mut Vec<u16>,
     stages: &[UpperStage; STAGE_COUNT],
@@ -253,27 +281,32 @@ fn push_upper(
     }
 }
 
+/// Appends a wide field in the word order used by device arm records.
 fn push_u32(words: &mut Vec<u16>, value: u32) {
     words.push(value as u16);
     words.push((value >> 16) as u16);
 }
 
+/// Rejects host values that cannot be represented by a device arm field.
 fn fit_u32(value: u64) -> Result<u32, ProtoError> {
     u32::try_from(value).map_err(|_| ProtoError::FieldOverflow)
 }
 
+/// Walks arm-record bytes while checking boundaries and section markers.
 struct Reader<'a> {
     bytes: &'a [u8],
     i: usize,
 }
 
 impl Reader<'_> {
+    /// Reads the next arm-record word, reporting incomplete device data as an error.
     fn u16(&mut self) -> Result<u16, ProtoError> {
         let slice = self.bytes.get(self.i..self.i + 2).ok_or(ProtoError::Truncated)?;
         self.i += 2;
         Ok(u16::from_le_bytes([slice[0], slice[1]]))
     }
 
+    /// Checks that the next section marker matches the expected arm-record layout.
     fn expect_u16(&mut self, expected: u16) -> Result<(), ProtoError> {
         let got = self.u16()?;
         if got != expected {
@@ -283,6 +316,7 @@ impl Reader<'_> {
         }
     }
 
+    /// Checks a record boundary before continuing to read its contents.
     fn expect_u32(&mut self, expected: u32) -> Result<(), ProtoError> {
         let lo = self.u16()? as u32;
         let hi = self.u16()? as u32;
@@ -293,12 +327,14 @@ impl Reader<'_> {
         }
     }
 
+    /// Reads a wide arm field from the device word stream.
     fn u32_halves(&mut self) -> Result<u32, ProtoError> {
         let lo = self.u16()? as u32;
         let hi = self.u16()? as u32;
         Ok(lo | (hi << 16))
     }
 
+    /// Reads one group of trigger-stage fields in stage order.
     fn array16(&mut self) -> Result<[u16; STAGE_COUNT], ProtoError> {
         let mut out = [0u16; STAGE_COUNT];
         for slot in &mut out {
@@ -307,6 +343,7 @@ impl Reader<'_> {
         Ok(out)
     }
 
+    /// Reassembles the wide fields stored as separate groups of low and high words.
     fn group_u32(&mut self) -> Result<[u32; STAGE_COUNT], ProtoError> {
         let low = self.array16()?;
         let high = self.array16()?;
@@ -320,8 +357,11 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks arm records against independent fixtures and invalid input.
+
     use super::*;
 
+    /// Builds a representative capture configuration for checking the arm codec.
     fn canonical() -> ArmConfig {
         let mut stages = [Stage::default(); 16];
         stages[0] = Stage {
@@ -380,6 +420,7 @@ mod tests {
         words
     }
 
+    /// Checks the codec against an independently written device-record fixture.
     #[test]
     fn arm_record_matches_the_hand_written_vector() {
         let expected: Vec<u8> = hand_words().into_iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -389,6 +430,7 @@ mod tests {
         assert_eq!(decode_arm(&encoded).unwrap(), canonical());
     }
 
+    /// Checks that extended-channel triggers use a separate record and survive decoding.
     #[test]
     fn upper_channel_record_is_a_second_sync_pair() {
         let mut config = canonical();
@@ -410,6 +452,7 @@ mod tests {
         assert_eq!(opens, 2);
     }
 
+    /// Checks that incomplete or misidentified arm records fail before their fields are used.
     #[test]
     fn truncated_and_bad_sync_fail() {
         assert_eq!(decode_arm(&[0, 1, 2]), Err(ProtoError::Truncated));

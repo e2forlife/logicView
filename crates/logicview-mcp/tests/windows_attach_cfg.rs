@@ -4,6 +4,7 @@
 //! `cargo check --target x86_64-pc-windows-msvc`, which compiles the TCP
 //! module and skips the Unix module.
 
+/// Checks that platform-specific attachment implementations stay behind their compile-time guards.
 #[test]
 fn unix_socket_types_stay_behind_cfg() {
     let lib = include_str!("../src/lib.rs");
@@ -43,6 +44,7 @@ fn unix_socket_types_stay_behind_cfg() {
     assert_cfg_gated(lib, "attach_windows", "#[cfg(windows)]");
 }
 
+/// Checks the source-level guard that keeps an attachment module on its intended platform.
 fn assert_cfg_gated(src: &str, module: &str, cfg: &str) {
     let lines: Vec<&str> = src.lines().collect();
     let needle = format!("mod {module};");

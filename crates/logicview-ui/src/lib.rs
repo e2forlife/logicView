@@ -4,6 +4,17 @@
 //! Sample truth stays in the engine. Tile requests return either JSON (HTTP)
 //! or the `LVT1` binary frame (WebSocket). The server refuses a non-loopback
 //! bind.
+//!
+//! # Client boundary
+//!
+//! HTTP and WebSocket commands share `dispatch`, which delegates operations to
+//! `logicview-engine`. The embedded HTML, CSS, and JavaScript live in `assets`;
+//! this crate handles transport and does not own capture or measurement policy.
+//!
+//! When changing commands, keep the serialized `Command` representation and
+//! browser requests aligned. Changes to binary tile frames must also agree
+//! with the JavaScript reader. Session events prompt clients to refresh their
+//! view; they do not replace the samples retained by the engine.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -32,11 +43,13 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 
+/// Shares the same engine across all HTTP and WebSocket handlers.
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
 }
 
+/// The local UI server could not bind or continue serving.
 #[derive(Debug, Error)]
 pub enum UiError {
     #[error(
@@ -47,6 +60,8 @@ pub enum UiError {
     Io(#[from] std::io::Error),
 }
 
+/// Builds the application routes around a shared engine, including commands, events, and capture
+/// files.
 pub fn router(engine: Engine) -> Router {
     Router::new()
         .route("/", get(index))
@@ -67,6 +82,7 @@ pub fn router(engine: Engine) -> Router {
         .with_state(AppState { engine })
 }
 
+/// Binds the UI server to a local address, rejecting non-loopback listeners.
 pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, UiError> {
     if !addr.ip().is_loopback() {
         return Err(UiError::NonLoopback(addr));
@@ -74,11 +90,16 @@ pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, UiError> 
     Ok(tokio::net::TcpListener::bind(addr).await?)
 }
 
+/// Binds and runs the local UI server until the serving future ends.
 pub async fn serve(engine: Engine, addr: SocketAddr) -> Result<(), UiError> {
     let listener = bind(addr).await?;
     serve_listener(engine, listener).await
 }
 
+/// Runs the UI on an existing listener.
+///
+/// Callers are responsible for supplying a loopback listener, normally obtained
+/// through `bind`, because this entry point does not repeat that address check.
 pub async fn serve_listener(
     engine: Engine,
     listener: tokio::net::TcpListener,
@@ -89,10 +110,12 @@ pub async fn serve_listener(
     Ok(())
 }
 
+/// Serves the embedded application shell without browser caching.
 async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML))
 }
 
+/// Serves the embedded styles used by the waveform workspace.
 async fn css() -> impl IntoResponse {
     (
         [
@@ -103,6 +126,7 @@ async fn css() -> impl IntoResponse {
     )
 }
 
+/// Serves the embedded browser client that renders waveforms and sends engine commands.
 async fn js() -> impl IntoResponse {
     (
         [
@@ -113,6 +137,7 @@ async fn js() -> impl IntoResponse {
     )
 }
 
+/// Reports service availability and the advertised build capabilities.
 async fn health() -> Json<Value> {
     Json(json!({
         "ok": true,
@@ -122,6 +147,7 @@ async fn health() -> Json<Value> {
     }))
 }
 
+/// Handles a JSON command through the same engine dispatch used by WebSocket clients.
 async fn command(
     State(app): State<AppState>,
     Json(cmd): Json<Command>,
@@ -130,6 +156,7 @@ async fn command(
     Ok(Json(json!({"ok": true, "data": data})))
 }
 
+/// Streams live engine notifications to HTTP clients using server-sent events.
 async fn events(
     State(app): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -143,6 +170,7 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
+/// Chooses the event-stream name corresponding to a session notification.
 fn event_name(event: &EngineEvent) -> &'static str {
     match event {
         EngineEvent::Phase { .. } => "phase",
@@ -152,12 +180,14 @@ fn event_name(event: &EngineEvent) -> &'static str {
     }
 }
 
+/// Carries the uploaded filename used to recognize a capture container.
 #[derive(Deserialize)]
 struct ImportQuery {
     #[serde(default)]
     name: String,
 }
 
+/// Loads an uploaded archive into the selected session, using its filename to choose the format.
 async fn import_capture(
     State(app): State<AppState>,
     Query(query): Query<ImportQuery>,
@@ -170,6 +200,7 @@ async fn import_capture(
     Ok(Json(json!({"ok": true, "data": status})))
 }
 
+/// Downloads the selected session as a native capture archive, rejecting an empty record.
 async fn export_lvcap(State(app): State<AppState>) -> Result<Response, ApiError> {
     let status = app.engine.status(None).await?;
     if status.sample_count == 0 {
@@ -190,6 +221,7 @@ async fn export_lvcap(State(app): State<AppState>) -> Result<Response, ApiError>
         .into_response())
 }
 
+/// Downloads the selected session in the supported DSL archive layout.
 async fn export_dsl(State(app): State<AppState>) -> Result<Response, ApiError> {
     let bytes = app.engine.export_dsl(None).await?;
     Ok((
@@ -205,6 +237,7 @@ async fn export_dsl(State(app): State<AppState>) -> Result<Response, ApiError> {
         .into_response())
 }
 
+/// Downloads individual capture samples as a CSV table.
 async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
     let file = app.engine.export_samples_csv(None).await?;
     Ok(sample_file_response(
@@ -216,6 +249,7 @@ async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
     ))
 }
 
+/// Downloads individual capture samples as an Excel workbook.
 async fn export_xlsx(State(app): State<AppState>) -> Result<Response, ApiError> {
     let file = app.engine.export_samples_xlsx(None).await?;
     Ok(sample_file_response(
@@ -227,6 +261,7 @@ async fn export_xlsx(State(app): State<AppState>) -> Result<Response, ApiError> 
     ))
 }
 
+/// Adds download metadata and exported row counts so the client can detect table truncation.
 fn sample_file_response(
     body: Vec<u8>,
     content_type: &'static str,
@@ -249,10 +284,12 @@ fn sample_file_response(
     response
 }
 
+/// Upgrades the browser connection for binary waveform tiles and live command traffic.
 async fn ws_upgrade(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, app.engine))
 }
 
+/// Multiplexes browser commands and engine notifications over one WebSocket connection.
 async fn handle_socket(mut socket: WebSocket, engine: Engine) {
     let mut events = engine.subscribe();
     loop {
@@ -295,6 +332,7 @@ async fn handle_socket(mut socket: WebSocket, engine: Engine) {
     }
 }
 
+/// Returns binary frames for waveform tiles and JSON responses for other WebSocket commands.
 async fn reply_socket(
     socket: &mut WebSocket,
     engine: &Engine,
@@ -342,6 +380,7 @@ async fn reply_socket(
     }
 }
 
+/// Translates browser commands into shared engine operations and client-facing JSON results.
 async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
     match cmd {
         Command::ListDevices => Ok(json!(engine.list_devices().await)),
@@ -632,6 +671,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
     }
 }
 
+/// Bounds viewport requests before allocating or querying waveform columns.
 fn check_tile(columns: usize, spp: f64) -> Result<(), ApiError> {
     if columns == 0 || columns > 8192 || !spp.is_finite() || spp <= 0.0 || spp > 1.0e12 {
         return Err(ApiError(EngineError::Capture(
@@ -641,6 +681,7 @@ fn check_tile(columns: usize, spp: f64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Identifies a viewport, waveform lane, and request for binary tile rendering.
 struct TileQuery<'a> {
     session: Option<&'a str>,
     channel: usize,
@@ -651,6 +692,8 @@ struct TileQuery<'a> {
     req: u32,
 }
 
+/// Queries the requested waveform lane and encodes a response tagged with the browser request
+/// identifier.
 async fn tile_frame(engine: &Engine, query: TileQuery<'_>) -> Result<Vec<u8>, ApiError> {
     check_tile(query.columns, query.spp)?;
     if query.kind == "analog" {
@@ -718,6 +761,9 @@ pub fn encode_logic_frame(
     out
 }
 
+/// Encodes an analog waveform tile using the shared binary frame header.
+///
+/// Invalid columns carry NaN bounds so the client can leave empty time blank.
 pub fn encode_analog_frame(
     req: u32,
     channel: u16,
@@ -739,6 +785,7 @@ pub fn encode_analog_frame(
     out
 }
 
+/// Writes the common tile metadata needed to associate a binary frame with its viewport request.
 fn push_header(
     out: &mut Vec<u8>,
     kind: u8,
@@ -758,6 +805,7 @@ fn push_header(
     out.extend_from_slice(&spp.to_le_bytes());
 }
 
+/// Serializes a digital drawing column while preserving whether it contains real samples.
 fn column_json(column: &Column) -> Value {
     json!({
         "first": column.first,
@@ -768,6 +816,7 @@ fn column_json(column: &Column) -> Value {
     })
 }
 
+/// Serializes an analog drawing envelope while preserving whether it contains real samples.
 fn analog_json(column: &AnalogColumn) -> Value {
     json!({
         "min": column.min,
@@ -776,6 +825,7 @@ fn analog_json(column: &AnalogColumn) -> Value {
     })
 }
 
+/// Exposes pulse measurements and available cycle metrics to the browser.
 fn metrics_json(metrics: PulseMetrics) -> Value {
     json!({
         "sample": metrics.sample,
@@ -790,21 +840,25 @@ fn metrics_json(metrics: PulseMetrics) -> Value {
     })
 }
 
+/// Wraps an engine failure for the common HTTP error response.
 struct ApiError(EngineError);
 
 impl From<EngineError> for ApiError {
+    /// Adapts an engine failure to the UI error response path.
     fn from(err: EngineError) -> Self {
         Self(err)
     }
 }
 
 impl IntoResponse for ApiError {
+    /// Returns an engine command failure as a JSON client error.
     fn into_response(self) -> Response {
         let body = Json(json!({"ok": false, "error": self.0.to_string()}));
         (StatusCode::BAD_REQUEST, body).into_response()
     }
 }
 
+/// Browser representation of one edge in an ordered trigger.
 #[derive(Deserialize)]
 struct TriggerStepCmd {
     channel: u8,
@@ -812,6 +866,7 @@ struct TriggerStepCmd {
     rising: bool,
 }
 
+/// Tagged browser command contract shared by the HTTP and WebSocket transports.
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Command {
@@ -994,22 +1049,27 @@ enum Command {
     },
 }
 
+/// Provides the default pre-trigger placement for omitted browser settings.
 fn default_percent() -> f64 {
     10.0
 }
 
+/// Provides the default input threshold for omitted browser settings.
 fn default_threshold() -> f64 {
     1.6
 }
 
+/// Supplies enabled defaults for direction and edge options in browser commands.
 fn default_true() -> bool {
     true
 }
 
+/// Selects CSV when a browser annotation export does not specify a format.
 fn default_csv() -> String {
     "csv".into()
 }
 
+/// Interprets a browser search pattern as logic levels with wildcard positions.
 fn parse_pattern(text: &str) -> Vec<Option<bool>> {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
@@ -1023,6 +1083,8 @@ fn parse_pattern(text: &str) -> Vec<Option<bool>> {
 
 #[cfg(test)]
 mod tests {
+    //! Exercises the browser command contract, waveform transport, and capture downloads.
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -1030,6 +1092,7 @@ mod tests {
     use logicview_engine::Column;
     use tower::ServiceExt;
 
+    /// Checks the binary waveform contract expected by the browser client.
     #[test]
     fn logic_tile_frame_matches_the_documented_layout() {
         let frame = encode_logic_frame(
@@ -1059,6 +1122,7 @@ mod tests {
         assert_eq!(frame.len(), 37);
     }
 
+    /// Checks that the local application shell and service health route are available.
     #[tokio::test]
     async fn health_and_shell_are_served() {
         let app = router(Engine::new());
@@ -1091,6 +1155,7 @@ mod tests {
         assert!(!html.contains("Use Demo"));
     }
 
+    /// Exercises capture startup, progress, and completion through HTTP commands.
     #[tokio::test]
     async fn demo_capture_shows_samples_then_stops() {
         let app = router(Engine::new());
@@ -1133,6 +1198,8 @@ mod tests {
         );
     }
 
+    /// Checks that session selection keeps measurements and waveform queries tied to the correct
+    /// record.
     #[tokio::test]
     async fn two_sessions_measure_and_tiles() {
         let app = router(Engine::new());
@@ -1227,6 +1294,7 @@ mod tests {
         assert_eq!(imported["data"]["channels"][0]["name"], "CLK");
     }
 
+    /// Exercises demo stacking and protocol analysis through browser commands.
     #[tokio::test]
     async fn stacked_channels_decode_over_the_command_api() {
         let app = router(Engine::new());
@@ -1278,6 +1346,8 @@ mod tests {
         assert!(rows[0]["text"].as_str().unwrap().contains("MISO 0x3C"));
     }
 
+    /// Checks that ordered trigger settings reach the engine and report the observed demo trigger
+    /// position.
     #[tokio::test]
     async fn sequential_trigger_reports_sample_40() {
         let app = router(Engine::new());
@@ -1308,6 +1378,7 @@ mod tests {
         assert_eq!(stopped["trigger_sample"], 40);
     }
 
+    /// Guards the UI transport against drawing nonexistent samples after capture completion.
     #[tokio::test]
     async fn stopped_capture_does_not_paint_a_tail_past_the_last_sample() {
         let app = router(Engine::new());
@@ -1421,6 +1492,7 @@ mod tests {
         }
     }
 
+    /// Checks that table downloads expose usable formats and sample row metadata.
     #[tokio::test]
     async fn capture_exports_csv_and_xlsx() {
         let app = router(Engine::new());
@@ -1516,6 +1588,7 @@ mod tests {
         assert!(xlsx.windows(4).any(|window| window == b"SINE"));
     }
 
+    /// Checks that the UI listener stays on the local host.
     #[tokio::test]
     async fn non_loopback_bind_is_refused() {
         let addr = "0.0.0.0:9".parse().unwrap();
@@ -1523,6 +1596,7 @@ mod tests {
         assert!(err.to_string().contains("loopback"));
     }
 
+    /// Sends a command through the in-memory HTTP router and extracts its successful data payload.
     async fn post(app: &Router, body: Value) -> Value {
         let req = Request::builder()
             .method("POST")

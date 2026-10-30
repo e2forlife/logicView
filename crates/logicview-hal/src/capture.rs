@@ -17,16 +17,22 @@ const EP_IN: u8 = 0x86;
 
 const PIPE_DEPTH: usize = 32;
 
+/// Prepared arm bytes, transfer policy, and cancellation state for one physical acquisition.
 pub struct CaptureJob {
+    /// Prepared arm records to send before starting acquisition.
     pub image: Vec<u8>,
+    /// Number of packed channel streams, used to size complete sample atoms.
     pub enabled_channels: u64,
+    /// Planned per-channel record length before any device shortfall.
     pub requested_samples: u64,
+    /// Optional hardware input-threshold code, already converted by the profile.
     pub threshold: Option<u8>,
     /// Stream and loop ignore the header remaining count and keep reading
     /// until the requested length, a sample limit, or stop.
     pub stream: bool,
     /// Loop keeps the pipe open past the requested length until stop.
     pub continuous: bool,
+    /// Shared cooperative stop request checked by the blocking transfer loop.
     pub stop: Arc<AtomicBool>,
     /// What to do when `stop` is set before the byte budget is met.
     pub on_stop: OnStop,
@@ -53,21 +59,32 @@ pub enum OnStop {
     Discard,
 }
 
+/// Final device metadata and transfer diagnostics returned after capture cleanup.
 #[derive(Debug)]
 pub struct CaptureReport {
+    /// Validated device metadata, when a header arrived before capture ended.
     pub header: Option<LogicHeader>,
+    /// Accepted payload byte count; sample events contain only complete atoms.
     pub sample_bytes: u64,
+    /// Whether the final hardware status reported sample memory overflow.
     pub overflow: bool,
+    /// Raw final device status retained for diagnostics.
     pub hw_status: u8,
     /// Stop asked the pod to drop the buffer. `sample_bytes` is then zero.
     pub discarded: bool,
 }
 
+/// Metadata or complete sample atoms emitted while a physical acquisition is read.
 pub enum CaptureEvent {
     Header(LogicHeader),
     Samples(Vec<u8>),
 }
 
+/// Runs one blocking device capture, delivering metadata and whole sample atoms to the caller.
+///
+/// The caller should run this off the asynchronous executor. The job determines
+/// stop behavior and transfer limits; callback failures terminate the capture.
+/// Device cleanup follows the transfer loop before a report is returned.
 pub fn run_capture(
     job: &CaptureJob,
     mut emit: impl FnMut(CaptureEvent) -> Result<(), HalError>,
@@ -306,6 +323,7 @@ pub fn run_capture(
     })
 }
 
+/// Combines capture mode, sample limits, and stop behavior into the remaining transfer ceiling.
 fn read_budget(job: &CaptureJob, expected_bytes: u64, limit_after_stop: Option<u64>) -> u64 {
     let mut budget = if job.continuous {
         job.sample_limit.unwrap_or(u64::MAX)
@@ -318,6 +336,7 @@ fn read_budget(job: &CaptureJob, expected_bytes: u64, limit_after_stop: Option<u
     budget
 }
 
+/// Determines the payload budget from the requested length and device-reported shortfall.
 fn budget_bytes(job: &CaptureJob, header: &LogicHeader) -> u64 {
     let samples = if job.stream || job.continuous {
         job.requested_samples & !63
@@ -342,6 +361,10 @@ fn take_after_leader<'a>(leader: &mut u64, packet: &'a [u8]) -> &'a [u8] {
 
 #[cfg(test)]
 mod hw {
+    //! Exercises physical acquisitions on connected compatible hardware.
+    //!
+    //! These tests are ignored by default and serialize access to the pod.
+
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -351,17 +374,20 @@ mod hw {
 
     use super::*;
 
+    /// Serializes hardware tests so they do not claim or reconfigure the same pod concurrently.
     fn pod_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Creates a standard hardware test job with optional cancellation after the header.
     fn job(samples: u64, mode: u16, abort: bool) -> CaptureJob {
         let mut capture = armed(samples, mode, 100);
         capture.abort_after_header = abort;
         capture
     }
 
+    /// Builds a one-channel hardware test job using the chosen clock and mode.
     fn armed(samples: u64, mode: u16, divider: u32) -> CaptureJob {
         let mut config = ArmConfig::default();
         config.mode = ModeFlags(mode);
@@ -385,6 +411,8 @@ mod hw {
         }
     }
 
+    /// Summarizes received test data to help diagnose transfer alignment and internal-test
+    /// failures.
     fn pattern(bytes: &[u8]) -> String {
         if bytes.is_empty() {
             return "empty".into();
@@ -408,6 +436,7 @@ mod hw {
         format!("mixed {}", shown.join(" "))
     }
 
+    /// Runs a hardware test capture and retains a short payload preview for diagnostics.
     fn try_take(job: &CaptureJob) -> Result<(CaptureReport, Vec<u8>), String> {
         let mut bytes = Vec::new();
         match run_capture(job, |event| {
@@ -439,10 +468,12 @@ mod hw {
         }
     }
 
+    /// Runs a hardware test capture that is expected to succeed.
     fn take(job: &CaptureJob) -> (CaptureReport, Vec<u8>) {
         try_take(job).unwrap_or_else(|err| panic!("capture failed: {err}"))
     }
 
+    /// Checks that a previous test left the instrument usable for another acquisition.
     fn reopen(label: &str) {
         let (report, bytes) = take(&job(
             256,
@@ -462,6 +493,7 @@ mod hw {
         );
     }
 
+    /// Exercises physical buffer capture, cancellation, and recovery on the tested Plus pod.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic Plus"]
     fn plus_buffer_header_count_and_interrupted_capture() {
@@ -501,6 +533,7 @@ mod hw {
         assert_eq!(again.sample_bytes, 32);
     }
 
+    /// Prints physical USB link and endpoint information for wider-pod diagnostics.
     #[test]
     #[ignore = "needs the plugged-in DSLogic U3Pro32"]
     fn u3pro32_reports_link_speed() {
@@ -545,6 +578,7 @@ mod hw {
         }
     }
 
+    /// Checks sample alignment using the wider pod's internal pattern on a SuperSpeed link.
     #[test]
     #[ignore = "needs the plugged-in super-speed DSLogic U3Pro32"]
     fn u3pro32_super_internal_pattern_follows_the_header() {
@@ -581,6 +615,7 @@ mod hw {
         assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
     }
 
+    /// Exercises FPGA reload and short buffer capture on the wider pod.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
     fn u3pro32_short_buffer_returns_check_word_and_samples() {
@@ -625,6 +660,7 @@ mod hw {
         assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
     }
 
+    /// Checks buffer acquisition at a representative rate on the wider pod.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
     fn u3pro32_one_megahertz_buffer_returns_a_header() {
@@ -662,6 +698,7 @@ mod hw {
         );
     }
 
+    /// Checks streaming acquisition at a representative rate on the wider pod.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
     fn u3pro32_one_megahertz_stream_returns_a_header() {
@@ -689,6 +726,7 @@ mod hw {
         assert!(report.sample_bytes > 0, "stream samples arrived");
     }
 
+    /// Exercises buffer clock settings against real wider-pod captures.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
     fn u3pro32_buffer_rates_scale_with_the_divider() {
@@ -726,6 +764,7 @@ mod hw {
         );
     }
 
+    /// Exercises the supported streaming rate bands on a physical SuperSpeed connection.
     #[test]
     #[ignore = "needs the plugged-in super-speed DSLogic U3Pro32"]
     fn u3pro32_super_stream_ceilings_return_a_header() {
@@ -754,6 +793,7 @@ mod hw {
         );
     }
 
+    /// Builds a wider-pod buffer test job with matching channel and clock settings.
     fn u3_buffer(
         rate_hz: u64,
         channels: u32,
@@ -794,6 +834,7 @@ mod hw {
         }
     }
 
+    /// Builds a wider-pod stream test job with matching channel and clock settings.
     fn u3_stream(
         rate_hz: u64,
         channels: u32,
@@ -830,6 +871,7 @@ mod hw {
         }
     }
 
+    /// Creates a wider-pod internal-pattern job for transfer alignment checks.
     fn u3_job(samples: u64) -> CaptureJob {
         let mut capture = armed(samples, ModeFlags::INSTANT | ModeFlags::INTERNAL_TEST, 200);
         capture.product_id = Some(crate::U3PRO32_PID);
@@ -837,6 +879,7 @@ mod hw {
         capture
     }
 
+    /// Exercises representative Plus capture modes and checks device responses.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic Plus"]
     fn plus_reference_modes_return_a_header() {
@@ -904,6 +947,7 @@ mod hw {
         assert!(failed.is_empty(), "Plus modes that missed the reference: {failed:?}");
     }
 
+    /// Builds a Plus test job for a selected sampling rate and channel mask.
     fn plus_mode(
         rate_hz: u64,
         channels: u32,
@@ -954,6 +998,8 @@ mod hw {
         }
     }
 
+    /// Exercises physical capture modes, input settings, early-stop policies, and subsequent
+    /// recovery.
     #[test]
     #[ignore = "needs the plugged-in high-speed DSLogic Plus"]
     fn plus_stream_loop_repeat_threshold_filter_rle_and_stop() {
@@ -1124,6 +1170,7 @@ mod hw {
     }
 }
 
+/// Cancels queued input transfers and drains completions during capture cleanup.
 fn cancel(ep: &mut nusb::Endpoint<Bulk, In>) {
     ep.cancel_all();
     while ep.pending() > 0 {
@@ -1135,8 +1182,11 @@ fn cancel(ep: &mut nusb::Endpoint<Bulk, In>) {
 
 #[cfg(test)]
 mod leader {
+    //! Checks that transport padding is removed without discarding real all-low samples.
+
     use super::take_after_leader;
 
+    /// Guards against treating real all-low samples as transport padding.
     #[test]
     fn the_leader_is_one_packet_and_later_zeros_stay() {
         let mut leader = 512u64;

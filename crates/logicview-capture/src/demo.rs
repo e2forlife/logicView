@@ -16,6 +16,7 @@ pub const DEMO_CHANNELS: usize = 4;
 pub const CLOCK_PERIOD: u64 = 100;
 pub const CLOCK_HIGH_AT: u64 = 50;
 
+/// Produces deterministic capture blocks for demos and tests without a physical instrument.
 #[derive(Clone, Debug)]
 pub struct DemoSource {
     total: u64,
@@ -33,6 +34,8 @@ pub struct DemoSource {
 }
 
 impl DemoSource {
+    /// Creates a repeatable synthetic source using the session settings and selected channel
+    /// waveforms.
     pub fn new(
         config: &SessionConfig,
         total_samples: u64,
@@ -53,6 +56,10 @@ impl DemoSource {
         }
     }
 
+    /// Produces the next header or sample block without waiting for wall-clock time.
+    ///
+    /// The session consumes these blocks through the same storage path as a device
+    /// capture. Once exhausted, the source continues returning the end marker.
     pub fn poll(&mut self) -> Result<Feed, CaptureError> {
         if self.finished {
             return Ok(Feed::End);
@@ -108,6 +115,7 @@ impl DemoSource {
     }
 }
 
+/// One event from a capture source: metadata, a sample block, or completion.
 pub enum Feed {
     Header(LogicHeader),
     Samples {
@@ -119,10 +127,12 @@ pub enum Feed {
     End,
 }
 
+/// Provides the demo clock level used to exercise waveform drawing and measurements.
 pub fn clock_high(sample: u64) -> bool {
     sample % CLOCK_PERIOD >= CLOCK_HIGH_AT
 }
 
+/// Provides a repeating serial frame for exercising UART decoding without hardware.
 pub fn uart_high(sample: u64) -> bool {
     const BIT: u64 = 10;
     const IDLE: u64 = BIT * 2;
@@ -150,38 +160,46 @@ pub const I2C_DATA: u8 = 0x5A;
 pub const SPI_MOSI: u8 = 0xA5;
 pub const SPI_MISO: u8 = 0x3C;
 
+/// Provides the clock line of the demo EEPROM exchange.
 pub fn i2c_scl_high(sample: u64) -> bool {
     let frame = i2c_frame();
     frame[(sample as usize) % frame.len()].1
 }
 
+/// Provides the data line of the demo EEPROM exchange.
 pub fn i2c_sda_high(sample: u64) -> bool {
     let frame = i2c_frame();
     frame[(sample as usize) % frame.len()].0
 }
 
+/// Provides the clock line of the demo SPI pod.
 pub fn spi_sck_high(sample: u64) -> bool {
     spi_frame()[(sample as usize) % spi_frame().len()][0]
 }
 
+/// Provides the controller output line of the demo SPI pod.
 pub fn spi_mosi_high(sample: u64) -> bool {
     spi_frame()[(sample as usize) % spi_frame().len()][1]
 }
 
+/// Provides the peripheral output line of the demo SPI pod.
 pub fn spi_miso_high(sample: u64) -> bool {
     spi_frame()[(sample as usize) % spi_frame().len()][2]
 }
 
+/// Provides the chip-select line that bounds demo SPI transfers.
 pub fn spi_cs_high(sample: u64) -> bool {
     spi_frame()[(sample as usize) % spi_frame().len()][3]
 }
 
+/// Shares one lazily generated EEPROM waveform across demo channel queries.
 fn i2c_frame() -> &'static [(bool, bool)] {
     use std::sync::OnceLock;
     static FRAME: OnceLock<Vec<(bool, bool)>> = OnceLock::new();
     FRAME.get_or_init(build_i2c_frame)
 }
 
+/// Shares one lazily generated SPI waveform across demo channel queries.
 fn spi_frame() -> &'static [[bool; 4]] {
     use std::sync::OnceLock;
     static FRAME: OnceLock<Vec<[bool; 4]>> = OnceLock::new();
@@ -194,15 +212,18 @@ fn spi_frame() -> &'static [[bool; 4]] {
 /// changes while SCL is low and is stable on the rising edge. A start is SDA
 /// falling while SCL stays high.
 fn build_i2c_frame() -> Vec<(bool, bool)> {
+    /// Extends the synthetic I2C waveform with a stable bus state.
     fn push(out: &mut Vec<(bool, bool)>, n: usize, sda: bool, scl: bool) {
         for _ in 0..n {
             out.push((sda, scl));
         }
     }
+    /// Appends one complete clocked bit to the synthetic bus exchange.
     fn push_bit(out: &mut Vec<(bool, bool)>, bit: bool) {
         push(out, 8, bit, false);
         push(out, 8, bit, true);
     }
+    /// Appends an I2C byte and its acknowledgment to the synthetic exchange.
     fn push_byte(out: &mut Vec<(bool, bool)>, byte: u8, ack: bool) {
         for shift in (0..8).rev() {
             push_bit(out, (byte >> shift) & 1 == 1);
@@ -235,6 +256,7 @@ fn build_i2c_frame() -> Vec<(bool, bool)> {
 
 /// One mode-0 word, chip select active low, MSB first.
 fn build_spi_frame() -> Vec<[bool; 4]> {
+    /// Appends one complete clocked bit to the synthetic bus exchange.
     fn push_bit(out: &mut Vec<[bool; 4]>, mosi: bool, miso: bool) {
         for _ in 0..4 {
             out.push([false, mosi, miso, false]);
@@ -266,7 +288,7 @@ fn build_spi_frame() -> Vec<[bool; 4]> {
     out
 }
 
-/// One synthetic logic pod. Two of these can be stacked into one waveform.
+/// Display metadata and signal generator for one channel on a synthetic device.
 #[derive(Clone, Copy)]
 pub struct DemoChannel {
     pub name: &'static str,
@@ -274,6 +296,7 @@ pub struct DemoChannel {
     pub level: fn(u64) -> bool,
 }
 
+/// Describes a selectable synthetic device and the channels it contributes to a session.
 #[derive(Clone, Copy)]
 pub struct DemoPod {
     pub id: &'static str,
@@ -281,6 +304,7 @@ pub struct DemoPod {
     pub channels: &'static [DemoChannel],
 }
 
+/// Lists the synthetic devices and their channel waveforms for the device drawer.
 pub fn demo_pods() -> &'static [DemoPod] {
     const LOGIC: &[DemoChannel] = &[
         DemoChannel {
@@ -341,10 +365,12 @@ pub fn demo_pods() -> &'static [DemoPod] {
     PODS
 }
 
+/// Finds a synthetic device by its stable session identifier.
 pub fn demo_pod(id: &str) -> Option<&'static DemoPod> {
     demo_pods().iter().find(|pod| pod.id == id)
 }
 
+/// Provides a repeatable analog signal for exercising the analog waveform lane.
 pub fn analog_sample(sample: u64, rate: u64) -> f32 {
     let rate = rate.max(1) as f32;
     let t = sample as f32 / rate;
@@ -352,6 +378,7 @@ pub fn analog_sample(sample: u64, rate: u64) -> f32 {
     sine + noise(sample) * 0.05
 }
 
+/// Encodes a generated channel waveform into the packed format consumed by capture stores.
 fn pack_bits(start: u64, samples: u64, f: fn(u64) -> bool) -> Vec<u8> {
     let nbytes = (samples / 8) as usize;
     let mut out = vec![0u8; nbytes];
@@ -368,6 +395,7 @@ fn pack_bits(start: u64, samples: u64, f: fn(u64) -> bool) -> Vec<u8> {
     out
 }
 
+/// Adds deterministic dither so repeated demo captures remain reproducible.
 fn noise(sample: u64) -> f32 {
     let mut x = sample.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 30;
@@ -379,9 +407,12 @@ fn noise(sample: u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    //! Checks that synthetic sources produce recognizable and reproducible signals.
+
     use super::*;
     use logicview_proto::bit_at;
 
+    /// Checks that the demo channels expose distinct, recognizable signals.
     #[test]
     fn clock_edges_and_the_other_patterns_are_not_copies() {
         assert!(!clock_high(49));
@@ -411,6 +442,7 @@ mod tests {
         assert!((a250 - a0).abs() > 0.01);
     }
 
+    /// Checks that the packed demo clock preserves the expected transition.
     #[test]
     fn packed_clock_bit_50_is_high() {
         let bytes = pack_bits(0, 64, clock_high);

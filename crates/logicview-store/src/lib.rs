@@ -4,6 +4,14 @@
 //! `manifest.json`, `logic/<channel>.bin` (LSB-first bits), and `analog/0.f32`.
 //! A `.dsl` zip is a separate container: header text, session JSON, and
 //! `L-<n>/0` blocks. The header text itself is rendered by `logicview-proto`.
+//!
+//! # Restoring a capture
+//!
+//! [`ArchiveData`] separates file handling from the live engine. Readers restore
+//! metadata and streams; the capture stores validate the sample lengths when
+//! the engine installs them. Native captures preserve logic and optional analog
+//! data. The supported DSL subset contains logic data and should not be treated
+//! as a general reader for every session file produced by another application.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -15,8 +23,10 @@ use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+/// Native capture format version understood by this reader and writer.
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// A capture archive could not be read, written, or recognized.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("{0}")]
@@ -35,6 +45,7 @@ pub enum StoreError {
     NotCapture,
 }
 
+/// Metadata needed to restore capture timing, channels, and trigger display.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub version: u32,
@@ -50,6 +61,7 @@ pub struct Manifest {
     pub analog_channels: u32,
 }
 
+/// Trigger information retained with a saved capture.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TriggerManifest {
     pub enabled: bool,
@@ -57,6 +69,7 @@ pub struct TriggerManifest {
     pub instant: bool,
 }
 
+/// Stable channel index and display properties retained in a native capture.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChannelManifest {
     pub index: u32,
@@ -64,6 +77,7 @@ pub struct ChannelManifest {
     pub color: String,
 }
 
+/// Transport-neutral capture contents shared by archive readers and writers.
 #[derive(Clone, Debug)]
 pub struct ArchiveData {
     pub manifest: Manifest,
@@ -71,6 +85,10 @@ pub struct ArchiveData {
     pub analog: Vec<f32>,
 }
 
+/// Saves capture metadata and sample streams as a native capture directory.
+///
+/// Files with matching names are overwritten; callers choose the destination
+/// and remain responsible for avoiding unrelated existing contents.
 pub fn write_directory(path: &Path, data: &ArchiveData) -> Result<(), StoreError> {
     fs::create_dir_all(path)?;
     fs::create_dir_all(path.join("logic"))?;
@@ -88,6 +106,7 @@ pub fn write_directory(path: &Path, data: &ArchiveData) -> Result<(), StoreError
     Ok(())
 }
 
+/// Loads native capture files after checking the manifest version and required channel files.
 pub fn read_directory(path: &Path) -> Result<ArchiveData, StoreError> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(path.join("manifest.json"))?)?;
     check_version(&manifest)?;
@@ -112,6 +131,7 @@ pub fn read_directory(path: &Path) -> Result<ArchiveData, StoreError> {
     })
 }
 
+/// Saves a native capture archive to disk, creating parent directories as needed.
 pub fn write_zip(path: &Path, data: &ArchiveData) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -124,6 +144,7 @@ pub fn write_zip(path: &Path, data: &ArchiveData) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Builds a native capture archive in memory for downloads or automation responses.
 pub fn write_zip_bytes(data: &ArchiveData) -> Result<Vec<u8>, StoreError> {
     let cursor = write_zip_to(Cursor::new(Vec::new()), data)?;
     Ok(cursor.into_inner())
@@ -172,15 +193,18 @@ const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
 </Relationships>"#;
 
+/// Loads a native capture archive from a file.
 pub fn read_zip(path: &Path) -> Result<ArchiveData, StoreError> {
     let file = File::open(path)?;
     read_zip_reader(file)
 }
 
+/// Loads a native capture archive from uploaded or in-memory bytes.
 pub fn read_zip_bytes(bytes: &[u8]) -> Result<ArchiveData, StoreError> {
     read_zip_reader(Cursor::new(bytes.to_vec()))
 }
 
+/// Loads a native capture from either its directory or ZIP representation.
 pub fn read_any(path: &Path) -> Result<ArchiveData, StoreError> {
     if path.is_dir() {
         read_directory(path)
@@ -189,6 +213,7 @@ pub fn read_any(path: &Path) -> Result<ArchiveData, StoreError> {
     }
 }
 
+/// Writes the shared native archive layout to a seekable output stream.
 fn write_zip_to<W: Write + std::io::Seek>(writer: W, data: &ArchiveData) -> Result<W, StoreError> {
     let mut zip = ZipWriter::new(writer);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -205,6 +230,9 @@ fn write_zip_to<W: Write + std::io::Seek>(writer: W, data: &ArchiveData) -> Resu
     Ok(zip.finish()?)
 }
 
+/// Reads native archive members and checks that the declared channel files are present.
+///
+/// Sample lengths are checked when the capture is restored into its stores.
 fn read_zip_reader<R: Read + std::io::Seek>(reader: R) -> Result<ArchiveData, StoreError> {
     let mut archive = ZipArchive::new(reader)?;
     let manifest: Manifest = {
@@ -239,6 +267,7 @@ fn read_zip_reader<R: Read + std::io::Seek>(reader: R) -> Result<ArchiveData, St
     })
 }
 
+/// Rejects manifests whose format version this reader does not understand.
 fn check_version(manifest: &Manifest) -> Result<(), StoreError> {
     if manifest.version != MANIFEST_VERSION {
         Err(StoreError::Version(manifest.version))
@@ -255,6 +284,7 @@ pub struct DslParts {
     pub channels: Vec<Vec<u8>>,
 }
 
+/// Packages header metadata, session settings, and channel blocks into the supported DSL layout.
 pub fn write_dsl_bytes(parts: &DslParts) -> Result<Vec<u8>, StoreError> {
     let cursor = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(cursor);
@@ -361,6 +391,7 @@ pub fn read_dsl_bytes(bytes: &[u8]) -> Result<ArchiveData, StoreError> {
     })
 }
 
+/// Extracts capture metadata and probe names from the supported session header text.
 fn parse_dsl_header(text: &str) -> (BTreeMap<String, String>, BTreeMap<u32, String>) {
     let mut fields = BTreeMap::new();
     let mut probes = BTreeMap::new();
@@ -390,6 +421,7 @@ fn parse_dsl_header(text: &str) -> (BTreeMap<String, String>, BTreeMap<u32, Stri
     (fields, probes)
 }
 
+/// Reads one packed channel block from the supported DSL container for inspection and tests.
 pub fn read_dsl_channel(bytes: &[u8], channel: usize) -> Result<Vec<u8>, StoreError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec()))?;
     let mut file = archive
@@ -400,6 +432,7 @@ pub fn read_dsl_channel(bytes: &[u8], channel: usize) -> Result<Vec<u8>, StoreEr
     Ok(out)
 }
 
+/// Encodes analog samples in the portable byte order used by native captures.
 fn f32_bytes(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 4);
     for sample in samples {
@@ -408,6 +441,7 @@ fn f32_bytes(samples: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Restores analog values while rejecting an incomplete final sample.
 fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, StoreError> {
     let (chunks, rest) = bytes.as_chunks::<4>();
     if !rest.is_empty() {
@@ -421,8 +455,11 @@ fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks native capture persistence and supported interchange packaging.
+
     use super::*;
 
+    /// Builds a small native archive fixture with logic, analog, and display metadata.
     fn sample() -> ArchiveData {
         ArchiveData {
             manifest: Manifest {
@@ -451,6 +488,7 @@ mod tests {
         }
     }
 
+    /// Checks that both native storage forms preserve metadata and sample values.
     #[test]
     fn directory_and_zip_round_trip() {
         let dir = std::env::temp_dir().join(format!("lvcap-dir-{}", std::process::id()));
@@ -471,6 +509,7 @@ mod tests {
         assert_eq!(from_zip.analog, data.analog);
     }
 
+    /// Checks the named archive members required by the supported DSL writer.
     #[test]
     fn dsl_zip_keeps_the_header_and_channel_block() {
         let bytes = write_dsl_bytes(&DslParts {
@@ -491,6 +530,8 @@ mod tests {
         assert_eq!(read_dsl_channel(&bytes, 0).unwrap(), vec![0xAA, 0x55]);
     }
 
+    /// Checks that supported DSL metadata and channel data restore into a native capture
+    /// representation.
     #[test]
     fn dsl_zip_round_trips_into_an_archive() {
         let header = "\
@@ -523,6 +564,7 @@ trigger=
         assert!(data.analog.is_empty());
     }
 
+    /// Checks that spreadsheet packaging includes the worksheet and required workbook members.
     #[test]
     fn xlsx_package_contains_the_worksheet() {
         let bytes = write_xlsx(

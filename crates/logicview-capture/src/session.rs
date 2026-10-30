@@ -1,3 +1,9 @@
+//! Plans captures and tracks their lifecycle independently of device transport.
+//!
+//! The engine drives these transitions, while sources provide headers and samples.
+//! Arm records translate the shared configuration into settings understood by the
+//! current hardware backends.
+
 use logicview_analysis::find_edge_sequence;
 use logicview_proto::{
     align_trigger_position, encode_arm, unpack_logic_atoms, ArmConfig, DepthMode, LogicHeader,
@@ -16,6 +22,7 @@ pub const MAX_SAMPLES: u64 = 16_000_000;
 /// Samples produced per demo poll. A multiple of the 64-sample atom.
 pub const DEMO_CHUNK_SAMPLES: u64 = 65_536;
 
+/// Lifecycle state reported by the engine while a capture is prepared, run, and finalized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Idle,
@@ -28,6 +35,7 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// Returns the stable phase name shared by UI state and automation responses.
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Idle => "idle",
@@ -40,6 +48,7 @@ impl Phase {
         }
     }
 
+    /// Reports whether capture work is still in progress and another arm must wait.
     pub fn is_active(self) -> bool {
         matches!(
             self,
@@ -48,6 +57,7 @@ impl Phase {
     }
 }
 
+/// Chooses whether a capture uses its configured trigger or starts immediately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartMode {
     Normal,
@@ -83,17 +93,23 @@ pub enum TriggerKind {
 /// wait on that RAM: it searches the captured samples for the same sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriggerStep {
+    /// Probe index used by the trigger, before capture streams are packed.
     pub channel: u8,
+    /// Selects a rising transition when true and a falling transition when false.
     pub rising: bool,
 }
 
+/// Maximum ordered trigger depth supported by the arm-record layout.
 pub const MAX_TRIGGER_STEPS: usize = 16;
 
 /// Clock the arm divider is computed from.
 #[derive(Clone, Copy, Debug)]
 pub struct HostClock {
+    /// Reference clock used to derive the requested sampling rate.
     pub hw_max_hz: u64,
+    /// Requested rate that selects the hardware half-rate mode, if supported.
     pub half_rate_hz: Option<u64>,
+    /// Requested rate that selects the hardware quarter-rate mode, if supported.
     pub quarter_rate_hz: Option<u64>,
     /// 1 on the Plus. 5 on the U3Pro32. The high half of the divider word holds
     /// the pre-divider stage.
@@ -102,31 +118,49 @@ pub struct HostClock {
     pub ext_record: bool,
 }
 
+/// Shared capture options supplied by the UI or automation and translated into an arm record.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
+    /// Requested samples per second, validated against the selected hardware limits.
     pub sample_rate_hz: u64,
+    /// Requested record duration used to plan a bounded sample count.
     pub duration_ms: u64,
+    /// Paces demo delivery for live playback instead of generating the record as fast as possible.
     pub realtime: bool,
+    /// Enables trigger settings for normal capture; instant capture bypasses them.
     pub trigger_enabled: bool,
+    /// Requested pre-trigger share of the record, subject to mode-specific limits.
     pub trigger_percent: f64,
+    /// Selects device-buffered acquisition or streaming transfer.
     pub depth: DepthMode,
+    /// Chooses completion behavior; the engine applies repeat and loop scheduling.
     pub run: RunPolicy,
+    /// Pause between acquisitions when the engine uses repeat mode.
     pub repeat_interval_ms: u64,
+    /// Requests the device run-length encoding mode.
     pub rle: bool,
+    /// Logic input threshold requested for physical hardware.
     pub threshold_volts: f64,
+    /// Requests the hardware filter for isolated sample glitches.
     pub one_sample_filter: bool,
+    /// Selects external sampling clock input when supported by the hardware.
     pub external_clock: bool,
+    /// Selects falling-edge sampling for the configured clock mode.
     pub clock_falling: bool,
+    /// Requests dropping the device buffer when an acquisition is stopped early.
     pub discard_on_stop: bool,
     /// Bit per channel. Zero means the first `channel_count` channels.
     pub channel_enable: u32,
+    /// Probe index used by the simple trigger when no ordered steps are provided.
     pub trigger_channel: u8,
+    /// Edge or level condition for the simple trigger.
     pub trigger_kind: TriggerKind,
     /// Ordered edges. Empty means the single `trigger_channel` / `trigger_kind`.
     pub trigger_steps: Vec<TriggerStep>,
 }
 
 impl Default for SessionConfig {
+    /// Provides a bounded demo-friendly capture configuration for a new session.
     fn default() -> Self {
         Self {
             sample_rate_hz: 1_000_000,
@@ -172,6 +206,7 @@ pub fn active_edge_steps(config: &SessionConfig) -> Vec<TriggerStep> {
     }
 }
 
+/// Rejects trigger sequences that exceed the arm format's stage or channel limits.
 pub fn check_trigger(config: &SessionConfig) -> Result<(), CaptureError> {
     if config.trigger_steps.len() > MAX_TRIGGER_STEPS {
         return Err(CaptureError::BadTrigger(
@@ -186,16 +221,27 @@ pub fn check_trigger(config: &SessionConfig) -> Result<(), CaptureError> {
     Ok(())
 }
 
+/// Owns the current capture state, recorded data, and diagnostics independently of its source.
 pub struct Session {
+    /// Current acquisition lifecycle state reported to clients.
     pub phase: Phase,
+    /// Settings used to plan and interpret this capture.
     pub config: SessionConfig,
+    /// Original logic samples and their drawing summaries.
     pub store: LogicStore,
+    /// Original analog samples and their drawing envelopes.
     pub analog: AnalogStore,
+    /// Last prepared device configuration image, retained for capture and diagnostics.
     pub arm: Vec<u8>,
+    /// Observed trigger position in capture sample coordinates, if available.
     pub trigger_sample: Option<u64>,
+    /// Whether this capture bypassed the configured trigger.
     pub instant: bool,
+    /// Terminal failure reason when the session is in its error phase.
     pub error: Option<String>,
+    /// Nonfatal observations that affect interpretation of the retained record.
     pub warnings: Vec<String>,
+    /// Planned capture length, which can exceed the samples actually retained.
     pub total_samples: u64,
     /// Demo captures search stored samples for the edge sequence.
     resolve_edges: bool,
@@ -203,6 +249,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// Creates an idle session with empty stores and the default capture settings.
     pub fn new() -> Self {
         Self {
             phase: Phase::Idle,
@@ -220,10 +267,12 @@ impl Session {
         }
     }
 
+    /// Identifies the latest prepared capture so asynchronous workers can detect stale work.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Prepares a demo capture and returns the synthetic source that will feed it.
     pub fn begin(
         &mut self,
         config: SessionConfig,
@@ -319,6 +368,7 @@ impl Session {
         }
     }
 
+    /// Applies source metadata and establishes the initial trigger and running state.
     pub fn on_header(&mut self, header: LogicHeader) {
         if header.trigger_position > 0 && self.config.trigger_enabled && !self.instant {
             self.trigger_sample = Some(u64::from(header.trigger_position));
@@ -329,6 +379,10 @@ impl Session {
         }
     }
 
+    /// Unpacks a capture block into channel stores and updates the live session state.
+    ///
+    /// Analog samples beyond the logic block are dropped. Demo edge-trigger
+    /// positions are resolved from the accumulated original samples.
     pub fn on_samples(
         &mut self,
         atoms: &[u8],
@@ -358,12 +412,14 @@ impl Session {
         Ok(())
     }
 
+    /// Moves an active session into stopping while its source finishes or releases hardware.
     pub fn request_stop(&mut self) {
         if self.phase.is_active() {
             self.phase = Phase::Stopping;
         }
     }
 
+    /// Finalizes the captured record, trims known fill data, and records unresolved demo triggers.
     pub fn finish(&mut self) {
         // Alternating fill on every channel is not the captured signal.
         // Drop it before the analog lane is cut to the logic length.
@@ -386,17 +442,20 @@ impl Session {
         self.phase = Phase::Stopped;
     }
 
+    /// Records a terminal capture failure so clients can display the reason.
     pub fn fail(&mut self, message: impl Into<String>) {
         self.error = Some(message.into());
         self.phase = Phase::Error;
     }
 
+    /// Adds a nonfatal capture diagnostic to the session status.
     pub fn warn(&mut self, message: impl Into<String>) {
         self.warnings.push(message.into());
     }
 }
 
 impl Default for Session {
+    /// Creates the idle session used when no capture has been prepared.
     fn default() -> Self {
         Self::new()
     }
@@ -445,6 +504,7 @@ fn qualified_edge(
     2
 }
 
+/// Translates an ordered edge sequence into low- and extended-channel trigger records.
 fn apply_edge_stages(
     steps: &[TriggerStep],
     stages: &mut [Stage; 16],
@@ -489,6 +549,7 @@ fn apply_edge_stages(
     Ok(steps.len() as u8)
 }
 
+/// Resolves the selected channel mask, using the requested width when no mask is supplied.
 fn enabled_mask(mask: u32, channels: usize) -> u32 {
     if mask != 0 {
         return mask;
@@ -500,6 +561,10 @@ fn enabled_mask(mask: u32, channels: usize) -> u32 {
     }
 }
 
+/// Translates session options and device clock capabilities into capture arm records.
+///
+/// This is the shared policy boundary for sampling, trigger placement, and
+/// mode flags; transport code sends the resulting bytes without rebuilding them.
 fn build_arm(
     config: &SessionConfig,
     total: u64,
@@ -649,9 +714,12 @@ pub fn planned_samples(config: &SessionConfig) -> Result<u64, CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks capture planning, trigger encoding, and consistency between stored signal types.
+
     use super::*;
     use logicview_proto::{decode_arm, pack_logic_atoms};
 
+    /// Guards against analog spikes caused by retaining data beyond the logic capture.
     #[test]
     fn analog_samples_past_the_logic_count_are_dropped() {
         let mut session = Session::new();
@@ -678,6 +746,7 @@ mod tests {
             .all(|sample| sample.abs() < 1.0));
     }
 
+    /// Checks that ordered triggers preserve stage order across channel groups.
     #[test]
     fn two_edges_occupy_two_stages_including_the_upper_record() {
         let config = SessionConfig {
@@ -725,6 +794,7 @@ mod tests {
         assert_eq!(upper[1].edge, 1 << 1);
     }
 
+    /// Preserves the qualified edge sequence required by the measured device behavior.
     #[test]
     fn a_falling_edge_is_high_then_the_edge() {
         let config = SessionConfig {
@@ -760,6 +830,7 @@ mod tests {
         assert_eq!(armed.stages[1].count, 1);
     }
 
+    /// Checks that staged clocks and extended trigger records are selected for the wider device.
     #[test]
     fn u3_pre_divider_stage_sits_in_the_high_half() {
         let config = SessionConfig {
@@ -788,6 +859,7 @@ mod tests {
         assert!(armed.upper.is_some());
     }
 
+    /// Checks that slow-acquisition mode follows aggregate transfer volume, not sample rate alone.
     #[test]
     fn a_wide_u3_megahertz_capture_is_not_the_slow_bit() {
         let config = SessionConfig {
@@ -816,6 +888,7 @@ mod tests {
         assert!(armed.upper.is_some());
     }
 
+    /// Checks that unsupported trigger depth is rejected before arming.
     #[test]
     fn a_seventeenth_step_is_refused() {
         let config = SessionConfig {

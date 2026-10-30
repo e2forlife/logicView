@@ -11,11 +11,14 @@ use tokio::sync::mpsc;
 
 use super::{EngineEvent, Shared};
 
+/// Carries hardware events and the final result from the blocking worker to the engine.
 enum Note {
     Event(CaptureEvent),
     End(Result<logicview_hal::CaptureReport, HalError>),
 }
 
+/// Bridges the blocking hardware worker into asynchronous session updates and applies repeat or
+/// loop policy.
 pub(crate) async fn drive(
     shared: Arc<Shared>,
     id: String,
@@ -149,6 +152,7 @@ pub(crate) async fn drive(
     }
 }
 
+/// Installs hardware capture metadata only if this worker still owns the session generation.
 async fn apply_header(
     shared: &Shared,
     id: &str,
@@ -172,6 +176,7 @@ async fn apply_header(
     });
 }
 
+/// Adds complete hardware sample atoms and publishes progress for the matching capture generation.
 async fn apply_samples(
     shared: &Shared,
     id: &str,
@@ -199,6 +204,7 @@ async fn apply_samples(
     Ok(())
 }
 
+/// Retains a hardware diagnostic without letting an older worker change a newer capture.
 async fn warn(shared: &Shared, id: &str, generation: u64, message: String) {
     let mut state = shared.lock().await;
     let Some(slot) = state.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -209,6 +215,7 @@ async fn warn(shared: &Shared, id: &str, generation: u64, message: String) {
     }
 }
 
+/// Keeps the configured tail of a loop capture when this worker still owns the session.
 async fn trim(shared: &Shared, id: &str, generation: u64, samples: u64) {
     let mut state = shared.lock().await;
     let Some(slot) = state.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -219,6 +226,7 @@ async fn trim(shared: &Shared, id: &str, generation: u64, samples: u64) {
     }
 }
 
+/// Prepares an empty store for the next repeated acquisition in the same run.
 async fn clear_samples(shared: &Shared, id: &str, generation: u64) {
     let mut state = shared.lock().await;
     let Some(slot) = state.slots.iter_mut().find(|slot| slot.id == id) else {
@@ -231,6 +239,7 @@ async fn clear_samples(shared: &Shared, id: &str, generation: u64) {
     }
 }
 
+/// Finalizes the matching USB run, applies discard or error policy, and publishes its final state.
 async fn settle(shared: &Shared, id: &str, generation: u64, error: Option<String>, discard: bool) {
     let mut state = shared.lock().await;
     let Some(index) = state.slots.iter().position(|slot| slot.id == id) else {

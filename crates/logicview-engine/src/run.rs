@@ -1,3 +1,8 @@
+//! Drives synthetic captures and turns source events into shared session updates.
+//!
+//! Every update checks the capture generation so an older task cannot overwrite
+//! a newer acquisition for the same session.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +11,7 @@ use logicview_capture::Feed;
 
 use super::{EngineEvent, Shared};
 
+/// Feeds a demo source into the session, publishes progress, and optionally paces live playback.
 pub(crate) async fn drive(
     shared: Arc<Shared>,
     id: String,
@@ -151,6 +157,7 @@ async fn settle(shared: &Shared, id: &str, generation: u64, error: Option<String
     true
 }
 
+/// Removes the running handle only when it still belongs to this capture generation.
 fn clear_run(state: &mut super::State, id: &str, generation: u64) {
     if state
         .running

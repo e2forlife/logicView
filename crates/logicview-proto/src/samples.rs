@@ -1,3 +1,8 @@
+//! Converts device logic payloads to and from the per-channel streams used for analysis.
+//!
+//! Capture sources use atoms for transport; stores and decoders use packed bits
+//! for individual channels.
+
 use crate::error::ProtoError;
 
 /// Samples in one logic atom.
@@ -75,8 +80,11 @@ pub fn bit_at(bytes: &[u8], index: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Checks conversion between transport atoms and analysis channel streams.
+
     use super::*;
 
+    /// Checks that transport atoms preserve channel identity and sample order.
     #[test]
     fn unpack_vector_splits_channels_in_index_order() {
         // Two channels, one atom (16 bytes). Hand-written bits:
@@ -100,6 +108,7 @@ mod tests {
         assert_eq!(pack_logic_atoms(&chans).unwrap(), atom);
     }
 
+    /// Checks that incomplete payloads and incompatible channel streams are rejected.
     #[test]
     fn uneven_or_short_buffers_fail() {
         assert_eq!(

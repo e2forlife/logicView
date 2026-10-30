@@ -2,24 +2,40 @@
 //!
 //! Bits are LSB-first: bit 0 of byte 0 is sample 0. Search and pulse math are
 //! exact. The capture crate's mipmap is for drawing, not for these answers.
+//!
+//! # Measurement inputs
+//!
+//! Callers supply the original packed channel bytes, their valid sample count,
+//! and a sample rate when time units are needed. The valid count must not exceed
+//! the available packed data when using edge searches. All positions are
+//! capture-relative sample indexes, so results can be used directly for cursors,
+//! trigger markers, and decoder regions.
 
 /// One pulse under the cursor, plus the rising-to-rising cycle that contains it
 /// when both edges exist.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PulseMetrics {
+    /// Capture position at which the pulse was measured.
     pub sample: u64,
+    /// Whether the measured run is high rather than low.
     pub level_high: bool,
     /// Length of the current high or low run, in samples.
     pub pulse_width_samples: u64,
+    /// Rising-to-rising cycle length when the surrounding cycle is known.
     pub period_samples: Option<u64>,
+    /// High portion of the known rising-to-rising cycle.
     pub high_samples: Option<u64>,
+    /// Duration of the measured run at the capture sample rate.
     pub width_secs: f64,
+    /// Cycle duration when enough edges are available.
     pub period_secs: Option<f64>,
+    /// Cycle frequency when a nonzero period is available.
     pub frequency_hz: Option<f64>,
     /// High time divided by the rising-to-rising period.
     pub duty: Option<f64>,
 }
 
+/// Reads a channel level from the packed capture data; missing bytes are treated as low.
 pub fn bit_at(bytes: &[u8], index: u64) -> bool {
     let Some(byte) = bytes.get((index / 8) as usize) else {
         return false;
@@ -95,6 +111,10 @@ pub fn nearest_edge(bytes: &[u8], len: u64, sample: u64) -> Option<u64> {
     best
 }
 
+/// Measures the pulse under a sample position using the original channel data.
+///
+/// Cycle measurements are present only when both surrounding rising edges are
+/// known. Returns `None` for an invalid position, empty data, or an unknown rate.
 pub fn measure_pulse(bytes: &[u8], len: u64, sample: u64, rate_hz: u64) -> Option<PulseMetrics> {
     if sample >= len || rate_hz == 0 || bytes.is_empty() {
         return None;
@@ -182,6 +202,7 @@ pub fn find_edge_sequence(
     hit
 }
 
+/// Finds the next qualifying transition while evaluating an ordered trigger sequence.
 fn next_level_edge(
     len: u64,
     from: u64,
@@ -241,6 +262,7 @@ pub fn find_pattern(
     }
 }
 
+/// Checks whether the capture matches a search pattern at one candidate position.
 fn pattern_at(bytes: &[u8], at: u64, pattern: &[Option<bool>]) -> bool {
     pattern.iter().enumerate().all(|(offset, want)| match want {
         None => true,
@@ -271,11 +293,17 @@ pub fn count_edges(bytes: &[u8], len: u64, start: u64, end: u64) -> u64 {
 /// Distance between two cursors.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CursorSpan {
+    /// Distance between the clipped cursor positions.
     pub samples: u64,
+    /// Cursor interval at the capture sample rate.
     pub seconds: f64,
+    /// Number of transitions within the measured interval.
     pub edges: u64,
 }
 
+/// Measures the interval and edge count between two waveform cursors.
+///
+/// Positions are clipped to the capture; an unknown sample rate gives zero seconds.
 pub fn cursor_span(bytes: &[u8], len: u64, a: u64, b: u64, rate_hz: u64) -> CursorSpan {
     let start = a.min(b).min(len);
     let end = a.max(b).min(len);
@@ -294,8 +322,11 @@ pub fn cursor_span(bytes: &[u8], len: u64, a: u64, b: u64, rate_hz: u64) -> Curs
 
 #[cfg(test)]
 mod tests {
+    //! Checks measurement and search results against independently generated waveforms.
+
     use super::*;
 
+    /// Builds a predictable clock signal shared by measurement and search tests.
     fn clock_bytes(samples: u64) -> Vec<u8> {
         let mut out = vec![0u8; (samples / 8) as usize];
         for sample in 0..samples {
@@ -307,6 +338,7 @@ mod tests {
         out
     }
 
+    /// Checks that an ordered trigger fires only after every requested transition.
     #[test]
     fn sequence_fires_on_the_later_edge() {
         let ch0 = [0xF0];
@@ -325,6 +357,7 @@ mod tests {
         assert_eq!(find_edge_sequence(8, &[], level), None);
     }
 
+    /// Checks forward edge searches against known clock transitions.
     #[test]
     fn first_rising_edge_of_the_clock_is_sample_50() {
         let bytes = clock_bytes(1000);
@@ -334,6 +367,7 @@ mod tests {
         assert_eq!(find_edge(&bytes, 1000, 0, false), Some(100));
     }
 
+    /// Checks that cursor snapping chooses the closest available transition.
     #[test]
     fn nearest_clock_edge_snaps_to_the_closer_transition() {
         let bytes = clock_bytes(1_000);
@@ -345,6 +379,7 @@ mod tests {
         assert_eq!(nearest_edge(&bytes, 1_000, 50), Some(50));
     }
 
+    /// Checks pulse and cycle measurements, including an incomplete leading cycle.
     #[test]
     fn pulse_metrics_on_the_clock() {
         let bytes = clock_bytes(10_000);
@@ -369,6 +404,7 @@ mod tests {
         assert_eq!(leading.period_samples, None);
     }
 
+    /// Checks pattern navigation and cursor measurements against a known waveform.
     #[test]
     fn pattern_search_and_cursor_span_match_the_clock() {
         let bytes = clock_bytes(1_000);

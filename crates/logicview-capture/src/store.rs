@@ -10,6 +10,7 @@ use crate::error::CaptureError;
 
 const WINDOWS: [u64; 4] = [64, 4_096, 262_144, 16_777_216];
 
+/// Compact transition information used to draw a logic interval at reduced resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Summary {
     first: bool,
@@ -19,6 +20,7 @@ struct Summary {
 }
 
 impl Summary {
+    /// Creates a neutral waveform summary for an empty sample range.
     fn empty() -> Self {
         Self {
             first: false,
@@ -29,6 +31,7 @@ impl Summary {
     }
 }
 
+/// Original packed data and drawing summaries for one logic channel.
 #[derive(Clone, Debug)]
 struct ChannelBits {
     bytes: Vec<u8>,
@@ -37,6 +40,7 @@ struct ChannelBits {
 }
 
 impl ChannelBits {
+    /// Creates the packed storage and summary hierarchy for one logic channel.
     fn new() -> Self {
         Self {
             bytes: Vec::new(),
@@ -45,6 +49,7 @@ impl ChannelBits {
         }
     }
 
+    /// Adds a complete packed channel block and extends its drawing summaries.
     fn append(&mut self, bytes: &[u8], samples: u64) -> Result<(), CaptureError> {
         if !samples.is_multiple_of(8) || bytes.len() as u64 != samples / 8 {
             return Err(CaptureError::BadLength);
@@ -55,6 +60,7 @@ impl ChannelBits {
         Ok(())
     }
 
+    /// Recreates drawing summaries after the underlying capture data changes.
     fn rebuild(&mut self) {
         for level in &mut self.levels {
             level.clear();
@@ -62,6 +68,7 @@ impl ChannelBits {
         self.extend_summaries();
     }
 
+    /// Builds summaries for newly completed windows without rescanning the existing capture.
     fn extend_summaries(&mut self) {
         let complete = self.len / WINDOWS[0];
         let have = self.levels[0].len() as u64;
@@ -81,6 +88,7 @@ impl ChannelBits {
         }
     }
 
+    /// Combines stored summaries and boundary samples for a requested waveform interval.
     fn summarize_range(&self, start: u64, end: u64) -> Summary {
         let end = end.min(self.len);
         if start >= end {
@@ -99,6 +107,7 @@ impl ChannelBits {
         acc.unwrap_or_else(Summary::empty)
     }
 
+    /// Chooses a cached summary or direct sample scan to advance through a drawing query.
     fn take_step(&self, cursor: u64, end: u64) -> (u64, Summary) {
         let remain = end - cursor;
         for level in (0..WINDOWS.len()).rev() {
@@ -119,6 +128,7 @@ impl ChannelBits {
     }
 }
 
+/// Summarizes original channel levels for a range that cannot use a cached window.
 fn scan(bytes: &[u8], start: u64, end: u64) -> Summary {
     if start >= end {
         return Summary::empty();
@@ -143,10 +153,12 @@ fn scan(bytes: &[u8], start: u64, end: u64) -> Summary {
     }
 }
 
+/// Builds a coarser waveform window from its child summaries.
 fn rollup(children: &[Summary]) -> Summary {
     merge_all(children)
 }
 
+/// Combines adjacent summaries while retaining transitions across their shared boundary.
 fn merge(left: Summary, right: Summary) -> Summary {
     let mut edges = u32::from(left.edges) + u32::from(right.edges);
     let mut toggled = left.toggled || right.toggled;
@@ -162,6 +174,7 @@ fn merge(left: Summary, right: Summary) -> Summary {
     }
 }
 
+/// Combines a nonempty ordered set of summaries into one waveform window.
 fn merge_all(parts: &[Summary]) -> Summary {
     let mut acc = parts[0];
     for part in &parts[1..] {
@@ -173,9 +186,13 @@ fn merge_all(parts: &[Summary]) -> Summary {
 /// One pixel column of a digital trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Column {
+    /// Signal level at the beginning of the represented interval.
     pub first: bool,
+    /// Signal level at the end of the represented interval.
     pub last: bool,
+    /// Whether the represented interval contains a transition.
     pub toggled: bool,
+    /// Transition count saturated to fit the drawing summary.
     pub edges: u16,
     /// False when this pixel starts at or after the last stored sample.
     /// A low level with `valid == false` is empty time, not a sample.
@@ -183,6 +200,7 @@ pub struct Column {
 }
 
 impl Column {
+    /// Marks a drawing column as outside the stored capture rather than a low signal.
     fn empty() -> Self {
         Self {
             first: false,
@@ -197,35 +215,44 @@ impl Column {
 /// Min and max of an analog column, in volts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnalogColumn {
+    /// Lowest retained voltage represented by this column.
     pub min: f32,
+    /// Highest retained voltage represented by this column.
     pub max: f32,
+    /// Whether the column overlaps actual captured samples.
     pub valid: bool,
 }
 
+/// Owns packed logic channels and cached summaries for responsive waveform drawing.
 #[derive(Clone, Debug)]
 pub struct LogicStore {
     channels: Vec<ChannelBits>,
 }
 
 impl LogicStore {
+    /// Creates an empty logic capture with a fixed number of channels.
     pub fn new(channel_count: usize) -> Self {
         Self {
             channels: (0..channel_count).map(|_| ChannelBits::new()).collect(),
         }
     }
 
+    /// Returns the number of channel streams represented in the capture.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
 
+    /// Returns the capture length in samples, using the first channel as the shared length.
     pub fn len(&self) -> u64 {
         self.channels.first().map(|ch| ch.len).unwrap_or(0)
     }
 
+    /// Reports whether the logic capture contains any samples.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Reads an original channel level, returning `None` outside the stored capture.
     pub fn level(&self, channel: usize, sample: u64) -> Option<bool> {
         let bytes = self.channel_bytes(channel).ok()?;
         if sample >= self.len() {
@@ -234,6 +261,7 @@ impl LogicStore {
         Some(logicview_analysis::bit_at(bytes, sample))
     }
 
+    /// Borrows a channel's packed samples for measurement, decoding, or export.
     pub fn channel_bytes(&self, channel: usize) -> Result<&[u8], CaptureError> {
         self.channels
             .get(channel)
@@ -241,6 +269,7 @@ impl LogicStore {
             .ok_or(CaptureError::BadChannel(channel))
     }
 
+    /// Adds samples to one channel; capture callers must keep all channel lengths consistent.
     pub fn append_channel(
         &mut self,
         channel: usize,
@@ -254,6 +283,8 @@ impl LogicStore {
         ch.append(bytes, samples)
     }
 
+    /// Restores a capture from equally sized packed channel streams and builds its drawing
+    /// summaries.
     pub fn from_channels(channels: Vec<Vec<u8>>, sample_count: u64) -> Result<Self, CaptureError> {
         let expect = (sample_count / 8) as usize;
         if !sample_count.is_multiple_of(8) {
@@ -271,6 +302,7 @@ impl LogicStore {
         Ok(store)
     }
 
+    /// Copies the channel streams for persistence or transfer.
     pub fn to_channels(&self) -> Vec<Vec<u8>> {
         self.channels.iter().map(|ch| ch.bytes.clone()).collect()
     }
@@ -346,6 +378,11 @@ impl LogicStore {
         }
     }
 
+    /// Produces digital drawing columns for a viewport without inventing samples outside the
+    /// capture.
+    ///
+    /// `start` and `spp` are measured in samples and samples per pixel. Cached
+    /// summaries accelerate zoomed-out views; exact analysis uses the original bytes.
     pub fn tile(
         &self,
         channel: usize,
@@ -394,6 +431,7 @@ impl LogicStore {
     }
 }
 
+/// Owns analog values and cached envelopes used when the waveform is zoomed out.
 #[derive(Clone, Debug, Default)]
 pub struct AnalogStore {
     samples: Vec<f32>,
@@ -405,14 +443,17 @@ pub struct AnalogStore {
 impl AnalogStore {
     const BLOCK: usize = 1024;
 
+    /// Returns the number of analog samples retained in the capture.
     pub fn len(&self) -> usize {
         self.samples.len()
     }
 
+    /// Reports whether the analog capture contains any samples.
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
 
+    /// Borrows the original analog values for persistence or analysis.
     pub fn samples(&self) -> &[f32] {
         &self.samples
     }
@@ -429,12 +470,14 @@ impl AnalogStore {
         self.block_max.truncate(blocks);
     }
 
+    /// Adds analog capture values and updates the cached drawing ranges.
     pub fn append(&mut self, samples: &[f32]) -> Result<(), CaptureError> {
         self.samples.extend_from_slice(samples);
         self.rebuild_tail();
         Ok(())
     }
 
+    /// Restores analog values and builds the range summaries used by the waveform view.
     pub fn from_samples(samples: Vec<f32>) -> Self {
         let mut store = Self {
             samples,
@@ -445,6 +488,8 @@ impl AnalogStore {
         store
     }
 
+    /// Caches ranges for newly completed analog blocks while leaving partial blocks for direct
+    /// scans.
     fn rebuild_tail(&mut self) {
         let full = self.samples.len() / Self::BLOCK;
         let have = self.block_min.len();
@@ -462,6 +507,8 @@ impl AnalogStore {
         }
     }
 
+    /// Produces analog min/max columns for the viewport and marks regions outside the capture as
+    /// empty.
     pub fn tile(&self, start: f64, columns: usize, spp: f64) -> Vec<AnalogColumn> {
         if columns == 0 || !start.is_finite() || !spp.is_finite() || spp <= 0.0 {
             return Vec::new();
@@ -503,6 +550,7 @@ impl AnalogStore {
         out
     }
 
+    /// Finds the analog envelope using cached full blocks and original boundary samples.
     fn range_min_max(&self, start: u64, end: u64) -> (f32, f32) {
         let mut cursor = start as usize;
         let end = end as usize;
@@ -530,6 +578,7 @@ impl AnalogStore {
         (min, max)
     }
 
+    /// Extends analog bounds with original samples from a range not covered by cached blocks.
     fn scan_into(&self, start: usize, end: usize, min: &mut f32, max: &mut f32) {
         for value in &self.samples[start..end] {
             *min = min.min(*value);
@@ -537,6 +586,7 @@ impl AnalogStore {
         }
     }
 
+    /// Reads a retained analog sample, returning `None` outside the capture.
     pub fn sample(&self, index: u64) -> Option<f32> {
         self.samples.get(index as usize).copied()
     }
@@ -544,9 +594,12 @@ impl AnalogStore {
 
 #[cfg(test)]
 mod tests {
+    //! Checks drawing summaries and guards against rendering data outside the actual capture.
+
     use super::*;
     use logicview_analysis::find_edge;
 
+    /// Adds a predictable packed clock to the logic store for drawing and search tests.
     fn push_clock(store: &mut LogicStore, samples: u64) {
         let mut bytes = vec![0u8; (samples / 8) as usize];
         for sample in 0..samples {
@@ -557,6 +610,7 @@ mod tests {
         store.append_channel(0, &bytes, samples).unwrap();
     }
 
+    /// Checks that cached waveform summaries preserve the transitions found in original samples.
     #[test]
     fn mipmap_search_matches_the_linear_scan() {
         let mut store = LogicStore::new(1);
@@ -571,6 +625,7 @@ mod tests {
         }
     }
 
+    /// Checks that both close and wide waveform views preserve the expected clock behavior.
     #[test]
     fn tiles_see_the_clock_edges() {
         let mut store = LogicStore::new(1);
@@ -587,6 +642,7 @@ mod tests {
         assert!(span.toggled);
     }
 
+    /// Builds and appends a channel fixture from an independently specified waveform.
     fn push_levels(
         store: &mut LogicStore,
         channel: usize,
@@ -602,6 +658,7 @@ mod tests {
         store.append_channel(channel, &bytes, samples).unwrap();
     }
 
+    /// Checks that shared alternating upload fill is removed before waveform drawing.
     #[test]
     fn a_shared_oscillation_tail_is_not_the_stored_signal() {
         let signal = 256u64;
@@ -638,6 +695,7 @@ mod tests {
         }
     }
 
+    /// Guards against mistaking a real clock for shared transport fill.
     #[test]
     fn a_clock_next_to_a_still_channel_is_kept() {
         let mut store = LogicStore::new(2);
@@ -650,6 +708,7 @@ mod tests {
         assert!(cols.iter().all(|column| !column.toggled));
     }
 
+    /// Checks that viewport columns beyond recorded data stay empty without invented transitions.
     #[test]
     fn columns_past_the_last_sample_are_not_edges() {
         let mut store = LogicStore::new(1);
@@ -669,6 +728,7 @@ mod tests {
         assert!(!cols[2].valid && !cols[2].toggled);
     }
 
+    /// Uses cached quiet windows to find an edge for comparison with the original-sample search.
     fn find_edge_mip(store: &LogicStore, channel: usize, from: u64, rising: bool) -> Option<u64> {
         let ch = &store.channels[channel];
         if ch.len == 0 || from >= ch.len {

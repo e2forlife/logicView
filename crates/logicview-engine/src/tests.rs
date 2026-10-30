@@ -1,3 +1,8 @@
+//! Exercises the shared engine as a client would use it, using deterministic demo captures.
+//!
+//! These tests cover session state, protocol analysis, channel selection, persistence,
+//! and the distinction between listed hardware and hardware that can be opened.
+
 use std::time::Duration;
 
 use logicview_capture::{SessionConfig, TriggerStep};
@@ -5,6 +10,8 @@ use logicview_proto::{decode_arm, ModeFlags};
 
 use super::{hardware_before_demo, DeviceInfo, Engine, StartMode};
 
+/// Checks that native persistence preserves captured logic, analog values, and subsequent edge
+/// searches.
 #[tokio::test]
 async fn five_second_demo_edge_survives_save_and_load() {
     let engine = Engine::new();
@@ -57,6 +64,7 @@ async fn five_second_demo_edge_survives_save_and_load() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Checks that instant capture bypasses configured triggers while normal capture arms them.
 #[tokio::test]
 async fn instant_clears_the_trigger_enable_bit() {
     let engine = Engine::new();
@@ -116,6 +124,7 @@ async fn instant_clears_the_trigger_enable_bit() {
     assert!(armed.trigger_position >= 64);
 }
 
+/// Exercises pattern navigation, saved measurements, cursor spans, and DSL export together.
 #[tokio::test]
 async fn pattern_cursors_and_dsl_round_trip_on_the_demo() {
     let engine = Engine::new();
@@ -153,6 +162,7 @@ async fn pattern_cursors_and_dsl_round_trip_on_the_demo() {
     assert!(!channel.is_empty());
 }
 
+/// Checks that physical instruments are presented ahead of demo sources.
 #[test]
 fn plugged_in_pods_are_listed_before_demo_devices() {
     let ordered = hardware_before_demo(vec![
@@ -187,6 +197,7 @@ fn plugged_in_pods_are_listed_before_demo_devices() {
     );
 }
 
+/// Checks that an untested product remains discoverable in profiles but cannot be opened.
 #[tokio::test]
 async fn usb_connect_is_refused() {
     let engine = Engine::new();
@@ -208,6 +219,7 @@ async fn usb_connect_is_refused() {
         .any(|profile| profile.product_id == 0x0034 && !profile.hardware_tested));
 }
 
+/// Exercises channel origins, measurements, stacked protocol decoding, and annotation searches.
 #[tokio::test]
 async fn two_demo_pods_stack_decode_and_measure_the_clock() {
     use std::collections::BTreeMap;
@@ -322,6 +334,7 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
     assert!(text.contains("MOSI 0xA5 MISO 0x3C"));
 }
 
+/// Checks ordered trigger encoding and observed demo positions, including invalid sequence depth.
 #[tokio::test]
 async fn sequential_trigger_arms_on_channel_1_and_fires_on_channel_3() {
     let engine = Engine::new();
@@ -446,6 +459,8 @@ async fn sequential_trigger_arms_on_channel_1_and_fires_on_channel_3() {
     assert!(refused.to_string().contains("16"));
 }
 
+/// Checks that the enable mask controls stored streams while the complete probe catalog remains
+/// available.
 #[tokio::test]
 async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
     let engine = Engine::new();
@@ -484,6 +499,7 @@ async fn a_cleared_channel_is_left_out_of_the_demo_capture() {
     );
 }
 
+/// Checks discovery ordering for the wider hardware profile.
 #[tokio::test]
 #[ignore = "needs the plugged-in high-speed DSLogic U3Pro32"]
 async fn plugged_in_u3pro32_is_listed_before_demo_devices() {
@@ -503,6 +519,7 @@ async fn plugged_in_u3pro32_is_listed_before_demo_devices() {
     assert_eq!(status.devices[0].id, "usb:2a0e:002c");
 }
 
+/// Checks that configuration applies channel-count-dependent sampling ceilings.
 #[tokio::test]
 async fn sample_rate_drops_when_more_channels_are_enabled() {
     let engine = Engine::new();
@@ -569,6 +586,7 @@ async fn sample_rate_drops_when_more_channels_are_enabled() {
     assert_eq!(wide.super_stream_rates[0].max_hz, 1_000_000_000);
 }
 
+/// Checks that native and DSL imports restore an inactive session and its captured data.
 #[tokio::test]
 async fn imported_capture_bytes_replace_the_open_session() {
     let engine = Engine::new();

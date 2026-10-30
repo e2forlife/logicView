@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 const WINDOW_PX: u32 = 256;
 const EXE_SIZES: [u32; 5] = [16, 32, 48, 64, 256];
 
+/// Prepares icon assets during the application build and embeds Windows executable resources.
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let png_path = manifest.join("../logicview-ui/assets/icon.png");
@@ -26,10 +27,12 @@ fn main() {
     }
 }
 
+/// Creates an icon image at the size required by a desktop resource.
 fn resize(source: &image::RgbaImage, size: u32) -> image::RgbaImage {
     image::imageops::resize(source, size, size, image::imageops::FilterType::Lanczos3)
 }
 
+/// Builds the Windows icon file and embeds it when the build host supports resource compilation.
 fn embed_exe_icon(source: &image::RgbaImage, out_dir: &Path) {
     let ico_path = out_dir.join("logicview.ico");
     write_ico(source, &ico_path);
@@ -46,6 +49,7 @@ fn embed_exe_icon(source: &image::RgbaImage, out_dir: &Path) {
     }
 }
 
+/// Packages the application artwork at multiple sizes for Windows shell and window displays.
 fn write_ico(source: &image::RgbaImage, path: &Path) {
     let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
     for size in EXE_SIZES {

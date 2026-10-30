@@ -46,6 +46,7 @@ const ADCC_ADDR: u16 = 0x48;
 const FORCE_RDY: u8 = 1 << 1;
 const FORCE_STOP: u8 = 1 << 2;
 
+/// Owns the claimed USB interface and model information for one prepared logic analyzer.
 pub struct Pod {
     interface: nusb::Interface,
     pub firmware_major: u8,
@@ -54,6 +55,7 @@ pub struct Pod {
     speed: Option<Speed>,
 }
 
+/// Discovery information for a connected instrument, including models that cannot be opened.
 pub struct ListedPod {
     pub id: String,
     pub name: String,
@@ -99,6 +101,7 @@ pub fn list_plus() -> Result<Vec<ListedPod>, HalError> {
     Ok(pods)
 }
 
+/// Builds the device-drawer identity from USB discovery data without opening the instrument.
 pub(crate) fn describe_listed(
     vendor_id: u16,
     product_id: u16,
@@ -142,6 +145,7 @@ fn split_arm_image(image: &[u8]) -> (&[u8], Option<&[u8]>) {
     (image, None)
 }
 
+/// Formats the discovered USB link speed for the device drawer.
 fn speed_label(speed: Option<Speed>) -> &'static str {
     match speed {
         Some(Speed::High) => "USB 2",
@@ -153,6 +157,7 @@ fn speed_label(speed: Option<Speed>) -> &'static str {
 }
 
 impl Pod {
+    /// Opens the first supported pod and prepares its firmware and sampling hardware.
     pub fn open() -> Result<Self, HalError> {
         Self::open_product(None)
     }
@@ -210,10 +215,12 @@ impl Pod {
         Ok(pod)
     }
 
+    /// Identifies the opened hardware profile used to select capture behavior.
     pub fn product_id(&self) -> u16 {
         self.product_id
     }
 
+    /// Returns the negotiated USB speed used to choose transfer and sampling limits.
     pub fn speed(&self) -> Option<Speed> {
         self.speed
     }
@@ -229,6 +236,7 @@ impl Pod {
         }
     }
 
+    /// Reads the device state used to coordinate FPGA setup and capture transfers.
     pub fn status(&self) -> Result<u8, HalError> {
         let bytes = self.read(DEST_STATUS, 0, 1)?;
         bytes
@@ -237,10 +245,12 @@ impl Pod {
             .ok_or_else(|| HalError::Usb("status read was empty".into()))
     }
 
+    /// Reports whether the device recorded a capture overflow.
     pub fn overflow(&self) -> Result<bool, HalError> {
         Ok(self.status()? & BIT_OVERFLOW != 0)
     }
 
+    /// Programs the logic input threshold using a code selected by the hardware profile.
     pub fn set_threshold(&self, code: u8) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, VTH_ADDR, &[code])
     }
@@ -255,6 +265,7 @@ impl Pod {
             .ok_or_else(|| HalError::Usb("register read was empty".into()))
     }
 
+    /// Asks an unfinished acquisition to become ready for sample upload.
     pub(crate) fn force_ready(&self) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_RDY])
     }
@@ -264,10 +275,12 @@ impl Pod {
         self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[0])
     }
 
+    /// Asks the device to abandon the current acquisition.
     pub(crate) fn force_stop(&self) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, CTR0_ADDR, &[FORCE_STOP])
     }
 
+    /// Uploads the prepared arm records and waits for the device transfer handshake.
     pub(crate) fn arm_image(&self, image: &[u8]) -> Result<(), HalError> {
         if !self.link_is_super() {
             self.write(DEST_WORDWIDE, &[BIT_WORDWIDE])?;
@@ -297,14 +310,17 @@ impl Pod {
         Ok(())
     }
 
+    /// Starts acquisition after the arm image and input transfer queue are ready.
     pub(crate) fn start(&self) -> Result<(), HalError> {
         self.write(8, &[])
     }
 
+    /// Stops device acquisition as part of capture completion or cleanup.
     pub(crate) fn stop(&self) -> Result<(), HalError> {
         self.write(9, &[])
     }
 
+    /// Borrows the claimed USB interface for the capture transfer loop.
     pub(crate) fn interface(&self) -> &nusb::Interface {
         &self.interface
     }
@@ -363,6 +379,7 @@ impl Pod {
         self.init_sample_clock()
     }
 
+    /// Accepts an already configured FPGA or loads the required external bitstream.
     fn ensure_fpga(&self) -> Result<(), HalError> {
         if self.status()? & BIT_DONE != 0 {
             return self.accept_hdl();
@@ -370,6 +387,7 @@ impl Pod {
         self.load_bitstream()
     }
 
+    /// Reads the hardware-specific FPGA image from an external location and configures the pod.
     fn load_bitstream(&self) -> Result<(), HalError> {
         let path = bitstream_path(self.bitstream_name())?;
         let image = std::fs::read(&path).map_err(|err| {
@@ -378,6 +396,7 @@ impl Pod {
         self.configure_fpga(&image)
     }
 
+    /// Selects the external FPGA image required by the opened device model.
     fn bitstream_name(&self) -> &'static str {
         if self.product_id == U3PRO32_PID {
             U3_BITSTREAM_NAME
@@ -386,6 +405,7 @@ impl Pod {
         }
     }
 
+    /// Selects the FPGA interface version expected by this hardware backend.
     fn hdl_expected(&self) -> u8 {
         if self.product_id == U3PRO32_PID {
             U3_HDL_VERSION
@@ -394,6 +414,8 @@ impl Pod {
         }
     }
 
+    /// Checks the configured FPGA interface, allowing the measured post-capture state of the wider
+    /// pod.
     fn accept_hdl(&self) -> Result<(), HalError> {
         let found = match self.read(DEST_REG_READ, 0, (HDL_ADDR as u8) + 1) {
             Ok(window) => window.get(HDL_ADDR as usize).copied().unwrap_or(0),
@@ -414,6 +436,7 @@ impl Pod {
         }
     }
 
+    /// Performs the model-specific programming handshake and uploads the user-supplied FPGA image.
     fn configure_fpga(&self, image: &[u8]) -> Result<(), HalError> {
         if self.product_id == U3PRO32_PID {
             // The GPIF stays word-wide across PROG unless this is cleared
@@ -441,6 +464,7 @@ impl Pod {
         Ok(())
     }
 
+    /// Waits for a device handshake state with a bounded timeout.
     fn wait_status(&self, bit: u8, limit: Duration) -> Result<(), HalError> {
         let start = Instant::now();
         loop {
@@ -456,6 +480,7 @@ impl Pod {
         }
     }
 
+    /// Reports whether the opened pod has a USB link that supports the wider streaming limits.
     pub fn link_is_super(&self) -> bool {
         matches!(self.speed, Some(Speed::Super | Speed::SuperPlus))
     }
@@ -480,10 +505,12 @@ impl Pod {
         Ok(())
     }
 
+    /// Programs one device register through the vendor control interface.
     fn write_reg(&self, addr: u16, value: u8) -> Result<(), HalError> {
         self.write_at(DEST_REG_WRITE, addr, &[value])
     }
 
+    /// Transfers a complete arm record or FPGA image, rejecting incomplete USB writes.
     fn bulk_out(&self, data: &[u8]) -> Result<(), HalError> {
         let mut ep = self
             .interface
@@ -501,10 +528,12 @@ impl Pod {
         Ok(())
     }
 
+    /// Sends a vendor control command with no register offset.
     fn write(&self, dest: u8, payload: &[u8]) -> Result<(), HalError> {
         self.write_at(dest, 0, payload)
     }
 
+    /// Sends a bounded vendor control payload to the selected destination and offset.
     fn write_at(&self, dest: u8, offset: u16, payload: &[u8]) -> Result<(), HalError> {
         if payload.len() > 60 {
             return Err(HalError::Message(
@@ -529,6 +558,7 @@ impl Pod {
             .map_err(|err| HalError::Usb(err.to_string()))
     }
 
+    /// Requests a vendor control read and collects the device's response after its setup delay.
     fn read(&self, dest: u8, offset: u16, size: u8) -> Result<Vec<u8>, HalError> {
         let header = [dest, offset as u8, (offset >> 8) as u8, size];
         self.interface
@@ -563,6 +593,7 @@ impl Pod {
     }
 }
 
+/// Locates a user-supplied FPGA image and reports all searched locations on failure.
 fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
     let mut tried = Vec::new();
     if let Ok(dir) = std::env::var("LOGICVIEW_FIRMWARE_DIR") {
@@ -590,6 +621,7 @@ fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
     })
 }
 
+/// Lists conventional external locations that may contain the required FPGA image.
 fn candidate_dirs() -> Vec<PathBuf> {
     let mut dirs = dsview_res_dirs(
         std::env::var("ProgramFiles").ok().as_deref(),
@@ -619,9 +651,12 @@ fn dsview_res_dirs(program_files: Option<&str>, program_files_x86: Option<&str>)
 
 #[cfg(test)]
 mod tests {
+    //! Checks device identification and external bitstream discovery without claiming hardware.
+
     use super::{describe_listed, dsview_res_dirs, matches_plus, supported_product};
     use nusb::Speed;
 
+    /// Checks that device identity and the openable-model allowlist remain distinct from discovery.
     #[test]
     fn plus_identity_is_the_tested_high_speed_pod() {
         assert!(matches_plus(0x2A0E, 0x0020));
@@ -632,6 +667,7 @@ mod tests {
         assert!(!supported_product(0x0034));
     }
 
+    /// Checks that discovery exposes meaningful model and connection information.
     #[test]
     fn scan_names_the_plugged_in_plus_and_a_u3pro32() {
         let plus = describe_listed(
@@ -656,6 +692,7 @@ mod tests {
         assert!(describe_listed(0x1234, 0x0020, None, None).is_none());
     }
 
+    /// Checks the external installation paths used to locate user-supplied bitstreams.
     #[test]
     fn firmware_search_includes_a_dsview_install() {
         let dirs = dsview_res_dirs(Some(r"C:\Program Files"), Some(r"C:\Program Files (x86)"));

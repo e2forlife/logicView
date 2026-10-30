@@ -14,10 +14,13 @@ use logicview_decode::{
 use super::{AnnotationRow, DecoderInfo, DecoderInst, Engine, EngineError, Slot};
 
 impl Engine {
+    /// Returns protocol schemas so clients can offer compatible analyzer inputs and output classes.
     pub async fn decoder_catalog(&self) -> Vec<DecoderSchema> {
         catalog()
     }
 
+    /// Resolves channel and stack bindings, installs an analyzer, and refreshes session
+    /// annotations.
     pub async fn add_decoder(
         &self,
         session: Option<&str>,
@@ -70,6 +73,7 @@ impl Engine {
         })
     }
 
+    /// Removes an analyzer and its direct dependents, then refreshes the remaining results.
     pub async fn remove_decoder(
         &self,
         session: Option<&str>,
@@ -89,6 +93,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Replaces analyzer bindings and options and reruns decoding on the current capture.
     pub async fn update_decoder(
         &self,
         session: Option<&str>,
@@ -154,6 +159,7 @@ impl Engine {
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?)
     }
 
+    /// Lists configured analyzer instances for the requested or selected session.
     pub async fn list_decoders(
         &self,
         session: Option<&str>,
@@ -163,6 +169,7 @@ impl Engine {
         Ok(state.slot(&id)?.decoders.iter().map(info_of).collect())
     }
 
+    /// Returns a bounded page of decoded events filtered by analyzer, time range, and search query.
     pub async fn read_annotations(
         &self,
         session: Option<&str>,
@@ -180,6 +187,7 @@ impl Engine {
         Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 
+    /// Returns the first page of annotation matches across the session's analyzers.
     pub async fn search_annotations(
         &self,
         session: Option<&str>,
@@ -189,6 +197,7 @@ impl Engine {
             .await
     }
 
+    /// Exports filtered decoded events as CSV or tab-separated text, grouped by analyzer.
     pub async fn export_annotations(
         &self,
         session: Option<&str>,
@@ -231,6 +240,7 @@ impl Engine {
     }
 }
 
+/// Replaces session annotations by decoding the currently retained original samples.
 pub(crate) fn rerun(slot: &mut Slot) {
     if slot.decoders.is_empty() {
         slot.annotations.clear();
@@ -247,6 +257,10 @@ pub(crate) fn rerun(slot: &mut Slot) {
     slot.annotations = decode_all(&slot.decoders, &packed, len);
 }
 
+/// Runs signal decoders before stacked decoders and merges their events into time order.
+///
+/// The current implementation treats a failed decoder run as an empty result,
+/// so absent rows do not by themselves establish that the bus was inactive.
 fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<AnnotationRow> {
     let mut produced: BTreeMap<String, Vec<Annotation>> = BTreeMap::new();
     let mut rows = Vec::new();
@@ -316,6 +330,7 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64) -> Vec<Ann
     rows
 }
 
+/// Finds an unambiguous I2C parent for the supported EEPROM decoder stack.
 fn resolve_stack(slot: &Slot, stack_on: Option<&str>) -> Result<String, EngineError> {
     if let Some(id) = stack_on {
         let parent = slot
@@ -346,6 +361,7 @@ fn resolve_stack(slot: &Slot, stack_on: Option<&str>) -> Result<String, EngineEr
     }
 }
 
+/// Resolves a channel index, unique label, or device-qualified label to a captured stream.
 fn resolve_channel(slot: &Slot, spec: &str) -> Result<usize, EngineError> {
     if let Ok(index) = spec.parse::<usize>() {
         if index < slot.channel_names.len() {
@@ -377,6 +393,7 @@ fn resolve_channel(slot: &Slot, spec: &str) -> Result<usize, EngineError> {
     }
 }
 
+/// Copies an analyzer's configuration into its client-facing description.
 fn info_of(decoder: &DecoderInst) -> DecoderInfo {
     DecoderInfo {
         id: decoder.id.clone(),
@@ -387,6 +404,7 @@ fn info_of(decoder: &DecoderInst) -> DecoderInfo {
     }
 }
 
+/// Filters annotations while matching byte sequences within each analyzer's own event stream.
 fn filtered(
     slot: &Slot,
     decoder: Option<&str>,
@@ -437,6 +455,7 @@ fn filtered(
     rows
 }
 
+/// Groups tagged rows into the per-analyzer annotation lists used by export writers.
 fn group_rows(rows: &[AnnotationRow]) -> Vec<(String, Vec<Annotation>)> {
     let mut groups: Vec<(String, Vec<Annotation>)> = Vec::new();
     for row in rows {

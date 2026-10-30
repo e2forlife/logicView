@@ -4,6 +4,15 @@
 //! behavior we implement against. They are locked by fixtures in the tests.
 //! Fields that still need a measurement on real hardware are called out next
 //! to the constant. Nothing here speaks USB.
+//!
+//! # Boundaries
+//!
+//! This crate describes bytes rather than transport: [`ArmConfig`] becomes the
+//! settings sent before capture, [`LogicHeader`] describes a returned capture,
+//! and atom helpers translate the payload into packed streams per channel.
+//! Hardware access belongs to `logicview-hal`; session policy belongs to
+//! `logicview-capture`. Keep fixtures independent of the encoder so they can
+//! detect layout regressions rather than repeat them.
 
 mod arm;
 mod dsl;
@@ -100,8 +109,11 @@ pub fn unpack_capture_count(packed: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    //! Checks sample-count and trigger-placement rules shared by capture sources.
+
     use super::*;
 
+    /// Checks that pre-trigger placement respects the capture mode and device alignment.
     #[test]
     fn trigger_position_matches_hand_computed_cases() {
         assert_eq!(
@@ -117,6 +129,7 @@ mod tests {
         assert_eq!(align_trigger_position(0, 50.0, DepthMode::Buffer), 0);
     }
 
+    /// Preserves the sample-count encoding established by hardware measurements.
     #[test]
     fn capture_count_shift_matches_the_plus_capture() {
         assert_eq!(CAPTURE_COUNT_SHIFT, 4);
@@ -130,6 +143,7 @@ mod tests {
         assert_eq!(unpack_capture_count(0x80) / 8, 256);
     }
 
+    /// Checks that retained payload sizes match complete device atoms.
     #[test]
     fn kept_samples_drop_the_remainder_and_align_to_64() {
         assert_eq!(actual_sample_count(10_000, 100), 9856);

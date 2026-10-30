@@ -10,6 +10,17 @@
 //!
 //! Scope and data-acquisition tools are refused. This build does not implement
 //! them.
+//!
+//! # Engine sharing
+//!
+//! [`McpSession`] handles MCP framing and discovery, while [`invoke`] translates
+//! tools into engine commands. A local session calls the engine directly; an
+//! attached session sends the same tool calls through the private local
+//! transport. Keep these paths equivalent when adding automation features.
+//!
+//! Platform modules own attachment discovery and connections. The attachment
+//! protocol is separate from the public MCP JSON-RPC protocol. Standard output
+//! is reserved for MCP responses when running on stdio.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,6 +44,7 @@ use attach_windows as transport;
 #[cfg(not(any(unix, windows)))]
 compile_error!("MCP attach is implemented for Unix sockets and Windows TCP localhost");
 
+/// Chooses the local engine attachment endpoint, honoring `LOGICVIEW_SOCKET` when supplied.
 pub fn default_socket_path() -> PathBuf {
     if let Some(value) = std::env::var_os("LOGICVIEW_SOCKET") {
         return PathBuf::from(value);
@@ -40,11 +52,13 @@ pub fn default_socket_path() -> PathBuf {
     platform_default_socket_path()
 }
 
+/// Chooses the conventional Unix socket location used to attach to a running desktop engine.
 #[cfg(unix)]
 fn platform_default_socket_path() -> PathBuf {
     PathBuf::from("/tmp/logicview.sock")
 }
 
+/// Chooses the Windows endpoint file that publishes the desktop engine's TCP address.
 #[cfg(windows)]
 fn platform_default_socket_path() -> PathBuf {
     std::env::temp_dir().join("logicview.sock")
@@ -65,6 +79,8 @@ pub fn attach_location() -> String {
 
 // The Windows transport reads this. Unix unit tests cover it; the Unix library
 // build has no caller, so the unused warning is limited to that build.
+/// Validates an attachment address so the client connects only to a local endpoint with a real
+/// port.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse_loopback_endpoint(text: &str) -> Result<std::net::SocketAddr, String> {
     let addr: std::net::SocketAddr = text
@@ -80,6 +96,7 @@ pub(crate) fn parse_loopback_endpoint(text: &str) -> Result<std::net::SocketAddr
     Ok(addr)
 }
 
+/// Runs the MCP stdio service and returns a process exit status, reporting failures on stderr.
 pub async fn run_stdio(attach: Option<PathBuf>) -> i32 {
     let session = match open_session(attach).await {
         Ok(session) => session,
@@ -95,6 +112,8 @@ pub async fn run_stdio(attach: Option<PathBuf>) -> i32 {
     0
 }
 
+/// Attaches to the requested engine, or tries the default endpoint before creating a local demo
+/// engine.
 async fn open_session(attach: Option<PathBuf>) -> Result<McpSession, String> {
     if let Some(path) = attach {
         return McpSession::connect(&path)
@@ -109,6 +128,8 @@ async fn open_session(attach: Option<PathBuf>) -> Result<McpSession, String> {
     Ok(McpSession::local(Engine::new()))
 }
 
+/// Accepts local clients and exposes the supplied shared engine through the platform attachment
+/// transport.
 pub async fn serve_attach(engine: Engine, path: &Path) -> std::io::Result<()> {
     let listener = transport::bind(path).await?;
     tracing::info!(endpoint = %listener.label(), "engine attach listening");
@@ -123,6 +144,8 @@ pub async fn serve_attach(engine: Engine, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Handles the private attachment protocol, translating each local tool request into an engine
+/// command.
 async fn socket_client<S>(engine: Engine, stream: S) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -157,22 +180,26 @@ where
     Ok(())
 }
 
+/// Selects direct engine access or serialized requests over an attachment stream.
 enum Backend {
     Local(Engine),
     Remote(Mutex<transport::Stream>),
 }
 
+/// MCP request handler backed by a local engine or an attached running application.
 pub struct McpSession {
     backend: Backend,
 }
 
 impl McpSession {
+    /// Creates an MCP session that calls the supplied engine directly.
     pub fn local(engine: Engine) -> Self {
         Self {
             backend: Backend::Local(engine),
         }
     }
 
+    /// Creates an MCP session attached to a running engine through the platform transport.
     pub async fn connect(path: &Path) -> Result<Self, String> {
         let stream = transport::connect(path).await?;
         Ok(Self {
@@ -180,6 +207,10 @@ impl McpSession {
         })
     }
 
+    /// Handles one MCP JSON-RPC request and returns its response.
+    ///
+    /// Notifications have no response. Tool failures are represented inside tool
+    /// results, while unsupported methods and resources use RPC error responses.
     pub async fn handle(&mut self, message: Value) -> Option<Value> {
         let id = message.get("id").cloned();
         let method = message
@@ -261,6 +292,7 @@ impl McpSession {
         }
     }
 
+    /// Wraps an engine tool result or failure in the MCP tool-content representation.
     async fn call_tool(&mut self, name: &str, arguments: &Value) -> Value {
         match self.dispatch(name, arguments).await {
             Ok(data) => tool_ok(&data),
@@ -268,6 +300,7 @@ impl McpSession {
         }
     }
 
+    /// Routes a tool call to either the in-process engine or the attached desktop engine.
     async fn dispatch(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
         match &self.backend {
             Backend::Local(engine) => invoke(engine, name, arguments).await,
@@ -275,6 +308,7 @@ impl McpSession {
         }
     }
 
+    /// Resolves a LogicView resource URI to current engine state or decoder output.
     async fn read_resource(&mut self, uri: &str) -> Result<String, String> {
         let value = if uri == "logicview://devices" {
             self.dispatch("list_devices", &json!({})).await?
@@ -317,6 +351,10 @@ impl McpSession {
     }
 }
 
+/// Serializes a request and response on the shared attachment stream.
+///
+/// Holding the mutex across both operations prevents concurrent calls from
+/// consuming one another's responses.
 async fn remote_call(
     stream: &Mutex<transport::Stream>,
     tool: &str,
@@ -351,6 +389,7 @@ async fn remote_call(
     }
 }
 
+/// Reads MCP messages until input closes and writes responses without mixing logs into stdout.
 async fn stdio_loop(mut session: McpSession) -> Result<(), String> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -371,6 +410,8 @@ async fn stdio_loop(mut session: McpSession) -> Result<(), String> {
     }
 }
 
+/// Reads a JSON message framed either as one line or by a Content-Length header, skipping blank
+/// lines.
 async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Option<Value>, String> {
     loop {
         let mut line = String::new();
@@ -418,6 +459,10 @@ async fn read_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Result<Opti
     }
 }
 
+/// Translates a named automation tool and JSON arguments into shared engine operations.
+///
+/// Both stdio sessions and attached clients use this dispatch path, keeping
+/// capture, analysis, and validation behavior consistent across backends.
 pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, String> {
     let session = args.get("session").and_then(|value| value.as_str());
     match tool {
@@ -743,6 +788,8 @@ pub async fn invoke(engine: &Engine, tool: &str, args: &Value) -> Result<Value, 
     }
 }
 
+/// Builds a capture response with device identities, warnings, and whether an existing run was
+/// reused.
 fn capture_payload(status: &logicview_engine::Status, reused: bool) -> Value {
     json!({
         "reused": reused,
@@ -758,26 +805,31 @@ fn capture_payload(status: &logicview_engine::Status, reused: bool) -> Value {
     })
 }
 
+/// Reads a required textual tool argument or returns a useful validation error.
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(|value| value.as_str())
         .ok_or_else(|| format!("{key} is required"))
 }
 
+/// Reads a required nonnegative integer tool argument or returns a validation error.
 fn req_u64(args: &Value, key: &str) -> Result<u64, String> {
     args.get(key)
         .and_then(|value| value.as_u64())
         .ok_or_else(|| format!("{key} is required"))
 }
 
+/// Normalizes JSON channel bindings into the engine's textual channel specifications.
 fn channel_map(value: &Value) -> Result<std::collections::BTreeMap<String, String>, String> {
     stringish_map(value, "channels")
 }
 
+/// Normalizes JSON decoder options into the strings expected by protocol interpreters.
 fn string_map(value: &Value) -> Result<std::collections::BTreeMap<String, String>, String> {
     stringish_map(value, "options")
 }
 
+/// Converts scalar object values into strings while rejecting nested or missing option maps.
 fn stringish_map(
     value: &Value,
     label: &str,
@@ -798,6 +850,7 @@ fn stringish_map(
     Ok(map)
 }
 
+/// Converts a user's logic search expression into levels and wildcard positions.
 fn parse_pattern(text: &str) -> Vec<Option<bool>> {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
@@ -809,10 +862,12 @@ fn parse_pattern(text: &str) -> Vec<Option<bool>> {
         .collect()
 }
 
+/// Builds a successful JSON-RPC response preserving the caller's request identifier.
 fn rpc_ok(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+/// Builds a JSON-RPC error response preserving the caller's request identifier.
 fn rpc_err(id: Value, message: String) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -821,6 +876,7 @@ fn rpc_err(id: Value, message: String) -> Value {
     })
 }
 
+/// Provides both a readable result summary and the complete JSON payload in MCP tool content.
 fn tool_ok(data: &Value) -> Value {
     let summary = summary_text(data);
     json!({
@@ -832,6 +888,7 @@ fn tool_ok(data: &Value) -> Value {
     })
 }
 
+/// Reports a tool failure through the MCP content error convention.
 fn tool_err(message: &str) -> Value {
     json!({
         "content": [{"type": "text", "text": message}],
@@ -839,6 +896,7 @@ fn tool_err(message: &str) -> Value {
     })
 }
 
+/// Chooses a concise human-readable preview for annotations, capture status, or other tool data.
 fn summary_text(data: &Value) -> String {
     if let Some(text) = data.get("text").and_then(|value| value.as_str()) {
         if !text.is_empty() {
@@ -869,6 +927,7 @@ fn summary_text(data: &Value) -> String {
     data.to_string()
 }
 
+/// Describes the automation tools advertised during MCP discovery.
 fn tool_defs() -> Vec<Value> {
     vec![
         tool(
@@ -899,6 +958,7 @@ fn tool_defs() -> Vec<Value> {
     ]
 }
 
+/// Builds a tool discovery entry from its name, description, and argument schema.
 fn tool(name: &str, description: &str, properties: Value) -> Value {
     json!({
         "name": name,
@@ -910,6 +970,7 @@ fn tool(name: &str, description: &str, properties: Value) -> Value {
     })
 }
 
+/// Lists the engine state and catalog resources advertised during MCP discovery.
 fn resource_defs() -> Vec<Value> {
     [
         ("logicview://devices", "Demo pods and connected tested pods"),
@@ -922,6 +983,7 @@ fn resource_defs() -> Vec<Value> {
     .collect()
 }
 
+/// Lists built-in demo workflows that help a client explore capture and protocol analysis.
 fn prompt_defs() -> Vec<Value> {
     vec![
         json!({"name": "bringup_i2c", "description": "Capture the demo I2C EEPROM transaction and quote the rows."}),
@@ -930,6 +992,7 @@ fn prompt_defs() -> Vec<Value> {
     ]
 }
 
+/// Returns the instructions and expected observations for a built-in demo workflow.
 fn prompt_text(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "bringup_i2c" => Some((
@@ -973,10 +1036,13 @@ fn prompt_text(name: &str) -> Option<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    //! Exercises MCP discovery, tool calls, and attachment behavior using demo sessions.
+
     use super::*;
     use logicview_capture::SessionConfig;
     use logicview_engine::{Engine, StartMode};
 
+    /// Sends a JSON-RPC request to a test session and requires a response.
     async fn rpc(session: &mut McpSession, id: i64, method: &str, params: Value) -> Value {
         session
             .handle(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
@@ -984,6 +1050,7 @@ mod tests {
             .expect("response")
     }
 
+    /// Extracts the structured payload from a successful MCP tool response in tests.
     fn tool_data(response: &Value) -> Value {
         let text = response["result"]["content"][1]["text"]
             .as_str()
@@ -991,6 +1058,7 @@ mod tests {
         serde_json::from_str(text).expect("json payload")
     }
 
+    /// Exercises discovery and protocol bring-up through the MCP request interface.
     #[tokio::test]
     async fn i2c_and_spi_bringup_reads_decoded_text() {
         let mut session = McpSession::local(Engine::new());
@@ -1126,6 +1194,7 @@ mod tests {
         assert_eq!(metrics["duty"], 0.5);
     }
 
+    /// Checks that an attached client reuses an active capture instead of replacing it.
     #[tokio::test]
     async fn attached_client_does_not_reset_a_running_capture() {
         let engine = Engine::new();
@@ -1186,6 +1255,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Checks that attachment addresses cannot point outside the local host.
     #[test]
     fn loopback_endpoint_rejects_other_hosts() {
         let addr = parse_loopback_endpoint("127.0.0.1:4174\n").unwrap();
@@ -1198,6 +1268,7 @@ mod tests {
         assert!(parse_loopback_endpoint("/tmp/logicview.sock").is_err());
     }
 
+    /// Checks that startup diagnostics describe this platform's attachment mechanism.
     #[test]
     fn attach_location_matches_this_platform() {
         let text = attach_location();

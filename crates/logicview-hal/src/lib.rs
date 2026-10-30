@@ -1,11 +1,23 @@
 //! USB capture for DreamSourceLab logic pods.
 //!
 //! Scan lists every vendor `0x2A0E` device. This build opens the high-speed
-//! DSLogic Plus (`0x0020`) and the high-speed DSLogic U3Pro32 (`0x002C`).
+//! DSLogic Plus (`0x0020`) and the DSLogic U3Pro32 (`0x002C`), including its
+//! high-speed and SuperSpeed capture paths.
 //! Firmware and FPGA bitstreams stay on disk outside the repo.
 //! `LOGICVIEW_FIRMWARE_DIR`, a DSView `res` folder, or
 //! `%LOCALAPPDATA%\Temp\lv-fw` can supply `DSLogicPlus.bin` or
 //! `DSLogicU3Pro32.bin`.
+//!
+//! # Responsibilities
+//!
+//! Device discovery and FPGA setup live in `device`; model identities and rate
+//! limits live in `catalog` and `profile`. [`run_capture`] owns blocking USB
+//! acquisition and emits whole sample atoms through [`CaptureEvent`]. The
+//! engine runs it on a worker thread and applies events to capture stores.
+//!
+//! Descriptive profiles do not imply hardware support. Preserve the tested-model
+//! checks and distinguish observed behavior from assumptions when extending a
+//! backend. Hardware tests are ignored by default and require a compatible pod.
 
 mod capture;
 mod catalog;
@@ -26,6 +38,7 @@ pub use profile::{
 
 use thiserror::Error;
 
+/// A physical device could not be opened, configured, or read successfully.
 #[derive(Debug, Error)]
 pub enum HalError {
     #[error("no tested DreamSourceLab logic pod ({DEVICE_ID} or {U3_DEVICE_ID}) is connected")]

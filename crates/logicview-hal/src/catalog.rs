@@ -105,10 +105,12 @@ const PROFILES: &[LogicProfile] = &[
     },
 ];
 
+/// Lists known model identities, distinguishing tested hardware from descriptive entries.
 pub fn logic_profiles() -> &'static [LogicProfile] {
     PROFILES
 }
 
+/// Looks up a model profile without implying that the device can be opened.
 pub fn logic_profile(product_id: u16) -> Option<&'static LogicProfile> {
     PROFILES
         .iter()
@@ -117,8 +119,11 @@ pub fn logic_profile(product_id: u16) -> Option<&'static LogicProfile> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks which descriptive profiles are marked as verified hardware.
+
     use super::*;
 
+    /// Checks that only hardware-verified model profiles advertise tested capture support.
     #[test]
     fn tested_profiles_are_the_plus_and_the_u3pro32() {
         let tested: Vec<_> = logic_profiles()

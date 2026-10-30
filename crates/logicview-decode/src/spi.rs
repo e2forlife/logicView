@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use super::{Annotation, Decoder, DecodeError, SampleSlice};
 
+/// Stateful SPI interpreter that preserves partially collected words across capture slices.
 #[derive(Clone, Debug)]
 pub struct SpiDecoder {
     cpol: bool,
@@ -28,6 +29,7 @@ pub struct SpiDecoder {
 }
 
 impl Default for SpiDecoder {
+    /// Creates a mode-zero SPI decoder with eight-bit words and active-low selection.
     fn default() -> Self {
         Self {
             cpol: false,
@@ -49,6 +51,7 @@ impl Default for SpiDecoder {
 }
 
 impl SpiDecoder {
+    /// Interprets chip-select voltage according to the configured active polarity.
     fn selected(&self, cs_high: bool) -> bool {
         if self.cs_active_low {
             !cs_high
@@ -57,24 +60,29 @@ impl SpiDecoder {
         }
     }
 
+    /// Chooses the sampling edge from the configured SPI mode.
     fn sample_on_rising(&self) -> bool {
         self.cpol == self.cpha
     }
 }
 
 impl Decoder for SpiDecoder {
+    /// Returns the stable identifier used to select this protocol in engine commands.
     fn id(&self) -> &'static str {
         "spi"
     }
 
+    /// Returns the display name for this protocol analyzer.
     fn name(&self) -> &'static str {
         "SPI"
     }
 
+    /// Lists the signal roles the engine maps to captured channels.
     fn channels(&self) -> &'static [&'static str] {
         &["sck", "mosi", "miso", "cs"]
     }
 
+    /// Clears partial protocol state while preserving the selected decoding options.
     fn reset(&mut self) {
         let (cpol, cpha, msb, bits, cs_active_low) = (
             self.cpol,
@@ -94,6 +102,8 @@ impl Decoder for SpiDecoder {
         };
     }
 
+    /// Accumulates both SPI data directions on selected clock edges and emits word and select
+    /// annotations.
     fn feed(&mut self, slice: &SampleSlice<'_>) -> Vec<Annotation> {
         let mut out = Vec::new();
         let mut index = slice.start;
@@ -163,10 +173,12 @@ impl Decoder for SpiDecoder {
         out
     }
 
+    /// Produces no extra rows because only complete protocol events are emitted during feeding.
     fn finish(&mut self) -> Vec<Annotation> {
         Vec::new()
     }
 
+    /// Configures the SPI clock mode, bit order, word width, or chip-select polarity.
     fn set_option(&mut self, key: &str, value: &str) -> Result<(), DecodeError> {
         match key {
             "cpol" => self.cpol = parse_bit(value)?,
@@ -202,6 +214,7 @@ impl Decoder for SpiDecoder {
     }
 }
 
+/// Accepts the supported textual forms for SPI clock settings.
 fn parse_bit(value: &str) -> Result<bool, DecodeError> {
     match value {
         "0" | "false" | "low" => Ok(false),
@@ -212,6 +225,7 @@ fn parse_bit(value: &str) -> Result<bool, DecodeError> {
     }
 }
 
+/// Creates a decoded SPI word with structured values for both transfer directions.
 fn word(start: u64, end: u64, mosi: u8, miso: u8) -> Annotation {
     let mut fields = BTreeMap::new();
     fields.insert("mosi".into(), format!("{mosi:02X}"));
@@ -228,10 +242,13 @@ fn word(start: u64, end: u64, mosi: u8, miso: u8) -> Annotation {
 
 #[cfg(test)]
 mod tests {
+    //! Checks SPI interpretation using independently generated signal levels.
+
     use std::sync::atomic::AtomicBool;
 
     use crate::{run, DecodeRequest};
 
+    /// Adds a complete mode-zero clocked transfer to the SPI test waveform.
     fn push_bit(rows: &mut Vec<[bool; 4]>, mosi: bool, miso: bool) {
         for _ in 0..4 {
             rows.push([false, mosi, miso, false]);
@@ -241,6 +258,7 @@ mod tests {
         }
     }
 
+    /// Extracts one packed channel from the synthetic multi-line SPI waveform.
     fn pack(rows: &[[bool; 4]], lane: usize) -> Vec<u8> {
         let mut out = vec![0u8; rows.len().div_ceil(8)];
         for (index, row) in rows.iter().enumerate() {
@@ -251,6 +269,8 @@ mod tests {
         out
     }
 
+    /// Checks a known SPI transfer and its chip-select annotation against independent expected
+    /// values.
     #[test]
     fn spi_mode0_golden_word() {
         let mut rows = Vec::new();

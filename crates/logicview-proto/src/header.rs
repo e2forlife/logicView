@@ -1,3 +1,8 @@
+//! Interprets device capture metadata before sample payloads reach the stores.
+//!
+//! The header records trigger position and capture shortfall; helper functions
+//! turn that information into payload sizes and user-facing warnings.
+
 use crate::error::ProtoError;
 
 /// First bulk-IN word of a logic capture. A mismatch means the capture is bad.
@@ -22,23 +27,31 @@ pub const LOGIC_HEADER_TRANSFER: usize = 512;
 /// - `0x14` status word
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogicHeader {
+    /// Marker used to recognize valid capture metadata.
     pub check_word: u32,
+    /// Device-reported trigger location in capture samples.
     pub trigger_position: u32,
+    /// Device-reported starting address of the buffered record.
     pub ram_start: u32,
+    /// Requested samples not retained, used to determine the buffered payload size.
     pub remaining: u64,
+    /// Raw capture status for device-specific diagnostics.
     pub status: u32,
 }
 
 impl LogicHeader {
+    /// Exposes the low word of the device-reported capture shortfall.
     pub fn remaining_low(self) -> u32 {
         self.remaining as u32
     }
 
+    /// Exposes the high word of the device-reported capture shortfall.
     pub fn remaining_high(self) -> u32 {
         (self.remaining >> 32) as u32
     }
 }
 
+/// Creates the capture metadata bytes used by demo sources and protocol fixtures.
 pub fn encode_logic_header(header: &LogicHeader) -> [u8; LOGIC_HEADER_LEN] {
     let mut out = [0u8; LOGIC_HEADER_LEN];
     out[0..4].copy_from_slice(&header.check_word.to_le_bytes());
@@ -50,6 +63,10 @@ pub fn encode_logic_header(header: &LogicHeader) -> [u8; LOGIC_HEADER_LEN] {
     out
 }
 
+/// Validates device capture metadata before the payload is interpreted.
+///
+/// Returns an error for incomplete data or an unexpected check word; additional
+/// USB transfer padding is ignored.
 pub fn parse_logic_header(bytes: &[u8]) -> Result<LogicHeader, ProtoError> {
     if bytes.len() < LOGIC_HEADER_LEN {
         return Err(ProtoError::Truncated);
@@ -94,6 +111,7 @@ pub fn capture_length_warning(rle: bool, requested: u64, remaining: u64) -> Opti
     })
 }
 
+/// Reads a header field without accepting data beyond the received buffer.
 fn read_u32(bytes: &[u8], at: usize) -> Result<u32, ProtoError> {
     let slice = bytes.get(at..at + 4).ok_or(ProtoError::Truncated)?;
     let mut buf = [0u8; 4];
@@ -103,8 +121,11 @@ fn read_u32(bytes: &[u8], at: usize) -> Result<u32, ProtoError> {
 
 #[cfg(test)]
 mod tests {
+    //! Checks capture metadata against fixtures and measured device headers.
+
     use super::*;
 
+    /// Checks capture metadata against an independently written byte fixture.
     #[test]
     fn header_vector_round_trips() {
         // Hand-written little-endian image:
@@ -122,6 +143,7 @@ mod tests {
         assert_eq!(encode_logic_header(&parsed).to_vec(), bytes);
     }
 
+    /// Checks that a header observed on a real device is accepted.
     #[test]
     fn measured_plus_header_parses() {
         // First 24 bytes of the 512-byte header transfer on 0x2A0E:0x0020
@@ -137,6 +159,7 @@ mod tests {
         assert_eq!(header.status, 1);
     }
 
+    /// Checks that early capture termination produces useful status text.
     #[test]
     fn length_warning_names_an_rle_shortfall() {
         assert_eq!(
@@ -150,6 +173,7 @@ mod tests {
         assert_eq!(capture_length_warning(true, 1_000, 0), None);
     }
 
+    /// Checks that incomplete or unrecognized metadata is rejected.
     #[test]
     fn bad_check_word_is_a_data_error() {
         let mut bytes = encode_logic_header(&LogicHeader {
@@ -167,6 +191,7 @@ mod tests {
         assert_eq!(parse_logic_header(&[0, 1, 2]), Err(ProtoError::Truncated));
     }
 
+    /// Turns the readable protocol fixture into bytes for codec tests.
     fn decode_hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)

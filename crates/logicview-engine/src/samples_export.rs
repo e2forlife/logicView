@@ -11,6 +11,7 @@ use logicview_store::write_xlsx;
 /// Excel's limit on data rows, leaving room for the header.
 pub const MAX_TABLE_ROWS: u64 = 1_048_575;
 
+/// Owned sample data copied from the engine so table rendering does not hold its state lock.
 pub struct SampleSnapshot {
     pub rate: u64,
     pub names: Vec<String>,
@@ -20,12 +21,15 @@ pub struct SampleSnapshot {
     pub analog: Vec<f32>,
 }
 
+/// Rendered table bytes with row counts that make export truncation visible to clients.
 pub struct SampleFile {
     pub body: Vec<u8>,
     pub rows: u64,
     pub total: u64,
 }
 
+/// Builds a sample table with capture timing and optional analog values, subject to the row
+/// ceiling.
 pub fn render_csv(snap: &SampleSnapshot) -> SampleFile {
     let rows = snap.len.min(MAX_TABLE_ROWS);
     let headers = headers(snap);
@@ -49,6 +53,7 @@ pub fn render_csv(snap: &SampleSnapshot) -> SampleFile {
     }
 }
 
+/// Builds a spreadsheet from original sample values, subject to the row ceiling.
 pub fn render_xlsx(snap: &SampleSnapshot) -> Result<SampleFile, logicview_store::StoreError> {
     let rows = snap.len.min(MAX_TABLE_ROWS);
     let headers = headers(snap);
@@ -92,6 +97,7 @@ pub fn render_xlsx(snap: &SampleSnapshot) -> Result<SampleFile, logicview_store:
     })
 }
 
+/// Builds column labels consistent with the capture's logic and analog streams.
 fn headers(snap: &SampleSnapshot) -> Vec<String> {
     let mut headers = Vec::with_capacity(snap.names.len() + 2);
     headers.push("time_s".into());
@@ -102,11 +108,13 @@ fn headers(snap: &SampleSnapshot) -> Vec<String> {
     headers
 }
 
+/// Formats a sample's capture-relative time for exported tables.
 fn format_time(sample: u64, rate: u64) -> String {
     let seconds = sample as f64 / rate.max(1) as f64;
     format!("{seconds:.9}")
 }
 
+/// Formats a finite analog value, leaving unavailable or invalid values blank.
 fn analog_cell(snap: &SampleSnapshot, sample: u64) -> String {
     match snap.analog.get(sample as usize) {
         Some(value) if value.is_finite() => format!("{value:.6}"),
@@ -114,6 +122,7 @@ fn analog_cell(snap: &SampleSnapshot, sample: u64) -> String {
     }
 }
 
+/// Writes one escaped table row so channel labels cannot corrupt the CSV structure.
 fn push_csv_row(out: &mut String, cells: &[String]) {
     for (index, cell) in cells.iter().enumerate() {
         if index > 0 {
@@ -130,6 +139,7 @@ fn push_csv_row(out: &mut String, cells: &[String]) {
     out.push('\n');
 }
 
+/// Writes a numeric worksheet cell or an empty cell when sample data is unavailable.
 fn write_number(xml: &mut String, column: usize, row: u64, value: &str) {
     let cell = format!("{}{row}", col_letter(column));
     if value.is_empty() {
@@ -139,6 +149,7 @@ fn write_number(xml: &mut String, column: usize, row: u64, value: &str) {
     xml.push_str(&format!("<c r=\"{cell}\"><v>{value}</v></c>"));
 }
 
+/// Converts a table column position into the worksheet address notation.
 fn col_letter(index: usize) -> String {
     let mut n = index + 1;
     let mut bytes = Vec::new();
@@ -151,6 +162,7 @@ fn col_letter(index: usize) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| "A".into())
 }
 
+/// Protects channel labels inserted into worksheet text.
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -159,8 +171,11 @@ fn xml_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Checks that exported sample tables preserve capture timing and channel values.
+
     use super::*;
 
+    /// Builds a small mixed-signal capture fixture for sample export tests.
     fn snap() -> SampleSnapshot {
         SampleSnapshot {
             rate: 1_000_000,
@@ -172,6 +187,7 @@ mod tests {
         }
     }
 
+    /// Checks that exported rows preserve timing, logic levels, and analog units.
     #[test]
     fn csv_lists_time_logic_and_volts() {
         let file = render_csv(&snap());

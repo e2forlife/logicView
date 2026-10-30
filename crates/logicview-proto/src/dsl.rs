@@ -1,3 +1,7 @@
+//! Writes the metadata portion of a session interchange header.
+//!
+//! This module does not read or write the complete capture archive.
+
 /// One probe line in a `.dsl` header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DslProbe {
@@ -7,8 +11,8 @@ pub struct DslProbe {
 
 /// Fields written into the text header of a version-3 session file.
 ///
-/// This is only the header text. The zip container, decoder JSON, and sample
-/// chunks are a later phase. Names must not contain newlines.
+/// This is only the header text. The `logicview-store` crate handles the ZIP
+/// container and channel blocks. Names must not contain newlines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DslHeader {
     pub version: u32,
@@ -48,6 +52,7 @@ pub fn write_dsl_header(header: &DslHeader) -> String {
     out
 }
 
+/// Appends a metadata entry to the session header text.
 fn push_kv(out: &mut String, key: &str, value: &str) {
     out.push_str(key);
     out.push('=');
@@ -66,8 +71,11 @@ pub fn format_trigger_time(trigger_pos: u64, sample_rate: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Checks the stable session header text used for capture interchange.
+
     use super::*;
 
+    /// Checks the session header against its stable interchange text fixture.
     #[test]
     fn dsl_header_matches_the_snapshot() {
         let header = DslHeader {

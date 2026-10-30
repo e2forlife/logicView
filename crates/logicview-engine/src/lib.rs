@@ -2,6 +2,23 @@
 //!
 //! Commands come from the UI and from MCP. A session can stack more than one
 //! demo pod into a single channel list. Events go out on a broadcast bus.
+//!
+//! # Finding the right layer
+//!
+//! [`Engine`] is the command boundary shared by the UI and MCP. Its methods
+//! resolve sessions and validate requests before changing capture state.
+//! `run` drives demo sources; `usb` bridges blocking device acquisition into
+//! asynchronous updates. Both publish [`EngineEvent`] notifications.
+//!
+//! Capture lifecycle and sample storage live in `logicview-capture`; USB
+//! transfers and hardware limits live in `logicview-hal`. Decoder commands
+//! and annotation ordering live in `decode_cmd`. File encoding belongs to
+//! `logicview-store`, while `samples_export` renders sample tables.
+//!
+//! A session owns its devices, samples, decoders, cursors, and measurements.
+//! Commands with no session identifier use the selected session. Workers carry
+//! a capture generation and check it before updating state; keep that check
+//! when adding background work.
 
 mod decode_cmd;
 mod run;
@@ -40,6 +57,7 @@ const MAX_SESSIONS: usize = 8;
 
 const ANALOG_NAME: &str = "SINE";
 
+/// An engine command could not resolve, configure, capture, analyze, or persist a session.
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("unknown session {0}")]
@@ -60,12 +78,14 @@ pub enum EngineError {
     TooManySessions,
 }
 
+/// Serializable sampling ceiling for an inclusive channel-count band.
 #[derive(Clone, Debug, Serialize)]
 pub struct RateBandInfo {
     pub max_channels: u32,
     pub max_hz: u64,
 }
 
+/// Client-facing hardware profile with capabilities and verification status.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileInfo {
     pub id: String,
@@ -82,6 +102,7 @@ pub struct ProfileInfo {
     pub super_stream_rates: Vec<RateBandInfo>,
 }
 
+/// A discovered or bound device as presented to UI and automation clients.
 #[derive(Clone, Debug, Serialize)]
 pub struct DeviceInfo {
     pub id: String,
@@ -92,6 +113,7 @@ pub struct DeviceInfo {
     pub super_speed: bool,
 }
 
+/// A sampled channel's display identity and originating device.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChannelInfo {
     pub index: usize,
@@ -101,6 +123,7 @@ pub struct ChannelInfo {
     pub device_name: String,
 }
 
+/// Display metadata for an analog waveform lane.
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalogInfo {
     pub index: usize,
@@ -108,6 +131,7 @@ pub struct AnalogInfo {
     pub color: String,
 }
 
+/// Consistent session snapshot shared by the UI and automation interfaces.
 #[derive(Clone, Debug, Serialize)]
 pub struct Status {
     pub id: String,
@@ -133,6 +157,7 @@ pub struct Status {
     pub active: bool,
 }
 
+/// Compact session summary used to build the workspace session list.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionBrief {
     pub id: String,
@@ -142,6 +167,7 @@ pub struct SessionBrief {
     pub active: bool,
 }
 
+/// Live notification that a session changed phase, gained samples, stopped, or failed.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineEvent {
@@ -166,11 +192,13 @@ pub enum EngineEvent {
     },
 }
 
+/// Identifies a running capture generation and its cooperative stop flag.
 struct RunHandle {
     pub(crate) generation: u64,
     stop: Arc<AtomicBool>,
 }
 
+/// Pulse measurement retained independently of subsequent cursor movement.
 #[derive(Clone, Debug, Serialize)]
 pub struct SavedMeasurement {
     pub id: u64,
@@ -182,6 +210,7 @@ pub struct SavedMeasurement {
     pub duty: Option<f64>,
 }
 
+/// Device identity and link capabilities assigned to a session.
 pub(crate) struct BoundDevice {
     id: String,
     name: String,
@@ -189,12 +218,14 @@ pub(crate) struct BoundDevice {
     super_speed: bool,
 }
 
+/// Maps a displayed channel back to its device when multiple demo sources are stacked.
 #[derive(Clone)]
 pub(crate) struct ChannelOrigin {
     device_id: String,
     device_name: String,
 }
 
+/// Configured decoder instance, including channel bindings and any lower-level dependency.
 pub(crate) struct DecoderInst {
     id: String,
     protocol: String,
@@ -204,6 +235,7 @@ pub(crate) struct DecoderInst {
     stack_on: Option<String>,
 }
 
+/// Client-facing settings and bindings of an installed decoder.
 #[derive(Clone, Debug, Serialize)]
 pub struct DecoderInfo {
     pub id: String,
@@ -213,6 +245,7 @@ pub struct DecoderInfo {
     pub stack_on: Option<String>,
 }
 
+/// Decoded event tagged with its analyzer instance for tables, search, and exports.
 #[derive(Clone, Debug, Serialize)]
 pub struct AnnotationRow {
     pub decoder: String,
@@ -224,6 +257,10 @@ pub struct AnnotationRow {
     pub fields: BTreeMap<String, String>,
 }
 
+/// All capture, device, and analysis state belonging to one workspace session.
+///
+/// Catalog fields preserve every probe; sampled-channel fields follow the
+/// current enable mask and therefore match the order of stored channel bytes.
 struct Slot {
     pub(crate) id: String,
     name: String,
@@ -243,6 +280,7 @@ struct Slot {
     next_measure: u64,
 }
 
+/// Mutable workspace state protected by the engine's asynchronous mutex.
 struct State {
     pub(crate) slots: Vec<Slot>,
     active: usize,
@@ -251,17 +289,24 @@ struct State {
     device: String,
 }
 
+/// State and event bus shared by client commands and background capture workers.
 struct Shared {
     state: Mutex<State>,
     events: broadcast::Sender<EngineEvent>,
 }
 
+/// Cloneable command facade used by desktop, HTTP, and MCP clients.
+///
+/// Clones share one workspace. Commands serialize state access through a mutex;
+/// long-running acquisition is handed to background workers identified by
+/// session generation so stale workers cannot update a newer capture.
 #[derive(Clone)]
 pub struct Engine {
     shared: Arc<Shared>,
 }
 
 impl Engine {
+    /// Creates a shared engine with one demo session ready for UI or automation commands.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
         let slot = Slot::demo("ses-1", "Capture 1");
@@ -278,10 +323,12 @@ impl Engine {
         Self { shared }
     }
 
+    /// Subscribes to live session changes; consumers must tolerate lag on the bounded event bus.
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.shared.events.subscribe()
     }
 
+    /// Lists known model profiles and sampling limits without probing connected hardware.
     pub async fn list_profiles(&self) -> Vec<ProfileInfo> {
         logicview_hal::logic_profiles()
             .iter()
@@ -299,6 +346,7 @@ impl Engine {
             .collect()
     }
 
+    /// Discovers connected USB devices and available demos, presenting physical hardware first.
     pub async fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut devices: Vec<DeviceInfo> = logicview_capture::demo_pods()
             .iter()
@@ -321,6 +369,8 @@ impl Engine {
         hardware_before_demo(devices)
     }
 
+    /// Selects a demo or opens a verified hardware model and installs its channels in the active
+    /// session.
     pub async fn connect(&self, id: &str) -> Result<DeviceInfo, EngineError> {
         if demo_pod(id).is_some() {
             self.set_active_devices(&[id.to_string()]).await?;
@@ -379,6 +429,8 @@ impl Engine {
         )))
     }
 
+    /// Adds another demo device to a stopped session; physical multi-device capture is not yet
+    /// verified.
     pub async fn attach_device(
         &self,
         id: Option<&str>,
@@ -417,6 +469,7 @@ impl Engine {
         Ok(slot.status(true))
     }
 
+    /// Removes a device from a stopped demo session while keeping at least one source.
     pub async fn detach_device(
         &self,
         id: Option<&str>,
@@ -448,6 +501,7 @@ impl Engine {
         Ok(slot.status(true))
     }
 
+    /// Replaces the active session's demo device set when no capture is running.
     async fn set_active_devices(&self, ids: &[String]) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;
         let active = state.active;
@@ -462,6 +516,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Returns session summaries together with the selected session identifier.
     pub async fn list_sessions(&self) -> (Vec<SessionBrief>, String) {
         let state = self.shared.state.lock().await;
         let active = state.slots[state.active].id.clone();
@@ -479,6 +534,7 @@ impl Engine {
         (sessions, active)
     }
 
+    /// Creates and selects a new demo session, enforcing the workspace session limit.
     pub async fn create_session(&self, name: Option<String>) -> Result<SessionBrief, EngineError> {
         let mut state = self.shared.state.lock().await;
         if state.slots.len() >= MAX_SESSIONS {
@@ -499,6 +555,7 @@ impl Engine {
         })
     }
 
+    /// Selects the session used by commands that omit an explicit identifier.
     pub async fn select_session(&self, id: &str) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;
         let index = state
@@ -510,6 +567,10 @@ impl Engine {
         Ok(())
     }
 
+    /// Validates and stores capture settings while the session is inactive.
+    ///
+    /// Trigger placement is bounded and rates above the selected device's ceiling
+    /// are lowered to that ceiling before the capture size is checked.
     pub async fn configure(
         &self,
         id: Option<&str>,
@@ -536,6 +597,10 @@ impl Engine {
         Ok(())
     }
 
+    /// Prepares and schedules a demo or USB capture, returning the current session status.
+    ///
+    /// Capture work continues asynchronously. Use events or `wait_until_settled`
+    /// when a caller needs the completed record rather than the initial state.
     pub async fn start(&self, id: Option<&str>, mode: StartMode) -> Result<Status, EngineError> {
         let id = {
             let state = self.shared.state.lock().await;
@@ -586,6 +651,7 @@ impl Engine {
         self.status(Some(&id)).await
     }
 
+    /// Requests capture termination and waits briefly for the source to settle.
     pub async fn stop(&self, id: Option<&str>) -> Result<Status, EngineError> {
         let id = {
             let state = self.shared.state.lock().await;
@@ -605,6 +671,7 @@ impl Engine {
         self.status(Some(&id)).await
     }
 
+    /// Waits for a session to become idle or stopped, reporting capture errors and timeouts.
     pub async fn wait_until_settled(
         &self,
         id: &str,
@@ -630,6 +697,7 @@ impl Engine {
         }
     }
 
+    /// Returns a consistent snapshot of the requested session or the selected session.
     pub async fn status(&self, id: Option<&str>) -> Result<Status, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
@@ -638,6 +706,8 @@ impl Engine {
         Ok(slot.status(slot.id == active))
     }
 
+    /// Searches original channel samples for the next or previous transition of the requested
+    /// polarity.
     pub async fn search_edge(
         &self,
         id: Option<&str>,
@@ -658,6 +728,7 @@ impl Engine {
         })
     }
 
+    /// Finds the closest transition for waveform cursor snapping.
     pub async fn nearest_edge(
         &self,
         id: Option<&str>,
@@ -672,6 +743,7 @@ impl Engine {
         Ok(nearest_edge(bytes, len, sample))
     }
 
+    /// Measures the pulse at a capture position using original samples and the session sample rate.
     pub async fn measure(
         &self,
         id: Option<&str>,
@@ -691,6 +763,7 @@ impl Engine {
         })
     }
 
+    /// Reads a retained analog value, returning `None` outside the recorded analog data.
     pub async fn analog_at(
         &self,
         id: Option<&str>,
@@ -702,6 +775,7 @@ impl Engine {
         Ok(slot.session.analog.sample(index))
     }
 
+    /// Returns digital drawing summaries for a viewport expressed in capture sample coordinates.
     pub async fn tile(
         &self,
         id: Option<&str>,
@@ -716,6 +790,7 @@ impl Engine {
         Ok(slot.session.store.tile(channel, start, columns, spp)?)
     }
 
+    /// Returns analog drawing envelopes for a viewport expressed in capture sample coordinates.
     pub async fn tile_analog(
         &self,
         id: Option<&str>,
@@ -729,6 +804,7 @@ impl Engine {
         Ok(slot.session.analog.tile(start, columns, spp))
     }
 
+    /// Validates device-specific capture limits, prepares arm bytes, and schedules the USB worker.
     async fn start_usb(&self, id: Option<&str>, mode: StartMode) -> Result<Status, EngineError> {
         let id = {
             let state = self.shared.state.lock().await;
@@ -887,6 +963,8 @@ impl Engine {
         self.status(Some(&id)).await
     }
 
+    /// Searches packed channel samples for a logic pattern, with unspecified levels acting as
+    /// wildcards.
     pub async fn search_pattern(
         &self,
         id: Option<&str>,
@@ -903,6 +981,7 @@ impl Engine {
         Ok(find_pattern(bytes, len, from, pattern, forward))
     }
 
+    /// Sets or clears a waveform cursor and returns both current cursor positions.
     pub async fn set_cursor(
         &self,
         id: Option<&str>,
@@ -918,6 +997,8 @@ impl Engine {
         Ok(slot.cursors)
     }
 
+    /// Measures the selected channel between the two saved cursors, requiring both positions to be
+    /// set.
     pub async fn cursor_span(
         &self,
         id: Option<&str>,
@@ -942,6 +1023,7 @@ impl Engine {
         ))
     }
 
+    /// Measures a pulse and retains a snapshot for the session's measurement drawer.
     pub async fn save_measurement(
         &self,
         id: Option<&str>,
@@ -973,6 +1055,7 @@ impl Engine {
         Ok(saved)
     }
 
+    /// Lists the measurement snapshots retained in this session.
     pub async fn measurements(
         &self,
         id: Option<&str>,
@@ -982,6 +1065,7 @@ impl Engine {
         Ok(state.slot(&id)?.measurements.clone())
     }
 
+    /// Builds the supported DSL capture archive from the session's logic data and settings.
     pub async fn export_dsl(&self, id: Option<&str>) -> Result<Vec<u8>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
@@ -1032,6 +1116,7 @@ impl Engine {
         )?)
     }
 
+    /// Returns the last prepared device arm image for diagnostics or protocol inspection.
     pub async fn arm_record(&self, id: Option<&str>) -> Result<Vec<u8>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
@@ -1039,6 +1124,7 @@ impl Engine {
         Ok(slot.session.arm.clone())
     }
 
+    /// Saves the capture as a native ZIP for a `.lvcap` path or as a directory for other paths.
     pub async fn save_lvcap(&self, id: Option<&str>, path: &Path) -> Result<(), EngineError> {
         let data = self.archive(id).await?;
         let is_file = path
@@ -1053,11 +1139,13 @@ impl Engine {
         Ok(())
     }
 
+    /// Loads a native capture from disk and installs it in an inactive session.
     pub async fn load_lvcap(&self, id: Option<&str>, path: &Path) -> Result<Status, EngineError> {
         let data = logicview_store::read_any(path)?;
         self.install_archive(id, data).await
     }
 
+    /// Serializes a native capture archive for download or transport.
     pub async fn export_zip(&self, id: Option<&str>) -> Result<Vec<u8>, EngineError> {
         let data = self.archive(id).await?;
         Ok(logicview_store::write_zip_bytes(&data)?)
@@ -1078,6 +1166,8 @@ impl Engine {
         self.install_archive(id, data).await
     }
 
+    /// Exports individual samples to CSV and reports whether the table row limit truncated the
+    /// capture.
     pub async fn export_samples_csv(
         &self,
         id: Option<&str>,
@@ -1086,6 +1176,7 @@ impl Engine {
         Ok(samples_export::render_csv(&snap))
     }
 
+    /// Exports individual samples to an Excel workbook with the shared table row limit.
     pub async fn export_samples_xlsx(
         &self,
         id: Option<&str>,
@@ -1094,6 +1185,8 @@ impl Engine {
         Ok(samples_export::render_xlsx(&snap)?)
     }
 
+    /// Copies recorded samples and labels while holding the engine lock so export can render
+    /// independently.
     async fn sample_snapshot(
         &self,
         id: Option<&str>,
@@ -1115,6 +1208,7 @@ impl Engine {
         })
     }
 
+    /// Copies session metadata and sample data into the native persistence representation.
     async fn archive(&self, id: Option<&str>) -> Result<ArchiveData, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
@@ -1155,6 +1249,7 @@ impl Engine {
         })
     }
 
+    /// Restores a saved record into an inactive session and replaces its source with a file device.
     async fn install_archive(
         &self,
         id: Option<&str>,
@@ -1212,6 +1307,7 @@ impl Engine {
         Ok(slot.status(is_active))
     }
 
+    /// Installs a physical device's channel catalog and clears data tied to the previous source.
     async fn use_pod_channels(
         &self,
         mask: u32,
@@ -1249,6 +1345,7 @@ impl Engine {
         }
     }
 
+    /// Resolves an optional session identifier, falling back to the selected session.
     fn resolve(&self, state: &State, id: Option<&str>) -> Result<String, EngineError> {
         match id {
             Some(id) => {
@@ -1268,12 +1365,14 @@ impl Engine {
 }
 
 impl Default for Engine {
+    /// Creates the shared engine with its initial demo session.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Slot {
+    /// Builds a new session slot with the default demo channels and empty analysis state.
     fn demo(id: &str, name: &str) -> Self {
         let mut slot = Self {
             id: id.to_string(),
@@ -1297,6 +1396,7 @@ impl Slot {
         slot
     }
 
+    /// Combines channel labels and device origins into the client-facing channel list.
     fn channel_list(
         &self,
         names: &[String],
@@ -1323,6 +1423,8 @@ impl Slot {
             .collect()
     }
 
+    /// Builds a client-facing session snapshot, keeping all available probes separate from sampled
+    /// channels.
     fn status(&self, active: bool) -> Status {
         Status {
             id: self.id.clone(),
@@ -1376,6 +1478,7 @@ impl Slot {
     }
 }
 
+/// Describes the trigger stages associated with a channel in the exported session header.
 fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
     if !config.trigger_enabled {
         return String::new();
@@ -1407,6 +1510,7 @@ fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
     }
 }
 
+/// Orders discovery results so connected USB instruments precede simulated sources.
 fn hardware_before_demo(devices: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
     let mut usb = Vec::new();
     let mut other = Vec::new();
@@ -1421,6 +1525,7 @@ fn hardware_before_demo(devices: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
     usb
 }
 
+/// Builds the discovery record for a selectable synthetic device.
 fn demo_device_info(id: &str) -> DeviceInfo {
     let pod = demo_pod(id);
     DeviceInfo {
@@ -1434,6 +1539,7 @@ fn demo_device_info(id: &str) -> DeviceInfo {
     }
 }
 
+/// Converts hardware sampling limits into the serializable profile description.
 fn rate_bands(product_id: u16, stream: bool, super_speed: bool) -> Vec<RateBandInfo> {
     logicview_hal::link_rate_limits(product_id, stream, super_speed)
         .iter()
@@ -1444,6 +1550,7 @@ fn rate_bands(product_id: u16, stream: bool, super_speed: bool) -> Vec<RateBandI
         .collect()
 }
 
+/// Returns the available probe count even when only a subset was captured.
 fn probe_count(slot: &Slot) -> usize {
     if slot.catalog_names.is_empty() {
         slot.channel_names.len()
@@ -1452,6 +1559,7 @@ fn probe_count(slot: &Slot) -> usize {
     }
 }
 
+/// Counts selected probes within the available width for sample-rate planning.
 fn enabled_channel_count(mask: u32, probes: usize) -> u32 {
     let width = probes.max(1).min(32);
     let all = if width == 32 {
@@ -1463,10 +1571,12 @@ fn enabled_channel_count(mask: u32, probes: usize) -> u32 {
     bits.count_ones().max(1)
 }
 
+/// Checks whether the session's bound hardware advertises a SuperSpeed connection.
 fn bound_link_is_super(devices: &[BoundDevice]) -> bool {
     devices.iter().any(|device| device.super_speed)
 }
 
+/// Selects the hardware rate profile, using the default analyzer profile for demo planning.
 fn rate_product(devices: &[BoundDevice]) -> u16 {
     devices
         .iter()
@@ -1474,6 +1584,7 @@ fn rate_product(devices: &[BoundDevice]) -> u16 {
         .unwrap_or(logicview_hal::PLUS_PID)
 }
 
+/// Keeps requested capture rates within the selected channel, mode, and link limits.
 fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     if config.sample_rate_hz == 0 {
         return;
@@ -1493,12 +1604,14 @@ fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     }
 }
 
+/// Extracts a product identifier from the current analyzer family's USB session identifier.
 fn usb_product_id(id: &str) -> Option<u16> {
     let rest = id.strip_prefix("usb:2a0e:")?;
     let hex = rest.split([':', '#', '/']).next().unwrap_or(rest);
     u16::from_str_radix(hex, 16).ok()
 }
 
+/// Selects the capture backend and rejects source combinations that cannot currently be armed.
 fn session_uses_usb(devices: &[BoundDevice]) -> Result<bool, EngineError> {
     let usb = devices.iter().filter(|device| device.kind == "usb").count();
     let demo = devices
@@ -1521,6 +1634,7 @@ fn session_uses_usb(devices: &[BoundDevice]) -> Result<bool, EngineError> {
     ))
 }
 
+/// Rebuilds a session's demo device and channel catalog, clearing source-dependent data.
 fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> {
     let mut devices = Vec::new();
     let mut names = Vec::new();
@@ -1561,6 +1675,7 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
     Ok(())
 }
 
+/// Selects the synthetic waveforms for enabled probes in capture channel order.
 fn demo_waves_masked(
     devices: &[BoundDevice],
     mask: u32,
@@ -1581,12 +1696,14 @@ fn demo_waves_masked(
     Ok(kept)
 }
 
+/// Preserves the complete probe catalog before the sampled channel list is narrowed.
 fn remember_catalog(slot: &mut Slot) {
     slot.catalog_names = slot.channel_names.clone();
     slot.catalog_colors = slot.channel_colors.clone();
     slot.catalog_origins = slot.origins.clone();
 }
 
+/// Rebuilds channel labels and origins to match the enabled capture streams.
 fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError> {
     if slot.catalog_names.is_empty() {
         remember_catalog(slot);
@@ -1629,6 +1746,7 @@ fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError>
     Ok(())
 }
 
+/// Collects synthetic channel generators in the order of the session's bound devices.
 fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineError> {
     let mut waves = Vec::new();
     for device in devices {
@@ -1644,6 +1762,7 @@ fn demo_waves(devices: &[BoundDevice]) -> Result<Vec<fn(u64) -> bool>, EngineErr
     Ok(waves)
 }
 
+/// Selects the native or DSL archive reader using the filename or format probing.
 fn decode_capture_bytes(name: &str, bytes: &[u8]) -> Result<ArchiveData, EngineError> {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".dsl") {
@@ -1661,6 +1780,7 @@ fn decode_capture_bytes(name: &str, bytes: &[u8]) -> Result<ArchiveData, EngineE
     }
 }
 
+/// Creates labels and display colors for enabled physical probes in channel order.
 fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {
     const COLORS: [&str; 8] = [
         "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2", "#7dcea0", "#f1948a",
@@ -1677,6 +1797,7 @@ fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {
 }
 
 impl State {
+    /// Borrows an existing session slot or reports an unknown session.
     fn slot(&self, id: &str) -> Result<&Slot, EngineError> {
         self.slots
             .iter()
@@ -1684,6 +1805,7 @@ impl State {
             .ok_or_else(|| EngineError::UnknownSession(id.to_string()))
     }
 
+    /// Borrows a session slot for modification or reports an unknown session.
     fn slot_mut(&mut self, id: &str) -> Result<&mut Slot, EngineError> {
         self.slots
             .iter_mut()
@@ -1693,10 +1815,12 @@ impl State {
 }
 
 impl Shared {
+    /// Locks shared engine state while a worker applies session updates.
     pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, State> {
         self.state.lock().await
     }
 
+    /// Broadcasts a session change; having no subscribers does not fail capture work.
     pub(crate) fn emit(&self, event: EngineEvent) {
         let _ = self.events.send(event);
     }

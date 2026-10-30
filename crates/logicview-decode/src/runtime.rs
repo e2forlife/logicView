@@ -9,6 +9,10 @@ use super::{create, Annotation, DecodeError, DecodeOutput, DecodeRequest, Sample
 
 const SLICE: u64 = 4_096;
 
+/// Configures a decoder and runs it over bounded slices or lower-level annotations.
+///
+/// Cancellation returns the rows already completed without flushing unfinished
+/// frames. Stacked decoders consume the supplied lower rows in one call.
 pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOutput, DecodeError> {
     let Some(mut decoder) = create(request.protocol) else {
         return Err(DecodeError::UnknownProtocol(request.protocol.into()));
@@ -87,6 +91,7 @@ pub fn search_annotations(rows: &[Annotation], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Recognizes a byte-sequence search query so it can be matched against structured fields.
 fn byte_pattern(query: &str) -> Option<Vec<u8>> {
     let parts: Vec<&str> = query.split('-').collect();
     if parts.len() < 2 {
@@ -102,6 +107,7 @@ fn byte_pattern(query: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Selects the protocol byte represented by a row for cross-row pattern searching.
 fn row_byte(row: &Annotation) -> Option<u8> {
     let key = if row.class == "address" {
         "raw"
@@ -117,6 +123,7 @@ fn row_byte(row: &Annotation) -> Option<u8> {
     u8::from_str_radix(text, 16).ok()
 }
 
+/// Finds annotation rows participating in matching byte sequences, ignoring non-byte rows.
 fn match_bytes(rows: &[Annotation], pattern: &[u8]) -> Vec<usize> {
     let indexed: Vec<(usize, u8)> = rows
         .iter()
@@ -143,6 +150,7 @@ fn match_bytes(rows: &[Annotation], pattern: &[u8]) -> Vec<usize> {
     hits
 }
 
+/// Serializes decoded annotations and their structured fields for spreadsheet analysis.
 pub fn export_csv(decoder: &str, rows: &[Annotation]) -> String {
     let mut out = String::from("start_sample,end_sample,decoder,class,text,fields\n");
     for row in rows {
@@ -165,6 +173,7 @@ pub fn export_csv(decoder: &str, rows: &[Annotation]) -> String {
     out
 }
 
+/// Serializes decoded annotations as a tab-separated, readable event listing.
 pub fn export_text(decoder: &str, rows: &[Annotation]) -> String {
     let mut out = String::new();
     for row in rows {
@@ -176,6 +185,7 @@ pub fn export_text(decoder: &str, rows: &[Annotation]) -> String {
     out
 }
 
+/// Protects annotation text containing CSV separators or quotes during export.
 fn csv_escape(text: &str) -> String {
     if text.contains([',', '"', '\n']) {
         format!("\"{}\"", text.replace('"', "\"\""))
@@ -186,10 +196,13 @@ fn csv_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Checks decode cancellation, annotation searches, and export behavior.
+
     use super::*;
     use crate::Annotation;
     use std::collections::BTreeMap;
 
+    /// Checks that an already cancelled decode does no sample processing.
     #[test]
     fn cancel_returns_before_any_rows() {
         let scl = vec![0xFFu8; 64 * 1024];
@@ -212,6 +225,7 @@ mod tests {
         assert!(output.annotations.is_empty());
     }
 
+    /// Checks structured byte searches, readable text searches, and annotation exports.
     #[test]
     fn byte_pattern_and_substring_search() {
         let rows = vec![
@@ -229,6 +243,7 @@ mod tests {
         assert!(export_text("i2c", &rows[..1]).contains("address"));
     }
 
+    /// Builds a structured annotation fixture for search and export tests.
     fn ann(class: &str, text: &str, fields: &[(&str, &str)]) -> Annotation {
         let mut map = BTreeMap::new();
         for (key, value) in fields {

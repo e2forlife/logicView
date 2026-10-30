@@ -14,12 +14,14 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::{Icon, WindowBuilder};
 use wry::WebViewBuilder;
 
+/// Starts the local application services and opens the desktop window once they are ready.
 pub fn open(addr: SocketAddr) -> Result<(), String> {
     let bound = start_server(addr)?;
     let origin = format!("http://{bound}");
     open_window(&format!("{origin}/"), &origin)
 }
 
+/// Starts the engine and UI on a background thread, waiting for an address or startup error.
 fn start_server(addr: SocketAddr) -> Result<SocketAddr, String> {
     let (tx, rx) = mpsc::channel();
     let engine = logicview_engine::Engine::new();
@@ -42,6 +44,7 @@ fn start_server(addr: SocketAddr) -> Result<SocketAddr, String> {
         .map_err(|_| "LogicView stopped before its window was ready".to_string())?
 }
 
+/// Serves the UI and starts the local MCP attachment endpoint for the same engine.
 async fn run_server(
     engine: logicview_engine::Engine,
     addr: SocketAddr,
@@ -67,12 +70,14 @@ async fn run_server(
     Ok(())
 }
 
+/// Loads the build-generated icon for the native application window.
 fn window_icon() -> Option<Icon> {
     const PX: u32 = 256;
     let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/window-icon.rgba"));
     Icon::from_rgba(rgba.to_vec(), PX, PX).ok()
 }
 
+/// Hosts the local UI in a native webview and keeps it alive until the window closes.
 fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     let event_loop = EventLoop::new();
     let mut builder = WindowBuilder::new()
@@ -123,6 +128,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     });
 }
 
+/// Displays a startup failure through logging and the platform's available user interface.
 pub fn report_error(message: &str) {
     tracing::error!("{message}");
     #[cfg(windows)]
@@ -155,8 +161,12 @@ pub(crate) fn allows_navigation(origin: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Checks desktop navigation rules without starting a native window.
+
     use super::allows_navigation;
 
+    /// Checks that the webview accepts application pages and downloads while rejecting external
+    /// origins.
     #[test]
     fn navigation_stays_inside_the_window() {
         let origin = "http://127.0.0.1:4173";
