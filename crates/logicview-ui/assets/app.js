@@ -2586,12 +2586,11 @@ async function fetchTiles() {
       && previous.start === start
       && previous.spp === spp
       && previous.width === width;
-    const complete = got >= pending.expect;
     const next = { start, spp, width };
     const panning = pointer && pointer.kind === "pan";
-    const accept = sameTileView || (complete && (
+    const accept = sameTileView || (
       !panning || tileOverlap(next, now.start, now.spp, widthNow) >= tileOverlap(previous, now.start, now.spp, widthNow)
-    ));
+    );
     if (accept) {
       state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
       state.tileView = next;
@@ -3839,11 +3838,7 @@ function openRunMenu() {
   }
   menu.classList.remove("hidden");
   const rect = runBtn.getBoundingClientRect();
-  const width = menu.offsetWidth || 140;
-  let left = rect.left;
-  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
-  menu.style.left = left + "px";
-  menu.style.top = (rect.bottom + 6) + "px";
+  placeViewportMenu(menu, rect.left, rect.bottom + 6);
 }
 
 function acqChoice(label, selected, apply) {
@@ -3909,16 +3904,7 @@ function openDeviceAcqMenu(x, y) {
   if (!menu) return;
   renderDeviceAcqMenu();
   menu.classList.remove("hidden");
-  const width = menu.offsetWidth || 220;
-  let left = x;
-  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
-  let top = y;
-  const height = menu.offsetHeight;
-  if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - height);
-  menu.style.left = left + "px";
-  menu.style.top = top + "px";
-  const flip = left + width + 196 > window.innerWidth;
-  for (const row of menu.querySelectorAll(".device-sub")) row.classList.toggle("flip", flip);
+  placeViewportMenu(menu, x, y);
 }
 
 function openDeviceMenu(anchor) {
@@ -3933,10 +3919,7 @@ function openDeviceMenu(anchor) {
   renderDeviceMenu();
   menu.classList.remove("hidden");
   const rect = anchor.getBoundingClientRect();
-  const below = rect.bottom + 6;
-  menu.style.left = Math.max(8, rect.left) + "px";
-  menu.style.top = below + "px";
-  placeDeviceSubmenu();
+  placeViewportMenu(menu, rect.left, rect.bottom + 6);
 }
 
 function placeDeviceSubmenu() {
@@ -4067,15 +4050,14 @@ function placeDecoderPicker() {
   const above = rect.top - gap - 8;
   const downward = below >= 160 || below >= above;
   const limit = Math.max(120, Math.min(240, downward ? below : above));
-  menu.style.left = rect.left + "px";
   menu.style.width = rect.width + "px";
   menu.style.maxHeight = limit + "px";
   if (downward) {
-    menu.style.top = (rect.bottom + gap) + "px";
+    placeViewportMenu(menu, rect.left, rect.bottom + gap);
     return;
   }
   menu.style.top = "0px";
-  menu.style.top = Math.max(8, rect.top - gap - menu.offsetHeight) + "px";
+  placeViewportMenu(menu, rect.left, rect.top - gap - menu.offsetHeight);
 }
 
 function renderDecoderPickerList(matches) {
@@ -6089,11 +6071,7 @@ function openMenu(button) {
   }
   const rect = button.getBoundingClientRect();
   pop.classList.remove("hidden");
-  const width = pop.offsetWidth;
-  let left = rect.left;
-  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
-  pop.style.left = left + "px";
-  pop.style.top = rect.bottom + "px";
+  placeViewportMenu(pop, rect.left, rect.bottom);
   for (const other of document.querySelectorAll(".menubar button")) {
     other.classList.toggle("open", other === button);
   }
@@ -6598,8 +6576,7 @@ function closeBusMenu() {
 
 function placeBusMenu(menu, x, y) {
   menu.classList.remove("hidden");
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  placeViewportMenu(menu, x, y);
 }
 
 function openBusMenu(bus, x, y) {
@@ -7315,6 +7292,95 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     statusEl.textContent = err.message;
   }
 });
+
+// Keep native WebView menus from appearing while preserving application handlers.
+document.addEventListener("contextmenu", (event) => event.preventDefault());
+
+function placeViewportMenu(menu, x, y) {
+  const margin = 8;
+  const left = Math.max(margin, Math.min(x, window.innerWidth - margin - menu.offsetWidth));
+  const top = Math.max(margin, Math.min(y, window.innerHeight - margin - menu.offsetHeight));
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+}
+
+function placeSubmenu(row) {
+  const submenu = row.querySelector(":scope > .device-submenu, :scope > .decode-menu-choices");
+  if (!submenu) return;
+  submenu.style.visibility = "hidden";
+  submenu.style.display = "block";
+  submenu.style.position = "fixed";
+  submenu.style.maxWidth = "calc(100vw - 16px)";
+  submenu.style.maxHeight = "calc(100vh - 16px)";
+  submenu.style.overflow = "auto";
+  const rect = row.getBoundingClientRect();
+  const x = rect.right + submenu.offsetWidth <= window.innerWidth - 8
+    ? rect.right - 4 : rect.left - submenu.offsetWidth + 4;
+  placeViewportMenu(submenu, x, rect.top);
+  submenu.style.right = "auto";
+  submenu.style.display = "";
+  submenu.style.visibility = "";
+}
+
+for (const type of ["pointerover", "focusin"]) {
+  document.addEventListener(type, (event) => {
+    const row = event.target.closest(".device-sub, .decode-menu-sub");
+    if (row) placeSubmenu(row);
+  });
+}
+
+const toolbar = document.querySelector(".toolbar");
+const overflowButton = document.getElementById("toolbar-overflow-button");
+const overflowPanel = document.getElementById("toolbar-overflow");
+const toolbarItems = [...toolbar.children].filter((item) => item !== overflowButton);
+
+function closeToolbarOverflow() {
+  overflowPanel.classList.add("hidden");
+  overflowButton.setAttribute("aria-expanded", "false");
+}
+
+function layoutToolbar() {
+  closeToolbarOverflow();
+  for (const item of toolbarItems) toolbar.insertBefore(item, overflowButton);
+  overflowButton.classList.remove("hidden");
+  const style = getComputedStyle(toolbar);
+  const gap = parseFloat(style.columnGap) || 0;
+  const available = toolbar.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  const widths = toolbarItems.map((item) => item.classList.contains("spacer") ? 0 : item.getBoundingClientRect().width);
+  const total = widths.reduce((sum, width) => sum + width, 0) + gap * Math.max(0, toolbarItems.length - 1);
+  if (total <= available) {
+    overflowButton.classList.add("hidden");
+    return;
+  }
+  let used = overflowButton.getBoundingClientRect().width;
+  let cutoff = 0;
+  for (; cutoff < toolbarItems.length; cutoff++) {
+    const next = widths[cutoff] + gap;
+    if (used + next > available) break;
+    used += next;
+  }
+  for (const item of toolbarItems.slice(cutoff)) overflowPanel.append(item);
+}
+
+overflowButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (!overflowPanel.classList.contains("hidden")) return closeToolbarOverflow();
+  overflowPanel.classList.remove("hidden");
+  const rect = overflowButton.getBoundingClientRect();
+  placeViewportMenu(overflowPanel, rect.right - overflowPanel.offsetWidth, rect.bottom + 6);
+  overflowButton.setAttribute("aria-expanded", "true");
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#toolbar-overflow, #toolbar-overflow-button")) closeToolbarOverflow();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !overflowPanel.classList.contains("hidden")) {
+    closeToolbarOverflow();
+    overflowButton.focus();
+  }
+});
+new ResizeObserver(layoutToolbar).observe(toolbar);
+layoutToolbar();
 
 boot().catch((err) => {
   statusEl.textContent = err.message;
