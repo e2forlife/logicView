@@ -3,3 +3,15 @@ Material Symbols by Google
 Source: https://github.com/google/material-design-icons/tree/master/symbols/web/settings/materialsymbolsoutlined
 Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
 The icon is distributed unchanged.
+
+Material Symbols Keyboard Double Arrow Right icon
+Material Symbols by Google
+Source: https://github.com/google/material-design-icons/tree/master/symbols/web/keyboard_double_arrow_right/materialsymbolsoutlined
+Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
+The icon is distributed unchanged.
+
+Material Symbols Directory Sync icon
+Material Symbols by Google
+Source: https://github.com/google/material-design-icons/tree/master/symbols/web/directory_sync/materialsymbolsoutlined
+Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
+The icon is distributed unchanged.

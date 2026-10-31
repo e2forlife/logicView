@@ -779,10 +779,27 @@ function renderChrome() {
   syncTriggerToolbar();
 }
 
+function paintRunIcon() {
+  const icon = runBtn.querySelector(".run-icon");
+  if (!icon) return;
+  const mode = settings.run === "repeat" || settings.run === "loop"
+    ? settings.run
+    : (settings.depth === "stream" ? "stream" : "single");
+  icon.dataset.mode = mode;
+  const titles = {
+    single: "Run capture. Right-click to choose repeat or loop.",
+    stream: "Run capture. Right-click to choose repeat or loop.",
+    repeat: "Repeat capture. Right-click to change run mode.",
+    loop: "Loop capture. Right-click to change run mode.",
+  };
+  runBtn.title = titles[mode] || titles.single;
+}
+
 function paintStatus() {
   const live = isLive(state.phase);
   runBtn.disabled = live || commandBusy;
   stopBtn.disabled = !live || commandBusy;
+  paintRunIcon();
   const name = document.getElementById("device-name");
   if (name) name.textContent = settings.deviceName;
   if (state.error) {
@@ -798,16 +815,67 @@ function paintStatus() {
   statusEl.textContent = `${state.phase} | ${count} samples | ${formatHz(state.rate)}${captured}${trigger}${hover}`;
 }
 
+let sessionRename = null;
+
 function renderTabs() {
+  if (sessionRename) return;
   tabsEl.replaceChildren();
   for (const session of state.sessions) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "tab" + (session.id === state.active ? " active" : "");
     button.textContent = session.name;
-    button.addEventListener("click", () => selectSession(session.id));
+    button.title = "Double-click to rename";
+    button.addEventListener("click", (ev) => {
+      if (ev.detail > 1) return;
+      selectSession(session.id);
+    });
+    button.addEventListener("dblclick", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      startSessionRename(session, button);
+    });
     tabsEl.appendChild(button);
   }
+}
+
+function startSessionRename(session, button) {
+  const input = document.createElement("input");
+  input.className = "rename";
+  input.value = session.name;
+  input.setAttribute("aria-label", "Capture name");
+  sessionRename = session.id;
+  button.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    if (commit && next && next !== session.name) {
+      try {
+        await api({ cmd: "rename_session", id: session.id, name: next });
+      } catch (err) {
+        statusEl.textContent = err.message;
+      }
+    }
+    sessionRename = null;
+    await refreshSessions();
+  };
+  input.addEventListener("keydown", (ev) => {
+    ev.stopPropagation();
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      finish(true);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("mousedown", (ev) => ev.stopPropagation());
+  input.addEventListener("click", (ev) => ev.stopPropagation());
 }
 
 function ensureSelection() {
@@ -2506,24 +2574,44 @@ async function fetchTiles() {
   }
   if (state.req !== req) return;
   const now = view();
-  const sameView = now.start === start
-    && now.spp === spp
-    && Math.max(1, Math.floor(wave.clientWidth || 1)) === width;
-  if (!sameView) {
+  const widthNow = Math.max(1, Math.floor(wave.clientWidth || 1));
+  if (now.spp !== spp || widthNow !== width) {
     tileAgain = true;
     return;
   }
-  if (Object.keys(pending.got).length) {
+  const got = Object.keys(pending.got).length;
+  if (got) {
     const previous = state.tileView;
     const sameTileView = previous
       && previous.start === start
       && previous.spp === spp
       && previous.width === width;
-    state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
-    state.tileView = { start, spp, width };
-    drawWave();
-    drawRuler();
+    const complete = got >= pending.expect;
+    const next = { start, spp, width };
+    const panning = pointer && pointer.kind === "pan";
+    const accept = sameTileView || (complete && (
+      !panning || tileOverlap(next, now.start, now.spp, widthNow) >= tileOverlap(previous, now.start, now.spp, widthNow)
+    ));
+    if (accept) {
+      state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
+      state.tileView = next;
+      if (panning) scheduleViewPaint();
+      else {
+        drawWave();
+        drawRuler();
+      }
+    }
   }
+  if (now.start !== start) tileAgain = true;
+}
+
+function tileOverlap(tile, viewStart, viewSpp, viewWidth) {
+  if (!tile || !(tile.spp > 0) || !(viewSpp > 0)) return 0;
+  const a0 = tile.start;
+  const a1 = tile.start + tile.width * tile.spp;
+  const b0 = viewStart;
+  const b1 = viewStart + viewWidth * viewSpp;
+  return Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
 }
 
 async function httpTiles(req, bodies, pending) {
@@ -2785,13 +2873,24 @@ function reducedLinkTitle() {
   return `${names} are connected at USB 2. These pods support USB 3.`;
 }
 
-function podIconHtml(count) {
-  const n = Math.max(1, Math.min(count || 1, 3));
-  const imgs = [];
-  for (let i = 0; i < n; i += 1) {
-    const back = n - 1 - i;
-    imgs.push(`<img class="pod" src="/assets/logicDevice.png" alt="" style="--stack:${back}">`);
-  }
+function podArt(device) {
+  const label = `${device && device.id || ""} ${device && device.name || ""}`.toLowerCase();
+  if (/\b(scope|dso|oscilloscope)\b/.test(label)) return "/assets/scopeDevice.png";
+  return "/assets/logicDevice.png";
+}
+
+function podIconHtml(devices) {
+  const list = (Array.isArray(devices) ? devices : []).slice(0, 3);
+  const shown = list.length ? list : [null];
+  const n = shown.length;
+  const imgs = shown.map((device, index) => {
+    const stack = n - 1 - index;
+    const src = podArt(device);
+    const fallback = src === "/assets/logicDevice.png"
+      ? ""
+      : ` onerror="this.onerror=null;this.src='/assets/logicDevice.png'"`;
+    return `<img class="pod" src="${src}" alt="" style="--stack:${stack}"${fallback}>`;
+  });
   return `<span class="pod-stack" data-count="${n}">${imgs.join("")}</span>`;
 }
 
@@ -2803,7 +2902,7 @@ function connectedMarkup() {
 }
 
 function paintPodIcons() {
-  const html = podIconHtml(Math.max(1, (state.devices || []).length));
+  const html = podIconHtml(state.devices || []);
   for (const host of [document.querySelector(".device-chip"), document.getElementById("device-card")]) {
     if (!host) continue;
     const stack = host.querySelector(".pod-stack");
@@ -2834,7 +2933,7 @@ function devicePanel() {
     : "";
   return `<h2>Device Settings</h2>
     <button type="button" class="device-card" id="device-card">
-      ${podIconHtml(Math.max(1, devices.length))}
+      ${podIconHtml(devices)}
       <div>
         <strong>${title}</strong>
         ${connectedMarkup()}
@@ -3106,9 +3205,12 @@ function bindPanel(name) {
       depth.addEventListener("change", () => {
         clampSampleRate();
         refillRateSelect();
+        paintRunIcon();
       });
     }
     bindSelect("set-run", "run", false);
+    const runMode = document.getElementById("set-run");
+    if (runMode) runMode.addEventListener("change", () => paintRunIcon());
     const repeat = document.getElementById("set-repeat");
     const threshold = document.getElementById("set-threshold");
     repeat.value = String(settings.repeatMs);
@@ -3702,7 +3804,126 @@ function closeDeviceMenu() {
   if (menu) menu.classList.add("hidden");
 }
 
+function closeDeviceAcqMenu() {
+  const menu = document.getElementById("device-acq-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function closeRunMenu() {
+  const menu = document.getElementById("run-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function openRunMenu() {
+  closeMenu();
+  closeDeviceMenu();
+  closeDeviceAcqMenu();
+  closeBusMenu();
+  closeDecoderPicker();
+  const menu = document.getElementById("run-menu");
+  if (!menu) return;
+  menu.replaceChildren();
+  for (const [id, label] of [["single", "Single"], ["repeat", "Repeat"], ["loop", "Loop"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (settings.run === id) button.setAttribute("aria-current", "true");
+    button.addEventListener("click", () => {
+      settings.run = id;
+      const select = document.getElementById("set-run");
+      if (select) select.value = id;
+      paintRunIcon();
+      closeRunMenu();
+    });
+    menu.append(button);
+  }
+  menu.classList.remove("hidden");
+  const rect = runBtn.getBoundingClientRect();
+  const width = menu.offsetWidth || 140;
+  let left = rect.left;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  menu.style.left = left + "px";
+  menu.style.top = (rect.bottom + 6) + "px";
+}
+
+function acqChoice(label, selected, apply) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (selected) button.setAttribute("aria-current", "true");
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    apply();
+    closeDeviceAcqMenu();
+  });
+  return button;
+}
+
+function acqSubmenu(title, value, items) {
+  const row = document.createElement("div");
+  row.className = "device-sub";
+  const label = document.createElement("button");
+  label.type = "button";
+  const name = document.createElement("span");
+  name.textContent = title;
+  const current = document.createElement("span");
+  current.className = "menu-key";
+  current.textContent = value;
+  label.append(name, current);
+  label.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    row.classList.toggle("open");
+  });
+  const sub = document.createElement("div");
+  sub.className = "device-submenu";
+  for (const item of items) sub.append(item);
+  row.append(label, sub);
+  return row;
+}
+
+function renderDeviceAcqMenu() {
+  const menu = document.getElementById("device-acq-menu");
+  if (!menu) return;
+  menu.replaceChildren();
+  const choice = clampSampleRate();
+  const rates = choice.rates.map((rate) => acqChoice(formatSampleRate(rate), rate === settings.rate, () => {
+    settings.rate = rate;
+    refillRateSelect();
+    refillDurationField();
+  }));
+  const limits = durationLimits();
+  clampDuration(limits);
+  const lengths = durationPresets(limits).map((ns) => acqChoice(formatDuration(ns), ns === settings.durationNs, () => {
+    commitDuration(formatDuration(ns));
+  }));
+  menu.append(
+    acqSubmenu("Sample rate", formatSampleRate(settings.rate), rates),
+    acqSubmenu("Length", formatDuration(settings.durationNs), lengths),
+  );
+}
+
+function openDeviceAcqMenu(x, y) {
+  closeDeviceMenu();
+  closeRunMenu();
+  const menu = document.getElementById("device-acq-menu");
+  if (!menu) return;
+  renderDeviceAcqMenu();
+  menu.classList.remove("hidden");
+  const width = menu.offsetWidth || 220;
+  let left = x;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  let top = y;
+  const height = menu.offsetHeight;
+  if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - height);
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+  const flip = left + width + 196 > window.innerWidth;
+  for (const row of menu.querySelectorAll(".device-sub")) row.classList.toggle("flip", flip);
+}
+
 function openDeviceMenu(anchor) {
+  closeDeviceAcqMenu();
+  closeRunMenu();
   const menu = document.getElementById("device-menu");
   if (!menu) return;
   if (!menu.classList.contains("hidden")) {
@@ -5316,6 +5537,18 @@ wave.addEventListener("pointerdown", (ev) => {
   wave.setPointerCapture(ev.pointerId);
 });
 
+let viewPaintQueued = false;
+function scheduleViewPaint() {
+  if (viewPaintQueued) return;
+  viewPaintQueued = true;
+  requestAnimationFrame(() => {
+    viewPaintQueued = false;
+    drawWave();
+    drawRuler();
+    drawOverview();
+  });
+}
+
 wave.addEventListener("pointermove", (ev) => {
   const rect = wave.getBoundingClientRect();
   state.hoverX = ev.clientX - rect.left;
@@ -5325,8 +5558,7 @@ wave.addEventListener("pointermove", (ev) => {
     v.userNavigated = true;
     clampView();
     scheduleTiles();
-    drawRuler();
-    drawOverview();
+    scheduleViewPaint();
     hideHover();
     return;
   }
@@ -5745,6 +5977,7 @@ function closeMenu() {
 }
 
 function openMenu(button) {
+  closeRunMenu();
   const name = button.dataset.menu;
   if (state.menu === name) {
     closeMenu();
@@ -5867,11 +6100,23 @@ function openMenu(button) {
 }
 
 document.getElementById("run").addEventListener("click", () => runCapture());
+document.getElementById("run").addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const menu = document.getElementById("run-menu");
+  if (menu && !menu.classList.contains("hidden")) closeRunMenu();
+  else openRunMenu();
+});
 document.getElementById("stop").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
 document.getElementById("device-select").addEventListener("click", (ev) => {
   ev.stopPropagation();
   openDeviceMenu(document.querySelector(".device-chip"));
+});
+document.querySelector(".device-chip").addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  openDeviceAcqMenu(ev.clientX, ev.clientY);
 });
 document.getElementById("tool-marker").addEventListener("click", () => setTool("marker"));
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
@@ -5950,6 +6195,9 @@ for (const button of document.querySelectorAll(".menubar button")) {
     ev.stopPropagation();
     openMenu(button);
   });
+  button.addEventListener("mouseenter", () => {
+    if (state.menu && state.menu !== button.dataset.menu) openMenu(button);
+  });
 }
 sideBody.addEventListener("scroll", () => placeDecoderPicker());
 window.addEventListener("resize", () => placeDecoderPicker());
@@ -5959,8 +6207,68 @@ document.addEventListener("click", (ev) => {
   if (!ev.target.closest("#device-menu") && !ev.target.closest("#device-select") && !ev.target.closest("#device-card")) {
     closeDeviceMenu();
   }
+  if (!ev.target.closest("#device-acq-menu")) closeDeviceAcqMenu();
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
+  if (!ev.target.closest("#run-menu") && !ev.target.closest("#run")) closeRunMenu();
   if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
+});
+
+let menuDismissTimer = 0;
+let menuDismissGroup = "";
+
+function menuGroup(node) {
+  if (!node || !node.closest) return "";
+  if (node.closest("#menu-pop") || node.closest(".menubar")) return "bar";
+  if (node.closest("#device-menu") || node.closest(".device-chip") || node.closest("#device-card")) return "device";
+  if (node.closest("#device-acq-menu")) return "acq";
+  if (node.closest("#decoder-kind-menu") || node.closest("#decoder-kind-picker")) return "decode";
+  if (node.closest("#bus-menu")) return "bus";
+  if (node.closest("#run-menu") || node.closest("#run")) return "run";
+  return "";
+}
+
+function groupIsOpen(group) {
+  if (group === "bar") return !!state.menu;
+  const id = {
+    device: "device-menu",
+    acq: "device-acq-menu",
+    decode: "decoder-kind-menu",
+    bus: "bus-menu",
+    run: "run-menu",
+  }[group];
+  const el = id && document.getElementById(id);
+  return !!(el && !el.classList.contains("hidden"));
+}
+
+function dismissMenuGroup(group) {
+  if (group === "bar") closeMenu();
+  else if (group === "device") closeDeviceMenu();
+  else if (group === "acq") closeDeviceAcqMenu();
+  else if (group === "decode") closeDecoderPicker();
+  else if (group === "bus") closeBusMenu();
+  else if (group === "run") closeRunMenu();
+}
+
+function scheduleMenuDismiss(group) {
+  clearTimeout(menuDismissTimer);
+  menuDismissGroup = group;
+  menuDismissTimer = setTimeout(() => {
+    if (menuDismissGroup !== group) return;
+    menuDismissGroup = "";
+    dismissMenuGroup(group);
+  }, 180);
+}
+
+document.addEventListener("mouseout", (ev) => {
+  const group = menuGroup(ev.target);
+  if (!group || !groupIsOpen(group)) return;
+  if (menuGroup(ev.relatedTarget) === group) return;
+  scheduleMenuDismiss(group);
+});
+document.addEventListener("mouseover", (ev) => {
+  if (menuGroup(ev.target) !== menuDismissGroup) return;
+  clearTimeout(menuDismissTimer);
+  menuDismissGroup = "";
 });
 
 document.getElementById("about-close").addEventListener("click", () => document.getElementById("about-dialog").close());
@@ -6027,6 +6335,7 @@ window.addEventListener("keydown", (ev) => {
     if (save && !save.classList.contains("hidden")) closeSaveDialog();
     else if (fly && !fly.classList.contains("hidden")) closeColorFlyout();
     else if (state.menu) closeMenu();
+    else if (!document.getElementById("run-menu").classList.contains("hidden")) closeRunMenu();
     else if (state.tool) setTool(state.tool);
     return;
   }

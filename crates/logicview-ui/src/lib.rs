@@ -48,6 +48,8 @@ const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
 const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
 const PREFS_LOGO: &[u8] = include_bytes!("../assets/PrefsLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
+const RUN_STREAM_ICON: &str = include_str!("../assets/keyboard_double_arrow_right.svg");
+const RUN_REPEAT_ICON: &str = include_str!("../assets/directory_sync.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
 const LOGIC_DEVICE: &[u8] = include_bytes!("../assets/logicDevice.png");
 const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
@@ -82,6 +84,11 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
         .route("/assets/settings.svg", get(settings_icon))
+        .route(
+            "/assets/keyboard_double_arrow_right.svg",
+            get(run_stream_icon),
+        )
+        .route("/assets/directory_sync.svg", get(run_repeat_icon))
         .route("/assets/AppLogo.png", get(app_logo))
         .route("/assets/ExportFileLogo.png", get(export_logo))
         .route("/assets/PrefsLogo.png", get(prefs_logo))
@@ -204,6 +211,16 @@ async fn prefs_logo() -> impl IntoResponse {
 /// Serves the locally embedded Material Symbols settings icon.
 async fn settings_icon() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/svg+xml")], SETTINGS_ICON)
+}
+
+/// Serves the stream-mode run icon, Keyboard Double Arrow Right.
+async fn run_stream_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], RUN_STREAM_ICON)
+}
+
+/// Serves the repeat and loop run icon, Directory Sync.
+async fn run_repeat_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], RUN_REPEAT_ICON)
 }
 
 /// Serves the embedded E2 artwork for the About dialog.
@@ -746,6 +763,9 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             Ok(json!({"sessions": sessions, "active": active}))
         }
         Command::CreateSession { name } => Ok(json!(engine.create_session(name).await?)),
+        Command::RenameSession { id, name } => {
+            Ok(json!(engine.rename_session(&id, &name).await?))
+        }
         Command::SelectSession { id } => {
             engine.select_session(&id).await?;
             Ok(json!({"id": id}))
@@ -1243,6 +1263,10 @@ enum Command {
     CreateSession {
         name: Option<String>,
     },
+    RenameSession {
+        id: String,
+        name: String,
+    },
     SelectSession {
         id: String,
     },
@@ -1599,6 +1623,20 @@ mod tests {
         assert_eq!(settings.headers()[header::CONTENT_TYPE], "image/svg+xml");
         let svg = settings.into_body().collect().await.unwrap().to_bytes();
         assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+        for uri in [
+            "/assets/keyboard_double_arrow_right.svg",
+            "/assets/directory_sync.svg",
+        ] {
+            let icon = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(icon.status(), StatusCode::OK);
+            assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/svg+xml");
+            let bytes = icon.into_body().collect().await.unwrap().to_bytes();
+            assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+        }
         let page = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -1695,6 +1733,12 @@ mod tests {
         let app = router(Engine::new());
         let created = post(&app, json!({"cmd": "create_session", "name": "Capture 2"})).await;
         assert_eq!(created["id"], "ses-2");
+        let renamed = post(
+            &app,
+            json!({"cmd": "rename_session", "id": "ses-2", "name": "  Bus capture  "}),
+        )
+        .await;
+        assert_eq!(renamed["name"], "Bus capture");
         let listed = post(&app, json!({"cmd": "list_sessions"})).await;
         assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(listed["active"], "ses-2");

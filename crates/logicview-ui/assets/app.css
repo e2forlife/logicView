@@ -181,8 +181,11 @@ button:disabled { cursor: default; }
   display: block;
   width: 26px;
   height: 22px;
-  fill: currentColor;
-  stroke: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .connected { display: inline-flex; align-items: center; gap: 4px; color: #3dcc8e; font-size: 10px; }
 .dot {
@@ -209,8 +212,27 @@ button:disabled { cursor: default; }
 
 .run { background: var(--run); color: white; }
 .run:hover:not(:disabled) { background: var(--run-hover); }
+.run .run-icon,
 .run svg, .stop svg { width: 12px; height: 12px; }
 .run svg { fill: white; }
+.run-icon {
+  display: inline-block;
+  flex: none;
+  background: transparent;
+}
+.run-icon[data-mode="stream"],
+.run-icon[data-mode="repeat"],
+.run-icon[data-mode="loop"] {
+  background: white;
+  -webkit-mask: var(--run-glyph) center / contain no-repeat;
+  mask: var(--run-glyph) center / contain no-repeat;
+}
+.run-icon[data-mode="stream"] { --run-glyph: url("/assets/keyboard_double_arrow_right.svg"); }
+.run-icon[data-mode="repeat"],
+.run-icon[data-mode="loop"] { --run-glyph: url("/assets/directory_sync.svg"); }
+.run-icon[data-mode="stream"] svg,
+.run-icon[data-mode="repeat"] svg,
+.run-icon[data-mode="loop"] svg { display: none; }
 .stop {
   background: #2c3442;
   color: #e8edf4;
@@ -966,80 +988,30 @@ table.ann tr:hover { background: #222733; }
   height: 50px;
 }
 
-.device-card .pod-stack[data-count="1"] .pod {
-  object-fit: contain;
-}
-
 .pod-stack {
+  --n: 1;
+  --step: 0.38;
   position: relative;
   flex: none;
   display: block;
+  background: transparent;
+  overflow: visible;
 }
+
+.pod-stack[data-count="2"] { --n: 2; }
+.pod-stack[data-count="3"] { --n: 3; }
 
 .pod-stack .pod {
   position: absolute;
-  right: 0;
-  bottom: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: center;
-  border-radius: 3px;
-  pointer-events: none;
-  z-index: calc(4 - var(--stack));
-}
-
-.pod-stack[data-count="2"],
-.pod-stack[data-count="3"] {
-  overflow: hidden;
-}
-
-/* Same-size copies. The front copy sits on top and the ones behind it
-   are moved down, clipped to a lower edge, with a gap between pods. */
-.pod-stack[data-count="2"] .pod,
-.pod-stack[data-count="3"] .pod {
   left: 0;
-  right: auto;
-  top: auto;
-  bottom: auto;
   width: 100%;
+  height: calc(100% / (1 + (var(--n) - 1) * var(--step)));
+  bottom: calc(var(--stack) * var(--step) * 100% / (1 + (var(--n) - 1) * var(--step)));
   object-fit: contain;
   object-position: center bottom;
-  transform: none;
-}
-
-.pod-stack[data-count="2"] .pod {
-  height: calc(100% - 14px);
-}
-
-.pod-stack[data-count="2"] .pod:first-child {
-  bottom: 0;
-  clip-path: inset(calc(100% - 11px) 0 0 0);
-}
-
-.pod-stack[data-count="2"] .pod:last-child {
-  top: 0;
-  clip-path: none;
-}
-
-.pod-stack[data-count="3"] .pod {
-  height: calc(100% - 22px);
-}
-
-.pod-stack[data-count="3"] .pod:nth-child(1) {
-  bottom: 0;
-  clip-path: inset(calc(100% - 8px) 0 0 0);
-}
-
-.pod-stack[data-count="3"] .pod:nth-child(2) {
-  bottom: 10px;
-  clip-path: inset(calc(100% - 8px) 0 0 0);
-}
-
-.pod-stack[data-count="3"] .pod:nth-child(3) {
-  top: 0;
-  height: calc(100% - 22px);
-  clip-path: none;
+  background: transparent;
+  pointer-events: none;
+  z-index: calc(var(--stack) + 1);
 }
 
 .device-card strong { display: block; font-size: 14px; margin-bottom: 2px; }
@@ -1172,6 +1144,20 @@ details.advanced summary {
   left: auto;
   right: calc(100% - 4px);
 }
+#device-acq-menu > .device-sub > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+#device-acq-menu .device-submenu {
+  max-height: min(320px, 70vh);
+  overflow: auto;
+}
+#device-acq-menu .device-submenu button[aria-current="true"],
+#run-menu button[aria-current="true"] {
+  color: var(--accent);
+}
 
 .unit-field {
   display: inline-flex;
@@ -1215,8 +1201,8 @@ details.advanced summary {
   justify-content: center;
   flex: none;
 }
-.ch .rename {
-  width: 72px;
+.ch .rename,
+.tabs .rename {
   margin: 0;
   padding: 1px 4px;
   font-size: 12px;
@@ -1224,6 +1210,17 @@ details.advanced summary {
   background: #0e131a;
   border: 1px solid var(--accent);
   border-radius: 4px;
+}
+.ch .rename { width: 72px; }
+.tabs .rename {
+  width: 140px;
+  height: 42px;
+  padding: 0 10px;
+  font-size: 13px;
+  border-radius: 0;
+  border: 0;
+  border-top: 2px solid #268fff;
+  background: #161e27;
 }
 .ch-en.on {
   color: white;
@@ -1306,11 +1303,21 @@ details.advanced summary {
 
 /* Workspace styling */
 :root { --side: 385px; --gutter: 230px; --ruler: 50px; --status: 42px; }
-.titlebar { height: 82px; flex: none; position: relative; align-items: flex-start; padding: 9px 20px 0; gap: 12px; }
-.titlebar .logo { width: 30px; height: 24px; }
-.titlebar strong { font-size: 21px; line-height: 24px; }
-.menubar { position: absolute; left: 14px; right: 0; bottom: 0; height: 36px; margin: 0; border-top: 1px solid var(--line); }
-.menubar > button { font-size: 14px; padding: 6px 10px; }
+.titlebar { height: 48px; flex: none; align-items: center; padding: 0 12px 0 20px; gap: 12px; }
+.titlebar .logo { width: 30px; height: 24px; flex: none; }
+.titlebar strong { font-size: 21px; line-height: 24px; flex: none; }
+.menubar {
+  position: static;
+  height: auto;
+  margin-left: auto;
+  min-width: 0;
+  overflow-x: auto;
+  border-top: 0;
+  flex: 0 1 auto;
+  scrollbar-width: none;
+}
+.menubar::-webkit-scrollbar { display: none; }
+.menubar > button { font-size: 14px; padding: 6px 10px; flex: none; }
 .toolbar { min-height: 68px; padding: 4px 14px; gap: 12px; flex-wrap: nowrap; overflow-x: auto; }
 .toolbar > * { flex-shrink: 0; }
 .device-chip { width: 280px; min-height: 58px; border-radius: 5px; background: #10161d; padding: 6px 48px 6px 16px; gap: 18px; }
@@ -1322,6 +1329,7 @@ details.advanced summary {
 .device-chip .chev svg { width: 26px; height: 22px; }
 .run, .stop { min-width: 124px; height: 48px; justify-content: center; border-radius: 5px; font-size: 15px; }
 .run { background: #216447; border: 1px solid #2fd879; }
+.run .run-icon,
 .run svg, .stop svg { width: 22px; height: 22px; }
 .tool-group { border-left: 1px solid var(--line); padding-left: 18px; gap: 10px; }
 .toolbar select { min-height: 37px; font-size: 13px; }
@@ -1436,7 +1444,7 @@ details.advanced summary {
 .decode-menu-choices .decoder-kind-empty.filtered-out { display: none; }
 .menu-separator { border-top: 1px solid #3a4558; margin: 4px 6px; }
 
-.preferences-open { position: absolute; top: 9px; right: 18px; width: 34px; height: 34px; border: 0; border-radius: 5px; background: transparent; color: var(--text); padding: 6px; }
+.preferences-open { position: static; flex: none; width: 34px; height: 34px; border: 0; border-radius: 5px; background: transparent; color: var(--text); padding: 6px; }
 .preferences-open:hover { background: var(--chip); }
 .preferences-open svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 .preferences-dialog { width: min(520px, calc(100vw - 32px)); color: var(--text); background: var(--bg-elev); border: 1px solid var(--line); border-radius: 10px; padding: 24px; }
@@ -1518,11 +1526,13 @@ details.advanced summary {
 :root[data-theme="light"] .ch-en,
 :root[data-theme="light"] .ch-en.on,
 :root[data-theme="light"] .ch-all[aria-pressed="true"],
-:root[data-theme="light"] .ch .rename {
+:root[data-theme="light"] .ch .rename,
+:root[data-theme="light"] .tabs .rename {
   background: #e8eef5;
   color: var(--text);
   border-color: #9cabbc;
 }
+:root[data-theme="light"] .tabs .rename { border-top-color: #268fff; }
 :root[data-theme="light"] .ch-en.on {
   background: color-mix(in srgb, var(--ch, #075db8) 22%, #fff);
   color: #172534;

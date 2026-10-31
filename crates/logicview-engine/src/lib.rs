@@ -620,6 +620,29 @@ impl Engine {
         })
     }
 
+    /// Renames a session. Surrounding whitespace is removed, and a blank name is rejected.
+    pub async fn rename_session(&self, id: &str, name: &str) -> Result<SessionBrief, EngineError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(EngineError::Device("capture name is empty".into()));
+        }
+        let mut state = self.shared.state.lock().await;
+        let active_id = state.slots[state.active].id.clone();
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .ok_or_else(|| EngineError::UnknownSession(id.to_string()))?;
+        slot.name = name.to_string();
+        Ok(SessionBrief {
+            id: slot.id.clone(),
+            name: slot.name.clone(),
+            phase: slot.session.phase.as_str().to_string(),
+            sample_count: slot.session.store.len(),
+            active: slot.id == active_id,
+        })
+    }
+
     /// Selects the session used by commands that omit an explicit identifier.
     pub async fn select_session(&self, id: &str) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;

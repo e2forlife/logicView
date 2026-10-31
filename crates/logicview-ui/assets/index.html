@@ -13,7 +13,6 @@
         <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
       </svg>
       <strong>LogicView</strong>
-      <button id="preferences-open" class="preferences-open" type="button" title="Preferences" aria-label="Preferences"><span class="settings-icon" aria-hidden="true"></span></button>
       <nav class="menubar" aria-label="Menu">
         <button type="button" data-menu="file">File</button>
         <button type="button" data-menu="edit">Edit</button>
@@ -24,6 +23,7 @@
         <button type="button" data-menu="tools">Tools</button>
         <button type="button" data-menu="help">Help</button>
       </nav>
+      <button id="preferences-open" class="preferences-open" type="button" title="Preferences" aria-label="Preferences"><span class="settings-icon" aria-hidden="true"></span></button>
     </header>
     <div class="toolbar">
       <div class="device-chip" title="Device">
@@ -32,11 +32,11 @@
           <strong id="device-name">Demo</strong>
           <span class="connected"><i class="dot"></i> Connected</span>
         </span>
-        <span class="chev" aria-hidden="true"><svg viewBox="4 6 16 14"><path d="M5 7h14L12 19z"></path></svg></span>
+        <span class="chev" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span>
         <button id="device-select" type="button" aria-haspopup="menu" aria-label="Device"></button>
       </div>
       <button id="run" class="run" type="button" title="Run capture">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
+        <span class="run-icon" data-mode="single" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5l12 7-12 7z"></path></svg></span>
         Run
       </button>
       <button id="stop" class="stop" type="button" title="Stop capture">
@@ -142,6 +142,8 @@
   </div>
   <div id="menu-pop" class="menu-pop hidden"></div>
   <div id="device-menu" class="device-menu hidden" role="menu"></div>
+  <div id="device-acq-menu" class="device-menu hidden" role="menu"></div>
+  <div id="run-menu" class="device-menu hidden" role="menu" aria-label="Run mode"></div>
   <div id="bus-menu" class="menu-pop hidden"></div>
   <div id="hover" class="hover hidden"></div>
   <div id="capture-wait" class="wait-dialog hidden" role="dialog" aria-live="polite" aria-label="Capture progress">

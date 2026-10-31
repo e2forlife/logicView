@@ -1020,3 +1020,21 @@ async fn buffer_length_stops_at_the_pod_memory_share() {
         other => panic!("two pods should use the smaller memory share, got {other}"),
     }
 }
+
+/// Checks that a capture tab name is trimmed, stored, and refused when blank or unknown.
+#[tokio::test]
+async fn rename_session_trims_and_rejects_blank() {
+    let engine = Engine::new();
+    let renamed = engine.rename_session("ses-1", "  Logic  ").await.unwrap();
+    assert_eq!(renamed.name, "Logic");
+    assert!(renamed.active);
+    let (sessions, _) = engine.list_sessions().await;
+    assert_eq!(sessions[0].name, "Logic");
+    assert!(engine.rename_session("ses-1", "   ").await.is_err());
+    match engine.rename_session("missing", "Name").await {
+        Err(EngineError::UnknownSession(id)) => assert_eq!(id, "missing"),
+        other => panic!("unknown session should fail, got {other:?}"),
+    }
+    let (sessions, _) = engine.list_sessions().await;
+    assert_eq!(sessions[0].name, "Logic");
+}
