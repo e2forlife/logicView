@@ -90,6 +90,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
             "/api/preferences",
             get(get_preferences).post(save_preferences),
         )
+        .route("/api/export-dir", post(save_export_dir))
         .route(
             "/api/mcp",
             get(mcp_server::status).post(mcp_server::configure),
@@ -103,6 +104,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/api/export/csv", get(export_csv))
         .route("/api/export/xlsx", get(export_xlsx))
         .route("/api/export-to", post(export_to))
+        .route("/api/save-as", post(save_as))
         .route(
             "/api/import",
             post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
@@ -157,6 +159,22 @@ async fn save_preferences(
     let current = logicview_config::load();
     prefs.mcp_enabled = current.mcp_enabled;
     prefs.mcp_port = current.mcp_port;
+    prefs.export_dir = current.export_dir;
+    logicview_config::save(&prefs).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(prefs))
+}
+
+#[derive(Deserialize)]
+struct ExportDirBody {
+    directory: String,
+}
+
+/// Remembers the export folder without changing the other preferences.
+async fn save_export_dir(
+    Json(input): Json<ExportDirBody>,
+) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
+    let mut prefs = logicview_config::load();
+    prefs.export_dir = input.directory;
     logicview_config::save(&prefs).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     Ok(Json(prefs))
 }
@@ -493,6 +511,58 @@ async fn export_to(
         "path": path.to_string_lossy(),
         "rows": rows,
         "total": total,
+    })))
+}
+
+/// Full path chosen in the system save dialog.
+#[derive(Deserialize)]
+struct SaveAs {
+    path: std::path::PathBuf,
+}
+
+/// Writes the current capture to the file chosen in the system save dialog.
+async fn save_as(
+    State(app): State<AppState>,
+    Json(input): Json<SaveAs>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !input.path.is_absolute() {
+        return Err(export_error("Choose a file"));
+    }
+    let path = if input
+        .path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lvcap"))
+    {
+        input.path
+    } else {
+        input.path.with_extension("lvcap")
+    };
+    let parent = path.parent().filter(|dir| dir.is_dir()).ok_or_else(|| {
+        export_error("Choose a folder that exists")
+    })?;
+    if path.file_name().is_none() || parent.as_os_str().is_empty() {
+        return Err(export_error("Choose a file"));
+    }
+    if path.exists() && !path.is_file() {
+        return Err(export_error("Choose a file"));
+    }
+    let status = app
+        .engine
+        .status(None)
+        .await
+        .map_err(|err| export_error(err.to_string()))?;
+    if status.sample_count == 0 {
+        return Err(export_error("nothing captured yet"));
+    }
+    let bytes = app
+        .engine
+        .export_zip(None)
+        .await
+        .map_err(|err| export_error(err.to_string()))?;
+    std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "path": path.to_string_lossy(),
     })))
 }
 
@@ -2082,6 +2152,66 @@ mod tests {
         let written = std::fs::read(dir.join("Capture(1).csv")).unwrap();
         assert!(written.starts_with(b"time_s"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a capture to the absolute path chosen by the system save dialog.
+    #[tokio::test]
+    async fn save_as_writes_the_chosen_file() {
+        let app = router(Engine::new());
+        let relative = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/save-as")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"path": "capture.lvcap"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relative.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+
+        let path = std::env::temp_dir().join(format!("logicview-save-as-{}.lvcap", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let saved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/save-as")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({"path": path})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(saved.status().is_success());
+        let written = std::fs::read(&path).unwrap();
+        assert!(written.starts_with(b"PK"));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Checks that the UI listener stays on the local host.

@@ -10,6 +10,8 @@ pub struct Preferences {
     pub theme: String,
     pub mcp_enabled: bool,
     pub mcp_port: u16,
+    /// Last folder used by Export Capture.
+    pub export_dir: String,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -19,6 +21,7 @@ impl Default for Preferences {
             theme: "system".into(),
             mcp_enabled: false,
             mcp_port: 8765,
+            export_dir: String::new(),
         }
     }
 }
@@ -117,6 +120,7 @@ mod tests {
             theme: "light".into(),
             mcp_enabled: true,
             mcp_port: 9135,
+            export_dir: "exports".into(),
         };
         save_to(&file, &prefs).unwrap();
         let loaded = load_from(&file);
@@ -125,6 +129,8 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert!(loaded.mcp_enabled);
         assert_eq!(loaded.mcp_port, 9135);
+        assert_eq!(loaded.export_dir, "exports");
+        assert!(Preferences::default().export_dir.is_empty());
         assert!(!Preferences::default().mcp_enabled);
         assert!(default_scripts_dir().ends_with("examples/decoders"));
         assert!(effective_scripts_dir(&Preferences::default()).contains("examples"));

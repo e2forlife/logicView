@@ -75,6 +75,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     enum UiEvent {
         PickDirectory(String),
         PickFile(String),
+        SaveFile(String),
         Theme(String),
         Close,
         Drop(std::path::PathBuf, i32, i32),
@@ -115,6 +116,10 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             } else if let Some(kind) = body.strip_prefix("pick-file:") {
                 if matches!(kind, "load" | "import") {
                     let _ = ipc_proxy.send_event(UiEvent::PickFile(kind.to_string()));
+                }
+            } else if let Some(kind) = body.strip_prefix("save-file:") {
+                if kind == "lvcap" {
+                    let _ = ipc_proxy.send_event(UiEvent::SaveFile(kind.to_string()));
                 }
             } else if let Some(theme) = body.strip_prefix("theme:") {
                 if matches!(theme, "light" | "dark" | "system") {
@@ -252,6 +257,34 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                         .unwrap_or_else(|| "null".into());
                     let _ = webview.evaluate_script(&format!(
                         "if (window.logicviewFileSelected) window.logicviewFileSelected({kind_js}, {path_js})"
+                    ));
+                }
+                UiEvent::SaveFile(kind) => {
+                    let chosen = rfd::FileDialog::new()
+                        .set_title("Save capture")
+                        .set_file_name("capture.lvcap")
+                        .add_filter("LogicView capture", &["lvcap"])
+                        .save_file()
+                        .map(|path| {
+                            if path
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("lvcap"))
+                            {
+                                path
+                            } else {
+                                path.with_extension("lvcap")
+                            }
+                        });
+                    let kind_js = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into());
+                    let path_js = chosen
+                        .as_ref()
+                        .map(|path| {
+                            serde_json::to_string(&path.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "null".into())
+                        })
+                        .unwrap_or_else(|| "null".into());
+                    let _ = webview.evaluate_script(&format!(
+                        "if (window.logicviewSaveSelected) window.logicviewSaveSelected({kind_js}, {path_js})"
                     ));
                 }
                 UiEvent::Theme(choice) => {

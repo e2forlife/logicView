@@ -4186,18 +4186,59 @@ const SAVE_KINDS = {
 
 let saveJob = null;
 
-function saveCaptureExport(kind) {
+let pendingSavePick = null;
+
+function pickSaveFile(kind) {
+  return new Promise((resolve) => {
+    if (pendingSavePick) pendingSavePick.resolve(null);
+    pendingSavePick = { kind, resolve };
+    window.ipc.postMessage("save-file:" + kind);
+  });
+}
+
+window.logicviewSaveSelected = (kind, path) => {
+  const pending = pendingSavePick;
+  pendingSavePick = null;
+  if (!pending || pending.kind !== kind) return;
+  pending.resolve(path || null);
+};
+
+async function saveCaptureExport(kind) {
   const spec = SAVE_KINDS[kind];
   if (!spec) return;
-  openSaveDialog({
-    title: spec.title,
-    note: spec.note,
-    filename: spec.filename,
-    ext: spec.ext,
-    mime: spec.mime,
-    picker: spec.picker,
-    produce: () => fetchCaptureBlob(spec.path),
-  });
+  if (!(state.total > 0)) {
+    statusEl.textContent = "nothing captured yet";
+    return;
+  }
+  if (window.ipc && kind === "lvcap") {
+    const path = await pickSaveFile(kind);
+    if (!path) {
+      statusEl.textContent = "save cancelled";
+      return;
+    }
+    try {
+      const response = await fetch("/api/save-as", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok || !json.ok) throw new Error(json.error || "save failed");
+      statusEl.textContent = "saved " + (json.path || path);
+    } catch (err) {
+      statusEl.textContent = err.message || "save failed";
+    }
+    return;
+  }
+  try {
+    const produced = await fetchCaptureBlob(spec.path);
+    const blob = produced instanceof Blob ? produced : new Blob([produced], { type: spec.mime || "application/octet-stream" });
+    const wrote = await writeChosenFile(spec.filename, blob, spec.picker);
+    if (wrote === "cancel") statusEl.textContent = "save cancelled";
+    else statusEl.textContent = "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  }
 }
 
 async function fetchCaptureBlob(path) {
@@ -4335,10 +4376,7 @@ function syncExportChoice(prefix) {
   const dir = document.getElementById(`${prefix}-export-dir`);
   const name = document.getElementById(`${prefix}-export-name`);
   if (kind) exportChoice.kind = kind.value;
-  if (dir) {
-    exportChoice.directory = dir.value;
-    try { localStorage.setItem("logicview-export-dir", dir.value); } catch (_) { /* the field still holds the path */ }
-  }
+  if (dir && dir.value !== exportChoice.directory) rememberExportDirectory(dir.value);
   if (name) exportChoice.filename = name.value;
   paintExportFields(prefix);
 }
@@ -6261,7 +6299,32 @@ function closeDecodeConfig() {
   document.getElementById("decode-config").classList.add("hidden");
 }
 
-let preferences = { firmware_dir: "", scripts_dir: "", theme: "system" };
+let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "" };
+let exportDirTimer = null;
+let exportDirSave = 0;
+
+function rememberExportDirectory(directory) {
+  exportChoice.directory = directory;
+  preferences.export_dir = directory;
+  try { localStorage.setItem("logicview-export-dir", directory); } catch (_) { /* the saved preferences still hold the folder */ }
+  clearTimeout(exportDirTimer);
+  exportDirTimer = setTimeout(persistExportDirectory, 250);
+}
+
+async function persistExportDirectory() {
+  const seq = ++exportDirSave;
+  const directory = preferences.export_dir || "";
+  try {
+    const response = await fetch("/api/export-dir", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ directory }),
+    });
+    if (!response.ok || seq !== exportDirSave) return;
+    const saved = await response.json();
+    if (seq === exportDirSave) preferences = saved;
+  } catch (_) { /* the field still holds the folder for this session */ }
+}
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 function applyTheme() {
   const light = preferences.theme === "light" || (preferences.theme === "system" && systemTheme.matches);
@@ -6279,6 +6342,12 @@ async function loadPreferences() {
   const response = await fetch("/api/preferences");
   if (!response.ok) throw new Error("Could not load preferences");
   preferences = await response.json();
+  if (preferences.export_dir) {
+    exportChoice.directory = preferences.export_dir;
+  } else if (exportChoice.directory) {
+    rememberExportDirectory(exportChoice.directory);
+  }
+  paintExportFields(null, true);
   applyTheme();
 }
 document.getElementById("preferences-open").addEventListener("click", () => {
