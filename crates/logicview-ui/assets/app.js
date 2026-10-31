@@ -3544,6 +3544,8 @@ function closeDecoderPicker() {
   if (!menu || !button) return;
   menu.classList.add("hidden");
   button.setAttribute("aria-expanded", "false");
+  const list = document.getElementById("decoder-kind-list");
+  if (list) list.replaceChildren();
   const search = document.getElementById("decoder-kind-search");
   if (search) {
     search.value = "";
