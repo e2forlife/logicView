@@ -11,6 +11,7 @@ name = "logicview"
 path = "src/main.rs"
 
 [dependencies]
+logicview-config = { path = "../logicview-config" }
 logicview-engine = { path = "../logicview-engine" }
 logicview-mcp = { path = "../logicview-mcp" }
 logicview-ui = { path = "../logicview-ui" }

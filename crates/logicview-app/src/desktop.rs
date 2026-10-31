@@ -75,6 +75,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
     enum UiEvent {
         PickDirectory(String),
         PickFile(String),
+        Theme(String),
         Close,
         Drop(std::path::PathBuf, i32, i32),
     }
@@ -86,7 +87,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .with_visible(false)
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(960.0, 640.0))
-        .with_theme(Some(tao::window::Theme::Dark));
+        .with_theme(preferred_window_theme(&logicview_config::load().theme));
     if let Some(icon) = window_icon() {
         builder = builder.with_window_icon(Some(icon));
     }
@@ -114,6 +115,10 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             } else if let Some(kind) = body.strip_prefix("pick-file:") {
                 if matches!(kind, "load" | "import") {
                     let _ = ipc_proxy.send_event(UiEvent::PickFile(kind.to_string()));
+                }
+            } else if let Some(theme) = body.strip_prefix("theme:") {
+                if matches!(theme, "light" | "dark" | "system") {
+                    let _ = ipc_proxy.send_event(UiEvent::Theme(theme.to_string()));
                 }
             } else if body == "close" {
                 let _ = ipc_proxy.send_event(UiEvent::Close);
@@ -249,6 +254,9 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                         "if (window.logicviewFileSelected) window.logicviewFileSelected({kind_js}, {path_js})"
                     ));
                 }
+                UiEvent::Theme(choice) => {
+                    window.set_theme(preferred_window_theme(choice));
+                }
                 UiEvent::Close => {
                     *control_flow = ControlFlow::Exit;
                 }
@@ -289,6 +297,17 @@ pub fn report_error(message: &str) {
     }
 }
 
+/// Maps a saved theme choice onto the native window caption.
+///
+/// `system` leaves the choice unset so the caption follows the operating system.
+pub(crate) fn preferred_window_theme(choice: &str) -> Option<tao::window::Theme> {
+    match choice {
+        "light" => Some(tao::window::Theme::Light),
+        "dark" => Some(tao::window::Theme::Dark),
+        _ => None,
+    }
+}
+
 /// The window may follow links inside the app, blank pages, and download blobs.
 /// Other destinations stay out of the window.
 pub(crate) fn allows_navigation(origin: &str, url: &str) -> bool {
@@ -306,7 +325,15 @@ pub(crate) fn allows_navigation(origin: &str, url: &str) -> bool {
 mod tests {
     //! Checks desktop navigation rules without starting a native window.
 
-    use super::allows_navigation;
+    use super::{allows_navigation, preferred_window_theme};
+
+    #[test]
+    fn window_caption_follows_the_saved_theme() {
+        assert_eq!(preferred_window_theme("light"), Some(tao::window::Theme::Light));
+        assert_eq!(preferred_window_theme("dark"), Some(tao::window::Theme::Dark));
+        assert_eq!(preferred_window_theme("system"), None);
+        assert_eq!(preferred_window_theme("other"), None);
+    }
 
     /// Checks that the webview accepts application pages and downloads while rejecting external
     /// origins.

@@ -1124,7 +1124,7 @@ function renderGutter() {
         return;
       }
       if (!ensureSelection().selection.includes(row.key)) selectOnly(row.key);
-      if (selectedLogicIndexes().length) openCreateGroupMenu(ev.clientX, ev.clientY);
+      openSignalMenu(row, ev.clientX, ev.clientY);
     });
     gutter.appendChild(el);
   }
@@ -1188,7 +1188,52 @@ function moveChannel(fromKey, toKey) {
     drawWave();
     return;
   }
+  const container = dropContainer(to);
+  if (container && plainLogic(from)) {
+    insertChannelInContainer(from, container, to);
+    return;
+  }
   if (isTopLevelRow(from) && isTopLevelRow(to)) reorderTopLevel(fromKey, toKey);
+}
+
+function plainLogic(row) {
+  return !!row && row.kind === "logic" && !row.decoderId;
+}
+
+function dropContainer(row) {
+  if (!row) return null;
+  if ((row.kind === "group" || row.kind === "bus") && row.bus && !row.bus.decode) return row.bus;
+  if (row.containerId == null) return null;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  return container && !container.decode ? container : null;
+}
+
+function detachChannel(index) {
+  const wanted = Number(index);
+  for (const container of sessionContainers()) {
+    container.members = (container.members || []).filter((member) => !(member.kind === "channel" && Number(member.index) === wanted));
+    container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  }
+}
+
+function insertChannelInContainer(fromRow, container, toRow) {
+  const index = Number(fromRow.channel);
+  let at = 0;
+  if (!(toRow.header && toRow.bus && Number(toRow.bus.id) === Number(container.id))) {
+    const target = memberPosition(container, toRow);
+    at = target >= 0 ? target : (container.members || []).length;
+  }
+  const fromAt = memberPosition(container, fromRow);
+  if (fromAt >= 0 && fromAt < at) at -= 1;
+  detachChannel(index);
+  const members = container.members || (container.members = []);
+  members.splice(Math.max(0, Math.min(at, members.length)), 0, { kind: "channel", index });
+  container.channels = members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
 }
 
 function isTopLevelRow(row) {
@@ -5522,6 +5567,68 @@ function openCreateGroupMenu(x, y) {
   placeBusMenu(menu, x, y);
 }
 
+function canUngroupSignal(row) {
+  if (!plainLogic(row) || row.containerId == null) return false;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  return !!(container && !container.decode);
+}
+
+function ungroupSignal(row) {
+  if (!canUngroupSignal(row)) return;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  const index = Number(row.channel);
+  const at = (container.members || []).findIndex((member) => member.kind === "channel" && Number(member.index) === index);
+  if (at < 0) return;
+  container.members.splice(at, 1);
+  container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  const parent = parentContainer(container.id);
+  if (parent) {
+    const groupAt = parent.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(container.id));
+    parent.members.splice(groupAt < 0 ? parent.members.length : groupAt + 1, 0, { kind: "channel", index });
+    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  } else {
+    const key = "logic:" + index;
+    const order = view().order && view().order.length ? [...view().order] : sourceRows().map((item) => item.key);
+    const without = order.filter((item) => item !== key);
+    const groupAt = without.indexOf("bus:" + container.id);
+    if (groupAt >= 0) without.splice(groupAt + 1, 0, key);
+    else without.unshift(key);
+    persistOrder(without);
+  }
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function openSignalMenu(row, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  if (canUngroupSignal(row)) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.textContent = "Ungroup";
+    item.addEventListener("click", () => {
+      ungroupSignal(row);
+      closeBusMenu();
+    });
+    menu.append(item);
+  }
+  if (selectedLogicIndexes().length) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.textContent = "Create group…";
+    item.addEventListener("click", () => {
+      closeBusMenu();
+      openBusDialog();
+    });
+    menu.append(item);
+  }
+  if (!menu.childElementCount) return;
+  placeBusMenu(menu, x, y);
+}
+
 function openContainerMenu(bus, x, y) {
   const menu = document.getElementById("bus-menu");
   menu.replaceChildren();
@@ -5552,7 +5659,7 @@ function openContainerMenu(bus, x, y) {
   }
   const remove = document.createElement("button");
   remove.type = "button";
-  remove.textContent = bus.type === "group" ? "Remove group" : "Remove bus";
+  remove.textContent = bus.type === "group" ? "Ungroup" : "Remove bus";
   remove.addEventListener("click", () => {
     removeContainer(bus.id);
     closeBusMenu();
@@ -5769,6 +5876,7 @@ function applyTheme() {
   state.gutterSig = "";
   renderGutter();
   drawWave();
+  if (window.ipc) window.ipc.postMessage("theme:" + (light ? "light" : "dark"));
 }
 systemTheme.addEventListener("change", applyTheme);
 async function loadDecoderCatalog() {

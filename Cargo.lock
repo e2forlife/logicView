@@ -1474,6 +1474,7 @@ version = "0.1.0"
 dependencies = [
  "ico",
  "image",
+ "logicview-config",
  "logicview-engine",
  "logicview-mcp",
  "logicview-ui",
