@@ -46,6 +46,7 @@ const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
 const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
+const PREFS_LOGO: &[u8] = include_bytes!("../assets/PrefsLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
 const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
@@ -82,6 +83,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/settings.svg", get(settings_icon))
         .route("/assets/AppLogo.png", get(app_logo))
         .route("/assets/ExportFileLogo.png", get(export_logo))
+        .route("/assets/PrefsLogo.png", get(prefs_logo))
         .route("/assets/E2logo.png", get(e2_logo))
         .route("/api/contributors", get(contributors_json))
         .route(
@@ -172,6 +174,11 @@ async fn app_logo() -> impl IntoResponse {
 /// Serves the export dialog artwork.
 async fn export_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], EXPORT_LOGO)
+}
+
+/// Serves the Preferences dialog header artwork.
+async fn prefs_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], PREFS_LOGO)
 }
 
 /// Serves the locally embedded Material Symbols settings icon.
@@ -1440,6 +1447,25 @@ mod tests {
             .unwrap()
             .to_bytes()
             .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let prefs_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/PrefsLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefs_logo.status(), StatusCode::OK);
+        assert_eq!(prefs_logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(prefs_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
         let e2_logo = app
             .clone()
             .oneshot(
@@ -1489,6 +1515,7 @@ mod tests {
         assert!(html.contains("id=\"cursor-mode\""));
         assert!(html.contains("id=\"export-dialog\""));
         assert!(html.contains("ExportFileLogo.png"));
+        assert!(html.contains("PrefsLogo.png"));
         assert!(html.contains("id=\"trig-kind\""));
         assert!(html.contains("id=\"trig-channel\""));
         assert!(html.contains("id=\"trig-pre\""));
