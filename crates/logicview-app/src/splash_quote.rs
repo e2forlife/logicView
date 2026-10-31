@@ -1,7 +1,7 @@
 //! Random startup quote: wording, letter timing, and placement under the logo.
 
 use serde::Deserialize;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Logo art size inside the splash, in logical pixels. The quote uses the room below this.
 pub(super) const LOGO_WIDTH: f64 = 780.0;
@@ -131,15 +131,20 @@ fn load_quotes() -> Vec<Quote> {
 /// Picks one embedded quote. An empty or unreadable file leaves the splash as the logo alone.
 pub(super) fn pick() -> Option<Message> {
     let quotes = load_quotes();
-    if quotes.is_empty() {
-        return None;
-    }
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos() as usize)
-        .unwrap_or(0);
-    let chosen = &quotes[seed % quotes.len()];
+    let chosen = quotes.get(quote_index(quotes.len()))?;
     Some(Message::new(&chosen.quote, &chosen.reference))
+}
+
+/// Chooses a quote slot. The Windows clock only moves in 100 ns steps, and that
+/// step divides evenly into the quote count, so a clock remainder always
+/// selected the first line.
+fn quote_index(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    (RandomState::new().hash_one(SystemTime::now()) as usize) % len
 }
 
 /// Characters fully revealed, and the opacity (`0.0..=1.0`) of the character fading in now.
@@ -468,6 +473,20 @@ mod tests {
         assert!(message.is_bold(message.reference_start));
         assert!(!message.is_bold(message.reference_start - 1));
         assert_eq!(message.text.chars().nth(message.reference_start), Some('1'));
+    }
+
+    /// A clock remainder stuck every launch on the first line. Several picks must spread out.
+    #[test]
+    fn startup_quote_changes_between_launches() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            seen.insert(pick().expect("quotes file").text);
+        }
+        assert!(
+            seen.len() > 1,
+            "every pick returned {}",
+            seen.iter().next().expect("one quote")
+        );
     }
 
     #[test]
