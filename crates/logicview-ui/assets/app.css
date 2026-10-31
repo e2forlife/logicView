@@ -528,6 +528,7 @@ select, input[type="number"], input[type="text"] {
   min-height: 0;
   display: flex;
   overflow: auto;
+  background: #0b0f14;
 }
 
 .row-resize {
@@ -1302,17 +1303,19 @@ details.advanced summary {
 :root[data-theme="light"] .menu-pop, :root[data-theme="light"] .device-menu, :root[data-theme="light"] .device-submenu, :root[data-theme="light"] .decode-menu-choices, :root[data-theme="light"] .wait-card, :root[data-theme="light"] .about-dialog, :root[data-theme="light"] .export-dialog, :root[data-theme="light"] .device-card { background: var(--bg-elev); color: var(--text); border-color: var(--line); }
 :root[data-theme="light"] .menu-key { color: #5c6b7e; }
 :root[data-theme="light"] select, :root[data-theme="light"] input, :root[data-theme="light"] .device-chip, :root[data-theme="light"] .ch, :root[data-theme="light"] .tab.active, :root[data-theme="light"] .decoder-row.selected, :root[data-theme="light"] .decode-add, :root[data-theme="light"] .ch-all { background: #e8eef5; color: var(--text); border-color: var(--line); }
+:root[data-theme="light"] .ch.selected { background: #c9ddf6; box-shadow: inset 4px 0 0 #075db8; }
 :root[data-theme="light"] .menu-pop button:hover, :root[data-theme="light"] .menubar button:hover, :root[data-theme="light"] .decoder-icon:hover { background: #dbe6f2; color: var(--text); }
 
 :root[data-theme="light"] .status { background: var(--bg-elev); color: var(--muted); }
 :root[data-theme="light"] .about-credits { background: #eef3f8; color: var(--text); border-color: var(--line); }
 
-/* Light surfaces use dark text; the waveform and measurement tooltip stay dark. */
+/* Light surfaces use dark text. The waveform is cream; the measurement tooltip stays dark. */
 :root[data-theme="light"] {
   --text: #172534;
   --muted: #46596d;
   --accent: #075db8;
 }
+:root[data-theme="light"] .wave-stage { background: #f4efe4; }
 :root[data-theme="light"] .menubar > button,
 :root[data-theme="light"] .toolbar .icon-btn,
 :root[data-theme="light"] .trig-kind,

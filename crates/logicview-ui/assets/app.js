@@ -1047,8 +1047,9 @@ function renderGutter() {
     el.title = row.device ? `${signalName(row)} · ${row.device}` : signalName(row);
     const bar = document.createElement("span");
     bar.className = "bar";
-    el.style.setProperty("--channel-color", row.color);
-    bar.style.background = row.color;
+    const shown = traceColor(row.color);
+    el.style.setProperty("--channel-color", shown);
+    bar.style.background = shown;
     bar.title = "Channel color";
     bar.addEventListener("mousedown", (ev) => {
       ev.preventDefault();
@@ -1318,22 +1319,113 @@ function drawDiamond(ctx, x, y, color) {
   ctx.fill();
 }
 
+function lightTheme() {
+  return document.documentElement.dataset.theme === "light";
+}
+
+function wavePalette() {
+  if (lightTheme()) {
+    return {
+      bg: "#f4efe4",
+      bgAlt: "#e6dcc8",
+      ink: "#243140",
+      grid: "rgba(36, 49, 64, 0.12)",
+      timeGrid: "rgba(36, 72, 110, 0.18)",
+      logicGuide: "rgba(36, 49, 64, 0.16)",
+      analogGuide: "rgba(36, 49, 64, 0.22)",
+      label: "#3d4e62",
+      hover: "rgba(23, 37, 52, 0.35)",
+      empty: "#5c6b7e",
+      halo: "rgba(244, 239, 228, 0.92)",
+      measure: "#16345c",
+    };
+  }
+  return {
+    bg: "#0b0f14",
+    bgAlt: "#141b24",
+    ink: "#d5deea",
+    grid: "rgba(255,255,255,0.045)",
+    timeGrid: "rgba(86, 140, 190, 0.16)",
+    logicGuide: "rgba(140, 170, 200, 0.14)",
+    analogGuide: "rgba(140, 170, 200, 0.18)",
+    label: "rgba(176, 188, 204, 0.55)",
+    hover: "rgba(255,255,255,0.28)",
+    empty: "#8b95a6",
+    halo: "rgba(8, 12, 18, 0.9)",
+    measure: "#d5e2ff",
+  };
+}
+
+function hslToHex(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = ((h % 360) + 360) % 360 / 60;
+  const x = c * (1 - Math.abs(hp % 2 - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hp < 1) [r, g, b] = [c, x, 0];
+  else if (hp < 2) [r, g, b] = [x, c, 0];
+  else if (hp < 3) [r, g, b] = [0, c, x];
+  else if (hp < 4) [r, g, b] = [0, x, c];
+  else if (hp < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const m = l - c / 2;
+  const byte = (value) => Math.max(0, Math.min(255, Math.round((value + m) * 255))).toString(16).padStart(2, "0");
+  return "#" + byte(r) + byte(g) + byte(b);
+}
+
+// Display-only. Stored channel colors stay unchanged so dark theme and the picker keep the chosen hex.
+function traceColor(color) {
+  if (!lightTheme()) return color;
+  const text = String(color || "").trim();
+  const match = /^#([0-9a-fA-F]{6})$/.exec(text);
+  if (!match) return color;
+  const n = parseInt(match[1], 16);
+  const r = ((n >> 16) & 255) / 255;
+  const g = ((n >> 8) & 255) / 255;
+  const b = (n & 255) / 255;
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  if (lum < 0.55) return "#" + match[1].toLowerCase();
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const lightness = (max + min) / 2;
+  const delta = max - min;
+  const saturation = delta < 1e-6 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+  if (saturation < 0.18) return "#2c3a4a";
+  let hue = 0;
+  if (max === r) hue = ((g - b) / delta) % 6;
+  else if (max === g) hue = (b - r) / delta + 2;
+  else hue = (r - g) / delta + 4;
+  hue *= 60;
+  if (hue < 0) hue += 360;
+  return hslToHex(hue, saturation, 0.38);
+}
+
+function drawLaneBackgrounds(ctx, width, layout, palette) {
+  layout.forEach((item, index) => {
+    ctx.fillStyle = index % 2 ? palette.bgAlt : palette.bg;
+    ctx.fillRect(0, item.top, width, item.height);
+  });
+}
+
 function drawWave() {
   const metrics = rowMetrics();
   const { ctx, w, h } = prep(wave, metrics.total);
+  const palette = wavePalette();
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = "#0b0f14";
+  ctx.fillStyle = palette.bg;
   ctx.fillRect(0, 0, w, h);
   const layout = metrics.layout;
+  drawLaneBackgrounds(ctx, w, layout, palette);
   if (state.total <= 0 || layout.length === 0) {
-    ctx.fillStyle = "#8b95a6";
+    ctx.fillStyle = palette.empty;
     ctx.font = "14px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("Click Run to capture data", w / 2, h / 2);
     return;
   }
-  drawGrid(ctx, w, h, layout);
+  drawGrid(ctx, w, h, layout, palette);
   const endX = traceEndX(w);
   ctx.save();
   ctx.beginPath();
@@ -1344,8 +1436,8 @@ function drawWave() {
     if (state.hidden.has(row.key)) continue;
     const cols = state.tiles[row.tileKey || row.key];
     if (!cols) continue;
-    if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
-    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
+    if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, traceColor(row.color));
+    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, traceColor(row.color));
   }
   drawBuses(ctx, layout);
   drawCondensedRows(ctx, w, layout);
@@ -1360,10 +1452,10 @@ function drawWave() {
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.lineWidth = 3;
-    ctx.strokeStyle = "rgba(8, 12, 18, 0.9)";
+    ctx.strokeStyle = palette.halo;
     ctx.strokeText("H", 8, top + pad);
     ctx.strokeText("L", 8, top + item.height - pad);
-    ctx.fillStyle = "#d5deea";
+    ctx.fillStyle = palette.ink;
     ctx.fillText("H", 8, top + pad);
     ctx.fillText("L", 8, top + item.height - pad);
   }
@@ -1385,7 +1477,7 @@ function drawWave() {
     ctx.restore();
   }
   if (state.hoverX != null) {
-    ctx.strokeStyle = "rgba(255,255,255,0.28)";
+    ctx.strokeStyle = palette.hover;
     ctx.beginPath();
     ctx.moveTo(state.hoverX + 0.5, 0);
     ctx.lineTo(state.hoverX + 0.5, h);
@@ -1446,7 +1538,7 @@ function drawHoverBoundaries(ctx, width, layout) {
   ctx.restore();
 }
 
-function drawGrid(ctx, w, h, layout) {
+function drawGrid(ctx, w, h, layout, palette = wavePalette()) {
   const v = view();
   ctx.save();
   ctx.lineWidth = 1;
@@ -1456,7 +1548,7 @@ function drawGrid(ctx, w, h, layout) {
     if (step && isFinite(step)) {
       const startSec = sampleSeconds(v.start);
       const first = Math.ceil(startSec / step) * step;
-      ctx.strokeStyle = "rgba(86, 140, 190, 0.16)";
+      ctx.strokeStyle = palette.timeGrid;
       for (let t = first; t < startSec + span + step * 0.01; t += step) {
         const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
         ctx.beginPath();
@@ -1470,14 +1562,14 @@ function drawGrid(ctx, w, h, layout) {
     const row = item.row;
     const top = item.top;
     const rowH = item.height;
-    ctx.strokeStyle = "rgba(255,255,255,0.045)";
+    ctx.strokeStyle = palette.grid;
     ctx.beginPath();
     ctx.moveTo(0, top + 0.5);
     ctx.lineTo(w, top + 0.5);
     ctx.stroke();
     if (row.kind === "logic") {
       const pad = Math.max(8, rowH * 0.22);
-      ctx.strokeStyle = "rgba(140, 170, 200, 0.14)";
+      ctx.strokeStyle = palette.logicGuide;
       ctx.beginPath();
       ctx.moveTo(0, top + pad + 0.5);
       ctx.lineTo(w, top + pad + 0.5);
@@ -1486,12 +1578,12 @@ function drawGrid(ctx, w, h, layout) {
       ctx.stroke();
     } else if (row.kind === "analog") {
       const mid = top + rowH / 2;
-      ctx.strokeStyle = "rgba(140, 170, 200, 0.18)";
+      ctx.strokeStyle = palette.analogGuide;
       ctx.beginPath();
       ctx.moveTo(0, mid + 0.5);
       ctx.lineTo(w, mid + 0.5);
       ctx.stroke();
-      ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
+      ctx.fillStyle = palette.label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
@@ -1501,7 +1593,7 @@ function drawGrid(ctx, w, h, layout) {
     } else if (row.kind === "bus" && row.bus && (row.bus.analog || row.bus.radix === "analog")) {
       const bits = (row.bus.channels || []).length;
       const max = bits ? (1n << BigInt(bits)) - 1n : 1n;
-      ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
+      ctx.fillStyle = palette.label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
@@ -1559,7 +1651,7 @@ function drawMeasureSpan(ctx, w, h) {
     ctx.lineTo(x1 + 0.5, h);
     ctx.stroke();
     const seconds = Math.abs(span.b - span.a) / Math.max(1, state.rate);
-    ctx.fillStyle = "#d5e2ff";
+    ctx.fillStyle = wavePalette().measure;
     ctx.font = "11px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
@@ -1691,12 +1783,13 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     if (x1 < 0 || x0 > canvasW) continue;
     const width = x1 - x0;
     traceHexagon(ctx, x0, top, width, height);
+    const shown = traceColor(color || "#3d8dfd");
     ctx.save();
-    ctx.fillStyle = color || "#3d8dfd";
+    ctx.fillStyle = shown;
     ctx.globalAlpha = alpha == null ? 0.36 : alpha;
     ctx.fill();
     ctx.globalAlpha = 0.92;
-    ctx.strokeStyle = color || "#c6dcff";
+    ctx.strokeStyle = shown;
     ctx.stroke();
     ctx.restore();
     const label = labelOf(row);
@@ -1706,7 +1799,7 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     ctx.beginPath();
     ctx.rect(x0 + point, top, Math.max(0, width - point * 2), height);
     ctx.clip();
-    ctx.fillStyle = "#f7fafc";
+    ctx.fillStyle = lightTheme() && (alpha == null || alpha < 0.7) ? wavePalette().ink : "#f7fafc";
     ctx.fillText(label, x0 + point + 4, top + height / 2);
     ctx.restore();
     lastLabel = x0 + Math.min(width, ctx.measureText(label).width + point + 10);
@@ -1728,7 +1821,7 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
       const item = logicRow(layout, target.channel, target.decoderId || decoder.id, target.lane);
       if (!item) continue;
       const pad = Math.max(8, item.height * 0.22);
-      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
+      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, traceColor(item.row.color), canvasW, target.label);
     }
   }
   ctx.restore();
@@ -1802,20 +1895,20 @@ function drawCondensedRows(ctx, canvasW, layout) {
     if (format === "analog") {
       const lane = item.row.lane;
       if (lane) {
-        drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color, (row) => parseInt((row.fields || {})[lane], 16));
+        drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color), (row) => parseInt((row.fields || {})[lane], 16));
       } else {
         const fields = rows[0] && rows[0].fields;
         if (fields && (fields.mosi || fields.miso)) {
-          drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
-          drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor("#ff6b8a"), (row) => parseInt((row.fields || {}).mosi, 16));
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor("#7dcea0"), (row) => parseInt((row.fields || {}).miso, 16));
         } else {
-          drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color || "#8eb6ff", (row) => {
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color || "#8eb6ff"), (row) => {
             const values = annotationNumbers(row);
             return values.length ? values[0] : NaN;
           });
         }
       }
-      ctx.fillStyle = "rgba(176, 188, 204, 0.7)";
+      ctx.fillStyle = wavePalette().label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
@@ -1826,7 +1919,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
     const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane) : (row) => condensedLabel(row, format);
-    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, labelOf, 0.82);
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82);
   }
 }
 
@@ -1996,13 +2089,13 @@ function drawDecodeBus(ctx, item, bus) {
       }
       ctx.stroke();
     };
-    stroke("mosi", "#ff6b8a");
-    stroke("miso", "#7dcea0");
+    stroke("mosi", traceColor("#ff6b8a"));
+    stroke("miso", traceColor("#7dcea0"));
     return;
   }
   ctx.font = "12px sans-serif";
   ctx.textBaseline = "middle";
-  ctx.fillStyle = "#d5deea";
+  ctx.fillStyle = wavePalette().ink;
   let lastX = -80;
   for (const word of words) {
     const x = sampleX(word.start_sample);
@@ -2038,7 +2131,7 @@ function drawBuses(ctx, layout) {
     if (analog) {
       const max = Number((1n << BigInt(bits)) - 1n) || 1;
       ctx.beginPath();
-      ctx.strokeStyle = "#7dcea0";
+      ctx.strokeStyle = traceColor("#7dcea0");
       ctx.lineWidth = 1.4;
       let started = false;
       for (let i = 0; i < cols.length; i++) {
@@ -2055,7 +2148,7 @@ function drawBuses(ctx, layout) {
     }
     ctx.font = "12px sans-serif";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = "#d5deea";
+    ctx.fillStyle = wavePalette().ink;
     let prev = null;
     let lastX = -1e9;
     for (let i = 0; i < cols.length; i++) {
@@ -3522,17 +3615,6 @@ function rowAt(clientY) {
   return layout[layout.length - 1].row;
 }
 
-function boundaryAt(clientY) {
-  const rect = wave.getBoundingClientRect();
-  const y = clientY - rect.top;
-  const { layout } = rowMetrics();
-  for (let index = 0; index < layout.length - 1; index++) {
-    const edge = layout[index].top + layout[index].height;
-    if (Math.abs(y - edge) <= 4) return layout[index].row.key;
-  }
-  return null;
-}
-
 function placeEdgeButtons(clientY) {
   state.edgePointerY = clientY;
   const prev = document.getElementById("edge-prev");
@@ -4546,11 +4628,6 @@ function zoomAt(sample, x, factor) {
 
 wave.addEventListener("pointerdown", (ev) => {
   if (ev.button !== 0) return;
-  const boundary = state.total > 0 ? boundaryAt(ev.clientY) : null;
-  if (boundary && state.tool !== "marker" && state.tool !== "measure") {
-    startRowResize(boundary, ev.clientY);
-    return;
-  }
   if (state.total <= 0) return;
   const rect = wave.getBoundingClientRect();
   const x = ev.clientX - rect.left;
@@ -5689,6 +5766,9 @@ const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 function applyTheme() {
   const light = preferences.theme === "light" || (preferences.theme === "system" && systemTheme.matches);
   document.documentElement.dataset.theme = light ? "light" : "dark";
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
 }
 systemTheme.addEventListener("change", applyTheme);
 async function loadDecoderCatalog() {
