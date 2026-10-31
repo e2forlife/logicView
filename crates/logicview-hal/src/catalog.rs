@@ -6,8 +6,8 @@
 //! so a session can show what a stack would look like. LogicView refuses to
 //! open those ids.
 
-use std::sync::OnceLock;
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct LogicProfile {
@@ -20,15 +20,23 @@ pub struct LogicProfile {
     pub note: String,
 }
 #[derive(Deserialize)]
-struct Profiles { devices: Vec<LogicProfile> }
+struct Profiles {
+    devices: Vec<LogicProfile>,
+}
 
 /// Loads external profiles once at startup, with bundled defaults as a fallback.
 pub fn logic_profiles() -> &'static [LogicProfile] {
     static PROFILES: OnceLock<Vec<LogicProfile>> = OnceLock::new();
     PROFILES.get_or_init(|| {
         let explicit = std::env::var_os("LOGICVIEW_PROFILES").map(std::path::PathBuf::from);
-        let candidates = explicit.into_iter().chain([std::path::PathBuf::from("profiles.toml")])
-            .chain(std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.join("profiles.toml"))));
+        let candidates = explicit
+            .into_iter()
+            .chain([std::path::PathBuf::from("profiles.toml")])
+            .chain(
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.join("profiles.toml"))),
+            );
         for path in candidates {
             if let Ok(contents) = std::fs::read_to_string(&path) {
                 match toml::from_str::<Profiles>(&contents) {
@@ -38,12 +46,16 @@ pub fn logic_profiles() -> &'static [LogicProfile] {
                 }
             }
         }
-        toml::from_str::<Profiles>(include_str!("../../../profiles.toml")).expect("bundled profiles are valid").devices
+        toml::from_str::<Profiles>(include_str!("../../../profiles.toml"))
+            .expect("bundled profiles are valid")
+            .devices
     })
 }
 
 pub fn logic_profile(product_id: u16) -> Option<&'static LogicProfile> {
-    logic_profiles().iter().find(|profile| profile.product_id == product_id)
+    logic_profiles()
+        .iter()
+        .find(|profile| profile.product_id == product_id)
 }
 
 #[cfg(test)]

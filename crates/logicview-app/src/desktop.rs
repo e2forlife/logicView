@@ -72,7 +72,12 @@ fn window_icon() -> Option<Icon> {
 
 /// Hosts the local UI in a native webview and keeps it alive until the window closes.
 fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
-    enum UiEvent { PickDirectory(String), Drop(std::path::PathBuf, i32, i32) }
+    enum UiEvent {
+        PickDirectory(String),
+        PickFile(String),
+        Close,
+        Drop(std::path::PathBuf, i32, i32),
+    }
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let ipc_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
@@ -95,10 +100,23 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .with_background_color((0x0c, 0x10, 0x16, 0xff))
         .with_clipboard(true)
         .with_ipc_handler(move |request| {
-            if let Some(target) = request.body().strip_prefix("pick-directory:") {
-                if target == "preferences-firmware" || target == "preferences-scripts" {
+            let body = request.body();
+            if let Some(target) = body.strip_prefix("pick-directory:") {
+                if matches!(
+                    target,
+                    "preferences-firmware"
+                        | "preferences-scripts"
+                        | "panel-export-dir"
+                        | "dialog-export-dir"
+                ) {
                     let _ = ipc_proxy.send_event(UiEvent::PickDirectory(target.to_string()));
                 }
+            } else if let Some(kind) = body.strip_prefix("pick-file:") {
+                if matches!(kind, "load" | "import") {
+                    let _ = ipc_proxy.send_event(UiEvent::PickFile(kind.to_string()));
+                }
+            } else if body == "close" {
+                let _ = ipc_proxy.send_event(UiEvent::Close);
             }
         })
         .with_drag_drop_handler(move |event| {
@@ -146,7 +164,8 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         use tao::platform::unix::WindowBuilderExtUnix;
         splash_builder = splash_builder.with_skip_taskbar(true);
     }
-    let splash = splash_builder.build(&event_loop)
+    let splash = splash_builder
+        .build(&event_loop)
         .map_err(|err| format!("could not open the startup splash: {err}"))?;
     if let Some(monitor) = splash.current_monitor() {
         let origin = monitor.position();
@@ -157,24 +176,30 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         splash.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
     }
     #[cfg(not(windows))]
-    let html = format!(r#"<!doctype html><html><head><style>
+    let html = format!(
+        r#"<!doctype html><html><head><style>
         html,body {{ margin:0; width:100%; height:100%; overflow:hidden; background:transparent; }}
         img {{ width:100%; height:100%; object-fit:contain; }}
-        </style></head><body><img src="{origin}/assets/AppLogo.png" alt="LogicView"></body></html>"#);
+        </style></head><body><img src="{origin}/assets/AppLogo.png" alt="LogicView"></body></html>"#
+    );
     #[cfg(not(windows))]
     let splash_builder = WebViewBuilder::new()
         .with_html(html)
         .with_transparent(true)
         .with_background_color((0, 0, 0, 0));
     #[cfg(all(not(windows), not(target_os = "linux")))]
-    let splash_view = splash_builder.build(&splash)
+    let splash_view = splash_builder
+        .build(&splash)
         .map_err(|err| format!("could not display the startup splash: {err}"))?;
     #[cfg(target_os = "linux")]
     let splash_view = {
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
-        let vbox = splash.default_vbox().ok_or_else(|| "startup splash has no GTK container".to_string())?;
-        splash_builder.build_gtk(vbox)
+        let vbox = splash
+            .default_vbox()
+            .ok_or_else(|| "startup splash has no GTK container".to_string())?;
+        splash_builder
+            .build_gtk(vbox)
             .map_err(|err| format!("could not display the startup splash: {err}"))?
     };
     #[cfg(windows)]
@@ -201,6 +226,31 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                         let path = serde_json::to_string(&path.to_string_lossy()).unwrap_or_default();
                         let _ = webview.evaluate_script(&format!("window.logicviewDirectorySelected({target}, {path})"));
                     }
+                }
+                UiEvent::PickFile(kind) => {
+                    let dialog = match kind.as_str() {
+                        "load" => rfd::FileDialog::new()
+                            .set_title("Load saved capture")
+                            .add_filter("LogicView capture", &["lvcap"]),
+                        _ => rfd::FileDialog::new()
+                            .set_title("Import capture")
+                            .add_filter("Capture", &["lvcap", "dsl"]),
+                    };
+                    let chosen = dialog.pick_file();
+                    let kind_js = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into());
+                    let path_js = chosen
+                        .as_ref()
+                        .map(|path| {
+                            serde_json::to_string(&path.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "null".into())
+                        })
+                        .unwrap_or_else(|| "null".into());
+                    let _ = webview.evaluate_script(&format!(
+                        "if (window.logicviewFileSelected) window.logicviewFileSelected({kind_js}, {path_js})"
+                    ));
+                }
+                UiEvent::Close => {
+                    *control_flow = ControlFlow::Exit;
                 }
                 UiEvent::Drop(path, x, y) => {
                     let path = serde_json::json!({"value": path.to_string_lossy(), "isDirectory": path.is_dir()});

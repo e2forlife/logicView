@@ -123,6 +123,8 @@ function view() {
       measures: [],
       buses: [],
       nextBus: 1,
+      selection: [],
+      anchor: null,
       selected: null,
       names: {},
       colors,
@@ -179,6 +181,107 @@ function persistColors() {
   } catch (_) { /* the in-memory color still lasts for this session */ }
 }
 
+function sessionContainers() {
+  const list = view().buses;
+  if (!Array.isArray(list)) {
+    view().buses = [];
+    return view().buses;
+  }
+  for (const bus of list) normalizeContainerInPlace(bus);
+  return list;
+}
+
+function normalizeContainerInPlace(raw) {
+  if (!raw || typeof raw !== "object") return raw;
+  raw.type = raw.type === "group" ? "group" : "bus";
+  if (!Array.isArray(raw.members)) {
+    const channels = Array.isArray(raw.channels) ? raw.channels : [];
+    raw.members = channels.map((index) => ({ kind: "channel", index: Number(index) })).filter((member) => Number.isFinite(member.index));
+  } else {
+    raw.members = raw.members.map((member) => {
+      if (!member || typeof member !== "object") return null;
+      if (member.kind === "group") return { kind: "group", id: Number(member.id) };
+      return { kind: "channel", index: Number(member.index) };
+    }).filter((member) => member && (member.kind === "group" ? Number.isFinite(member.id) : Number.isFinite(member.index)));
+  }
+  if (!raw.radix) raw.radix = raw.analog ? "analog" : "hex";
+  if (typeof raw.msbFirst !== "boolean") raw.msbFirst = false;
+  if (typeof raw.folded !== "boolean") raw.folded = false;
+  raw.channels = raw.members.filter((member) => member.kind === "channel").map((member) => member.index);
+  return raw;
+}
+
+function nestedContainerIds() {
+  const ids = new Set();
+  for (const container of sessionContainers()) {
+    for (const member of container.members || []) {
+      if (member.kind === "group") ids.add(Number(member.id));
+    }
+  }
+  return ids;
+}
+
+function parentContainer(id) {
+  const wanted = Number(id);
+  for (const container of sessionContainers()) {
+    if ((container.members || []).some((member) => member.kind === "group" && Number(member.id) === wanted)) return container;
+  }
+  return null;
+}
+
+function descendantChannels(container, guard = 0) {
+  if (!container || guard > 32) return [];
+  const out = [];
+  for (const member of container.members || []) {
+    if (member.kind === "channel") out.push(Number(member.index));
+    else if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (child) out.push(...descendantChannels(child, guard + 1));
+    }
+  }
+  return out;
+}
+
+function containerDepth(container, guard = 0) {
+  if (!container || guard > 32) return 0;
+  const parent = parentContainer(container.id);
+  return parent ? containerDepth(parent, guard + 1) + 1 : 0;
+}
+
+function directParentOfChannel(index) {
+  const wanted = Number(index);
+  for (const container of sessionContainers()) {
+    if ((container.members || []).some((member) => member.kind === "channel" && Number(member.index) === wanted)) return container;
+  }
+  return null;
+}
+
+function ownedChannelSet() {
+  const owned = new Set();
+  for (const container of sessionContainers()) {
+    for (const member of container.members || []) {
+      if (member.kind === "channel") owned.add(Number(member.index));
+    }
+  }
+  return owned;
+}
+
+function containerHeaderRow(container, depth) {
+  const type = container.type === "group" ? "group" : "bus";
+  return {
+    key: "bus:" + container.id,
+    kind: type,
+    channel: (container.channels || [])[0] ?? 0,
+    name: container.name,
+    color: storedColor("bus:" + container.id, "#d5deea"),
+    device: "",
+    bus: container,
+    containerId: container.id,
+    depth: depth || 0,
+    header: true,
+  };
+}
+
 function sourceRows() {
   const rows = [];
   for (const channel of state.channels) rows.push(logicRowModel(channel, ""));
@@ -193,16 +296,10 @@ function sourceRows() {
       device: "",
     });
   }
-  for (const bus of view().buses || []) {
-    rows.push({
-      key: "bus:" + bus.id,
-      kind: "bus",
-      channel: bus.channels[0] ?? 0,
-      name: bus.name,
-      color: storedColor("bus:" + bus.id, "#d5deea"),
-      device: "",
-      bus,
-    });
+  const nested = nestedContainerIds();
+  for (const bus of sessionContainers()) {
+    if (nested.has(Number(bus.id))) continue;
+    rows.push(containerHeaderRow(bus, 0));
   }
   return rows;
 }
@@ -276,14 +373,17 @@ function decodeBusRow(decoder, lane, header) {
   };
 }
 
-function groupRows(decoder, source) {
+function groupRows(decoder, source, depth = 0) {
   const indexes = indexesInOrder(decoderIndexes(decoder), source);
   const channel = indexes.length ? indexes[0] : 0;
   const lanes = decodeLanes(decoder, channel);
   const byIndex = new Map(state.channels.map((item) => [item.index, item]));
   const rows = [];
   for (const [position, lane] of lanes.entries()) {
-    rows.push(decodeBusRow(decoder, lane, position === 0));
+    const header = decodeBusRow(decoder, lane, position === 0);
+    header.depth = depth;
+    header.child = depth > 0;
+    rows.push(header);
     if (decoderCondensed(decoder.id, lane.id)) continue;
     const channels = decoder.channels || {};
     const laneIndexes = decoder.protocol === "spi" && lane.id
@@ -299,58 +399,202 @@ function groupRows(decoder, source) {
       if (!signal) continue;
       const row = logicRowModel(signal, decoder.id, lane.id);
       row.child = true;
+      row.depth = depth + 1;
       rows.push(row);
     }
   }
   return rows;
 }
 
-function displayRows() {
+function isStackChild(decoder) {
+  return !!(decoder.stack_on && (state.decoders || []).some((item) => item.id === decoder.stack_on));
+}
+
+function clusterDecoders(root) {
+  const out = [root];
+  const walk = (id) => {
+    for (const decoder of state.decoders || []) {
+      if (decoder.stack_on === id && !out.includes(decoder)) {
+        out.push(decoder);
+        walk(decoder.id);
+      }
+    }
+  };
+  walk(root.id);
+  return out;
+}
+
+function clusterChannels(root) {
+  const indexes = new Set();
+  for (const decoder of clusterDecoders(root)) {
+    for (const index of decoderIndexes(decoder)) indexes.add(index);
+  }
+  return indexes;
+}
+
+function deepestContainerFor(indexes) {
+  if (!indexes.length) return null;
+  let best = null;
+  let bestDepth = -1;
+  for (const container of sessionContainers()) {
+    const owned = new Set(descendantChannels(container));
+    if (!indexes.every((index) => owned.has(index))) continue;
+    const depth = containerDepth(container);
+    if (depth >= bestDepth) {
+      best = container;
+      bestDepth = depth;
+    }
+  }
+  return best;
+}
+
+function topLevelSource() {
+  const nested = nestedContainerIds();
+  const owned = ownedChannelSet();
+  const out = [];
+  for (const row of orderedSourceRows()) {
+    if (row.kind === "logic" && owned.has(row.channel)) continue;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus && nested.has(Number(row.bus.id))) continue;
+    out.push(row);
+  }
+  return out;
+}
+
+function renderCluster(root, source, depth, containerId) {
+  const cluster = clusterDecoders(root);
+  const groups = cluster.map((decoder) => ({
+    id: decoder.id,
+    stackOn: decoder.stack_on && cluster.some((item) => item.id === decoder.stack_on) ? decoder.stack_on : "",
+    rows: groupRows(decoder, source, depth),
+  }));
+  const out = [];
+  const placed = new Set();
+  const waiting = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
+  const place = (group) => {
+    if (placed.has(group.id)) return;
+    for (const row of group.rows) {
+      const copy = Object.assign({}, row);
+      if (containerId != null) copy.containerId = containerId;
+      out.push(copy);
+    }
+    placed.add(group.id);
+    for (const child of groups) {
+      if (!placed.has(child.id) && child.stackOn === group.id) place(child);
+    }
+  };
+  const rootGroup = groups.find((group) => group.id === root.id);
+  if (rootGroup) place(rootGroup);
+  for (const group of groups) {
+    if (!placed.has(group.id) && !waiting(group)) place(group);
+  }
+  return out;
+}
+
+function renderContainer(container, depth, blocked, seen) {
+  const visiting = seen || new Set();
+  if (!container || visiting.has(Number(container.id))) return [];
+  visiting.add(Number(container.id));
+  const rows = [];
+  const header = containerHeaderRow(container, depth);
+  header.child = depth > 0;
+  rows.push(header);
+  if (container.folded) return rows;
+  const blockedChannels = blocked || new Set();
+  const roots = (state.decoders || []).filter((decoder) => {
+    if (isStackChild(decoder)) return false;
+    const owner = deepestContainerFor(decoderIndexes(decoder));
+    return owner && Number(owner.id) === Number(container.id);
+  });
+  const localClaimed = new Set(blockedChannels);
+  for (const root of roots) {
+    for (const index of clusterChannels(root)) localClaimed.add(index);
+  }
+  const emitted = new Set();
   const source = orderedSourceRows();
+  const emitRoot = (root) => {
+    if (!root || emitted.has(root.id)) return;
+    emitted.add(root.id);
+    rows.push(...renderCluster(root, source, depth + 1, container.id));
+  };
+  for (const member of container.members || []) {
+    if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (!child) continue;
+      const childChannels = new Set(descendantChannels(child));
+      const root = roots.find((decoder) => !emitted.has(decoder.id) && [...clusterChannels(decoder)].some((index) => childChannels.has(index)));
+      if (root) emitRoot(root);
+      rows.push(...renderContainer(child, depth + 1, localClaimed, visiting));
+      continue;
+    }
+    const index = Number(member.index);
+    if (blockedChannels.has(index)) continue;
+    const root = roots.find((decoder) => !emitted.has(decoder.id) && clusterChannels(decoder).has(index));
+    if (root) {
+      emitRoot(root);
+      continue;
+    }
+    if (localClaimed.has(index)) continue;
+    const signal = state.channels.find((item) => item.index === index);
+    if (!signal) continue;
+    const row = logicRowModel(signal, "");
+    row.child = true;
+    row.depth = depth + 1;
+    row.containerId = container.id;
+    rows.push(row);
+  }
+  for (const root of roots) emitRoot(root);
+  return rows;
+}
+
+function displayRows() {
+  const source = topLevelSource();
   const decoders = state.decoders || [];
-  const groups = decoders.map((decoder) => {
-    const indexes = decoderIndexes(decoder);
+  const topDecoders = decoders.filter((decoder) => {
+    if (isStackChild(decoder)) return false;
+    return !deepestContainerFor(decoderIndexes(decoder));
+  });
+  const groups = topDecoders.map((decoder) => {
+    const indexes = clusterChannels(decoder);
     let anchor = -1;
     source.forEach((row, index) => {
       if (anchor >= 0) return;
-      if (row.kind === "logic" && indexes.includes(row.channel)) anchor = index;
+      if (row.kind === "logic" && indexes.has(row.channel)) anchor = index;
     });
     return {
       id: decoder.id,
       anchor,
-      stackOn: decoder.stack_on || "",
-      rows: groupRows(decoder, source),
+      rows: renderCluster(decoder, orderedSourceRows(), 0, null),
     };
   });
   const claimed = new Set();
+  for (const decoder of topDecoders) {
+    for (const index of clusterChannels(decoder)) claimed.add(index);
+  }
+  const nestedClaims = new Set();
   for (const decoder of decoders) {
-    for (const index of decoderIndexes(decoder)) claimed.add(index);
+    if (isStackChild(decoder)) continue;
+    if (!deepestContainerFor(decoderIndexes(decoder))) continue;
+    for (const index of clusterChannels(decoder)) nestedClaims.add(index);
   }
   const out = [];
   const placed = new Set();
-  const waitingOnParent = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
   const placeGroup = (group) => {
     if (placed.has(group.id)) return;
     out.push(...group.rows);
     placed.add(group.id);
-    for (const child of groups) {
-      if (!placed.has(child.id) && child.stackOn === group.id) placeGroup(child);
-    }
   };
   source.forEach((row, index) => {
     for (const group of groups) {
-      if (group.anchor !== index || placed.has(group.id) || waitingOnParent(group)) continue;
+      if (group.anchor !== index || placed.has(group.id)) continue;
       placeGroup(group);
     }
-    if (row.kind === "logic" && claimed.has(row.channel)) return;
+    if (row.kind === "logic" && (claimed.has(row.channel) || nestedClaims.has(row.channel))) return;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus) {
+      out.push(...renderContainer(row.bus, 0, claimed));
+      return;
+    }
     out.push(row);
   });
-  let guard = groups.length + 1;
-  while (placed.size < groups.length && guard-- > 0) {
-    const next = groups.find((group) => !placed.has(group.id) && !waitingOnParent(group));
-    if (!next) break;
-    placeGroup(next);
-  }
   for (const group of groups) {
     if (!placed.has(group.id)) placeGroup(group);
   }
@@ -377,9 +621,11 @@ function channelIsEnabled(index) {
 
 function rowEnabled(row) {
   if (row.kind === "lane" || row.kind === "condense" || row.kind === "decode") return true;
-  if (row.kind === "bus") {
+  if (row.kind === "bus" || row.kind === "group") {
     if (row.bus && row.bus.decode) return true;
-    return row.bus.channels.some((index) => channelIsEnabled(index));
+    const indexes = row.bus ? descendantChannels(row.bus) : [];
+    if (!indexes.length) return true;
+    return indexes.some((index) => channelIsEnabled(index));
   }
   if (row.kind === "analog") return state.analog.length > 0;
   const probe = probeForRow(row);
@@ -554,6 +800,52 @@ function renderTabs() {
   }
 }
 
+function ensureSelection() {
+  const v = view();
+  if (!Array.isArray(v.selection)) {
+    v.selection = v.selected ? [v.selected] : [];
+    if (v.anchor == null) v.anchor = v.selected || null;
+  }
+  return v;
+}
+
+function applySelection(key, ev) {
+  const v = ensureSelection();
+  const keys = layoutRows().map((row) => row.key);
+  if (ev.shiftKey && v.anchor && keys.includes(v.anchor) && keys.includes(key)) {
+    const start = keys.indexOf(v.anchor);
+    const end = keys.indexOf(key);
+    const [lo, hi] = start < end ? [start, end] : [end, start];
+    v.selection = keys.slice(lo, hi + 1);
+  } else if (ev.ctrlKey || ev.metaKey) {
+    const next = new Set(v.selection);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    v.selection = [...next];
+    v.anchor = key;
+  } else {
+    v.selection = [key];
+    v.anchor = key;
+  }
+  v.selected = v.anchor || v.selection[0] || null;
+  state.gutterSig = "";
+  renderGutter();
+}
+
+function selectOnly(key) {
+  applySelection(key, { shiftKey: false, ctrlKey: false, metaKey: false });
+}
+
+function selectedLogicIndexes() {
+  const selected = new Set(ensureSelection().selection);
+  const indexes = [];
+  for (const row of layoutRows()) {
+    if (!selected.has(row.key) || row.kind !== "logic") continue;
+    if (!indexes.includes(row.channel)) indexes.push(row.channel);
+  }
+  return indexes;
+}
+
 let channelDrag = null;
 
 function channelKeyAt(clientY) {
@@ -583,11 +875,7 @@ function finishChannelDrag() {
   const drag = channelDrag;
   channelDrag = null;
   highlightChannel(null);
-  if (!drag.moved) {
-    view().selected = drag.key;
-    state.gutterSig = "";
-    renderGutter();
-  }
+  if (!drag.moved) selectOnly(drag.key);
 }
 
 function startChannelDrag(key, startY) {
@@ -679,7 +967,9 @@ function startRowResize(key, startY) {
 let foldAnim = null;
 
 function rowFolded(row) {
-  return row.kind === "decode" && decoderCondensed(row.decoderId, row.lane);
+  if (row.kind === "decode") return decoderCondensed(row.decoderId, row.lane);
+  if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) return !!row.bus.folded;
+  return false;
 }
 
 function foldButton(row, folded) {
@@ -702,6 +992,14 @@ function foldButton(row, folded) {
   button.addEventListener("click", (ev) => {
     ev.stopPropagation();
     foldAnim = row.key;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) {
+      row.bus.folded = !row.bus.folded;
+      state.gutterSig = "";
+      renderGutter();
+      drawWave();
+      scheduleTiles();
+      return;
+    }
     const pref = decodePref(row.decoderId);
     if (row.lane) {
       if (!pref.lanes) pref.lanes = {};
@@ -731,8 +1029,8 @@ function foldSpacer() {
 
 function renderGutter() {
   const metrics = rowMetrics();
-  const selected = view().selected;
-  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.key === selected ? "s" : "")).join("|");
+  const selected = new Set(ensureSelection().selection);
+  const sig = [...selected].join(",") + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.depth || 0) + (selected.has(item.row.key) ? "s" : "") + ((item.row.bus && item.row.bus.radix) || "") + ((item.row.bus && item.row.bus.msbFirst) ? "m" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
@@ -741,8 +1039,9 @@ function renderGutter() {
     const folded = rowFolded(row);
     const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
-    el.className = "ch" + (row.child ? " child" : "") + (row.key === selected ? " selected" : "") + (dim ? " dim" : "");
+    el.className = "ch" + (row.child ? " child" : "") + (selected.has(row.key) ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
+    if ((row.depth || 0) > 1) el.style.setProperty("--nest", ((row.depth - 1) * 14) + "px");
     el.style.height = item.height + "px";
     el.style.flex = "none";
     el.title = row.device ? `${signalName(row)} · ${row.device}` : signalName(row);
@@ -801,18 +1100,31 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    const foldable = row.kind === "decode" || ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode);
+    if (foldable) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
+      if (ev.shiftKey || ev.ctrlKey || ev.metaKey) {
+        ev.preventDefault();
+        applySelection(row.key, ev);
+        return;
+      }
       startChannelDrag(row.key, ev.clientY);
     });
-    if ((row.kind === "bus" || row.kind === "decode") && row.bus) {
-      el.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
+    el.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      if ((row.kind === "bus" || row.kind === "decode") && row.bus && row.bus.decode) {
         openBusMenu(row.bus, ev.clientX, ev.clientY);
-      });
-    }
+        return;
+      }
+      if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) {
+        openContainerMenu(row.bus, ev.clientX, ev.clientY);
+        return;
+      }
+      if (!ensureSelection().selection.includes(row.key)) selectOnly(row.key);
+      if (selectedLogicIndexes().length) openCreateGroupMenu(ev.clientX, ev.clientY);
+    });
     gutter.appendChild(el);
   }
 }
@@ -863,13 +1175,72 @@ function eyeIcon(hidden) {
 
 function moveChannel(fromKey, toKey) {
   if (!fromKey || fromKey === toKey) return;
-  const keys = orderedRows().map((row) => row.key);
+  const rows = orderedRows();
+  const from = rows.find((row) => row.key === fromKey);
+  const to = rows.find((row) => row.key === toKey);
+  if (!from || !to) return;
+  const parent = sharedMemberParent(from, to);
+  if (parent) {
+    reorderMembers(parent, from, to);
+    state.gutterSig = "";
+    renderGutter();
+    drawWave();
+    return;
+  }
+  if (isTopLevelRow(from) && isTopLevelRow(to)) reorderTopLevel(fromKey, toKey);
+}
+
+function isTopLevelRow(row) {
+  if (!row || row.decoderId) return false;
+  if (row.child && !row.header) return false;
+  return (row.depth || 0) === 0;
+}
+
+function rowMemberParent(row) {
+  if (!row) return null;
+  if (row.kind === "logic" && !row.decoderId && row.containerId != null && !row.header) {
+    return sessionContainers().find((item) => Number(item.id) === Number(row.containerId)) || null;
+  }
+  if (row.header && row.bus && (row.depth || 0) > 0) return parentContainer(row.bus.id);
+  return null;
+}
+
+function sharedMemberParent(from, to) {
+  const parent = rowMemberParent(from);
+  if (!parent || parent !== rowMemberParent(to)) return null;
+  if (memberPosition(parent, from) < 0 || memberPosition(parent, to) < 0) return null;
+  return parent;
+}
+
+function memberPosition(container, row) {
+  if (!container || !row) return -1;
+  if (row.kind === "logic" && !row.decoderId && Number(row.containerId) === Number(container.id)) {
+    return container.members.findIndex((member) => member.kind === "channel" && Number(member.index) === Number(row.channel));
+  }
+  if (row.header && row.bus && parentContainer(row.bus.id) && Number(parentContainer(row.bus.id).id) === Number(container.id)) {
+    return container.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(row.bus.id));
+  }
+  return -1;
+}
+
+function reorderMembers(container, fromRow, toRow) {
+  const from = memberPosition(container, fromRow);
+  const to = memberPosition(container, toRow);
+  if (from < 0 || to < 0 || from === to) return;
+  const [moved] = container.members.splice(from, 1);
+  container.members.splice(to, 0, moved);
+  container.channels = container.members.filter((member) => member.kind === "channel").map((member) => member.index);
+}
+
+function reorderTopLevel(fromKey, toKey) {
+  const keys = topLevelSource().map((row) => row.key);
   const from = keys.indexOf(fromKey);
   const to = keys.indexOf(toKey);
   if (from < 0 || to < 0) return;
   const [moved] = keys.splice(from, 1);
   keys.splice(to, 0, moved);
-  persistOrder(keys);
+  const keep = (view().order || []).filter((key) => !keys.includes(key));
+  persistOrder([...keys, ...keep]);
   state.gutterSig = "";
   renderGutter();
   drawWave();
@@ -1127,8 +1498,9 @@ function drawGrid(ctx, w, h, layout) {
       ctx.fillText("1 V", 6, top + 12);
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
-    } else if (row.kind === "bus" && row.bus && row.bus.analog) {
-      const max = row.bus.decode ? 255 : Math.max(1, (1 << row.bus.channels.length) - 1);
+    } else if (row.kind === "bus" && row.bus && (row.bus.analog || row.bus.radix === "analog")) {
+      const bits = (row.bus.channels || []).length;
+      const max = bits ? (1n << BigInt(bits)) - 1n : 1n;
       ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
@@ -1235,13 +1607,22 @@ function rowHiddenByDecoder(row) {
   return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId, row.lane);
 }
 
+function busRadixLabel(bus) {
+  if (!bus || bus.analog || bus.radix === "analog") return "Analog";
+  if (bus.radix === "dec") return "Decimal";
+  if (bus.radix === "bin") return "Binary";
+  if (bus.radix === "oct") return "Octal";
+  return "Hex";
+}
+
 function rowKindLabel(row) {
+  if (row.kind === "group") return "Label";
   if (row.kind === "condense" || row.kind === "decode") {
     if (row.bus && row.bus.analog) return "Analog";
     return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
   }
   if (row.kind === "analog") return "Analog";
-  if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
+  if (row.kind === "bus") return busRadixLabel(row.bus);
   return "Digital";
 }
 
@@ -1571,13 +1952,24 @@ function drawAnalog(ctx, cols, top, height, color) {
 }
 
 function busValueAt(bus, index) {
-  let value = 0;
-  for (let bit = 0; bit < bus.channels.length; bit++) {
-    const cols = state.tiles["logic:" + bus.channels[bit]];
+  const channels = bus.channels || [];
+  let value = 0n;
+  const bits = channels.length;
+  for (let bit = 0; bit < bits; bit++) {
+    const cols = state.tiles["logic:" + channels[bit]];
     const column = cols && cols[index];
-    if (column && column.valid !== false && column.last) value |= 1 << bit;
+    if (!(column && column.valid !== false && column.last)) continue;
+    const shift = bus.msbFirst ? BigInt(bits - 1 - bit) : BigInt(bit);
+    value |= 1n << shift;
   }
   return value;
+}
+
+function formatBusValue(value, radix, bits) {
+  if (radix === "dec") return value.toString(10);
+  if (radix === "bin") return value.toString(2).padStart(Math.max(1, bits), "0");
+  if (radix === "oct") return value.toString(8);
+  return "0x" + value.toString(16).toUpperCase();
 }
 
 function drawDecodeBus(ctx, item, bus) {
@@ -1630,20 +2022,28 @@ function drawBuses(ctx, layout) {
       drawDecodeBus(ctx, item, bus);
       continue;
     }
-    const cols = state.tiles["logic:" + bus.channels[0]];
+    const channels = bus.channels || [];
+    if (!channels.length) continue;
+    let cols = null;
+    for (const index of channels) {
+      const candidate = state.tiles["logic:" + index];
+      if (candidate && (!cols || candidate.length > cols.length)) cols = candidate;
+    }
     if (!cols) continue;
     const pad = Math.max(8, item.height * 0.22);
     const top = item.top + pad;
     const bot = item.top + item.height - pad;
-    const max = Math.max(1, (1 << bus.channels.length) - 1);
-    if (bus.analog) {
+    const bits = channels.length;
+    const analog = bus.analog || bus.radix === "analog";
+    if (analog) {
+      const max = Number((1n << BigInt(bits)) - 1n) || 1;
       ctx.beginPath();
       ctx.strokeStyle = "#7dcea0";
       ctx.lineWidth = 1.4;
       let started = false;
       for (let i = 0; i < cols.length; i++) {
         if (tileSample(i) >= state.total) break;
-        const y = bot - (busValueAt(bus, i) / max) * (bot - top);
+        const y = bot - (Number(busValueAt(bus, i)) / max) * (bot - top);
         const x = traceX(i);
         if (!started) {
           ctx.moveTo(x, y);
@@ -1657,15 +2057,16 @@ function drawBuses(ctx, layout) {
     ctx.textBaseline = "middle";
     ctx.fillStyle = "#d5deea";
     let prev = null;
-    let lastX = -100;
+    let lastX = -1e9;
     for (let i = 0; i < cols.length; i++) {
       if (tileSample(i) >= state.total) break;
       const value = busValueAt(bus, i);
       const x = traceX(i);
       if (prev == null) prev = value;
       if (value !== prev || i === 0) {
-        if (x - lastX > 36) {
-          ctx.fillText("0x" + value.toString(16).toUpperCase(), x + 4, (top + bot) / 2);
+        const text = formatBusValue(value, bus.radix || "hex", bits);
+        if (x - lastX > ctx.measureText(text).width + 8) {
+          ctx.fillText(text, x + 4, (top + bot) / 2);
           lastX = x;
         }
         prev = value;
@@ -1734,12 +2135,20 @@ async function runTiles() {
 function tileRequests() {
   const seen = new Set();
   const rows = [];
-  for (const row of visibleRows()) {
-    if (row.kind !== "logic" && row.kind !== "analog") continue;
-    const key = row.tileKey || row.key;
-    if (seen.has(key)) continue;
+  const add = (row, key) => {
+    if (seen.has(key)) return;
     seen.add(key);
     rows.push({ row, key });
+  };
+  for (const row of visibleRows()) {
+    if (row.kind !== "logic" && row.kind !== "analog") continue;
+    add(row, row.tileKey || row.key);
+  }
+  for (const bus of sessionContainers()) {
+    if (bus.type === "group" || bus.decode) continue;
+    for (const index of bus.channels || []) {
+      add({ kind: "logic", channel: index, tileKey: "logic:" + index }, "logic:" + index);
+    }
   }
   return rows;
 }
@@ -2034,13 +2443,7 @@ function panelHtml(name) {
       <button class="block" id="pat-prev" type="button">Previous match</button>`;
   }
   if (name === "export") {
-    return `<h2>Export</h2>
-      <button class="block" id="export-csv" type="button">Save CSV…</button>
-      <button class="block" id="export-xlsx" type="button">Save Excel…</button>
-      <button class="block" id="download" type="button">Save .lvcap…</button>
-      <button class="block" id="download-dsl" type="button">Save .dsl…</button>
-      <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">Saving a capture asks where to put the file. CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
+    return `<h2>Export</h2><div class="export-form">${exportFormHtml("panel")}</div>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -2482,13 +2885,7 @@ function bindPanel(name) {
     refreshMeasurements();
     renderMeasureList();
   }
-  if (name === "export") {
-    document.getElementById("export-csv").addEventListener("click", () => saveCaptureExport("csv"));
-    document.getElementById("export-xlsx").addEventListener("click", () => saveCaptureExport("xlsx"));
-    document.getElementById("download").addEventListener("click", () => saveCaptureExport("lvcap"));
-    document.getElementById("download-dsl").addEventListener("click", () => saveCaptureExport("dsl"));
-    document.getElementById("export-ann").addEventListener("click", exportAnnotations);
-  }
+  if (name === "export") bindExportForm("panel");
 }
 
 function renderMarkerList() {
@@ -3171,32 +3568,14 @@ function hideEdgeButtons() {
 
 function activeLogicChannel() {
   if (state.hoverKey && state.hoverKey.startsWith("logic:")) return state.hoverChannel;
-  const selected = view().selected;
+  const v = ensureSelection();
   const rows = orderedRows();
-  const chosen = rows.find((row) => row.key === selected && row.kind === "logic");
+  const anchor = rows.find((row) => row.key === v.anchor && row.kind === "logic");
+  if (anchor) return anchor.channel;
+  const chosen = rows.find((row) => v.selection.includes(row.key) && row.kind === "logic");
   if (chosen) return chosen.channel;
   const first = rows.find((row) => row.kind === "logic");
   return first ? first.channel : 0;
-}
-
-async function exportAnnotations() {
-  try {
-    const query = (state.decodeQuery || "").trim();
-    const data = await api({
-      cmd: "export_annotations",
-      session: state.active,
-      format: "csv",
-      query: query || null,
-    });
-    const blob = new Blob([data], { type: "text/csv" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = "annotations.csv";
-    link.click();
-    URL.revokeObjectURL(link.href);
-  } catch (err) {
-    statusEl.textContent = err.message;
-  }
 }
 
 async function searchPattern(forward) {
@@ -3442,6 +3821,203 @@ async function writeChosenFile(name, blob, pickerType) {
   return name;
 }
 
+const EXPORT_TYPES = [
+  { id: "csv", label: "CSV" },
+  { id: "xlsx", label: "Excel" },
+  { id: "lvcap", label: "LogicView (.lvcap)" },
+  { id: "dsl", label: "DSL (.dsl)" },
+  { id: "annotations", label: "Annotations CSV" },
+];
+
+function storedNumber(key, fallback) {
+  try {
+    const value = Number(localStorage.getItem(key));
+    if (Number.isInteger(value) && value >= 1) return value;
+  } catch (_) { /* private mode keeps the counter in memory */ }
+  return fallback;
+}
+
+function storedText(key) {
+  try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+
+let exportSerial = storedNumber("logicview-export-serial", 1);
+const exportChoice = {
+  kind: "csv",
+  directory: storedText("logicview-export-dir"),
+  filename: `Capture(${storedNumber("logicview-export-serial", 1)})`,
+};
+
+function captureFileName(n) {
+  return `Capture(${n})`;
+}
+
+function exportFormHtml(prefix) {
+  const options = EXPORT_TYPES.map((item) => {
+    const selected = item.id === exportChoice.kind ? " selected" : "";
+    return `<option value="${item.id}"${selected}>${escapeHtml(item.label)}</option>`;
+  }).join("");
+  return `<label class="field">Type
+      <select id="${prefix}-export-kind" aria-label="Export type">${options}</select>
+    </label>
+    <label class="field">Location
+      <span class="path-row export-location">
+        <input id="${prefix}-export-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Output folder" value="${escapeHtml(exportChoice.directory)}">
+        <button type="button" class="path-browse" data-path-target="${prefix}-export-dir" aria-label="Choose output folder">...</button>
+      </span>
+    </label>
+    <label class="field">File name
+      <input id="${prefix}-export-name" type="text" spellcheck="false" autocomplete="off" value="${escapeHtml(exportChoice.filename)}">
+    </label>
+    <button class="block" id="${prefix}-export-go" type="button">Export</button>
+    <p class="hint">CSV and Excel list one row per sample. A long capture is cut at Excel's row limit.</p>`;
+}
+
+function syncExportChoice(prefix) {
+  const kind = document.getElementById(`${prefix}-export-kind`);
+  const dir = document.getElementById(`${prefix}-export-dir`);
+  const name = document.getElementById(`${prefix}-export-name`);
+  if (kind) exportChoice.kind = kind.value;
+  if (dir) {
+    exportChoice.directory = dir.value;
+    try { localStorage.setItem("logicview-export-dir", dir.value); } catch (_) { /* the field still holds the path */ }
+  }
+  if (name) exportChoice.filename = name.value;
+  paintExportFields(prefix);
+}
+
+function paintExportFields(except, force) {
+  for (const prefix of ["panel", "dialog"]) {
+    if (prefix === except) continue;
+    const kind = document.getElementById(`${prefix}-export-kind`);
+    const dir = document.getElementById(`${prefix}-export-dir`);
+    const name = document.getElementById(`${prefix}-export-name`);
+    if (kind && (force || document.activeElement !== kind)) kind.value = exportChoice.kind;
+    if (dir && (force || document.activeElement !== dir)) dir.value = exportChoice.directory;
+    if (name && (force || document.activeElement !== name)) name.value = exportChoice.filename;
+  }
+}
+
+function parentDirectory(value) {
+  const trimmed = String(value || "").replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  if (index < 0) return "";
+  const parent = trimmed.slice(0, index);
+  if (/^[A-Za-z]:$/.test(parent)) return parent + "\\";
+  return parent;
+}
+
+function assignExportDirectory(input, folder) {
+  if (!input || !folder) return;
+  input.value = folder;
+  syncExportChoice(input.id.startsWith("dialog-") ? "dialog" : "panel");
+}
+
+function bindExportForm(prefix) {
+  const kind = document.getElementById(`${prefix}-export-kind`);
+  const dir = document.getElementById(`${prefix}-export-dir`);
+  const name = document.getElementById(`${prefix}-export-name`);
+  const go = document.getElementById(`${prefix}-export-go`);
+  if (!kind || !dir || !name || !go || kind.dataset.bound) return;
+  kind.dataset.bound = "1";
+  kind.addEventListener("change", () => syncExportChoice(prefix));
+  dir.addEventListener("input", () => syncExportChoice(prefix));
+  name.addEventListener("input", () => syncExportChoice(prefix));
+  go.addEventListener("click", () => runExport(prefix));
+  const row = dir.closest(".export-location") || dir;
+  row.addEventListener("dragenter", (ev) => {
+    ev.preventDefault();
+    row.classList.add("dragover");
+  });
+  row.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+    row.classList.add("dragover");
+  });
+  row.addEventListener("dragleave", (ev) => {
+    if (ev.relatedTarget && row.contains(ev.relatedTarget)) return;
+    row.classList.remove("dragover");
+  });
+  row.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    row.classList.remove("dragover");
+    const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+    const raw = file && file.path;
+    if (!raw) {
+      statusEl.textContent = "Drop a folder on the location field.";
+      return;
+    }
+    const leaf = String(raw).split(/[\\/]/).pop() || "";
+    assignExportDirectory(dir, /\.[A-Za-z0-9]{1,8}$/.test(leaf) ? parentDirectory(raw) : raw);
+  });
+}
+
+function advanceExportName() {
+  exportSerial += 1;
+  try { localStorage.setItem("logicview-export-serial", String(exportSerial)); } catch (_) { /* the next name is still shown */ }
+  exportChoice.filename = captureFileName(exportSerial);
+  paintExportFields(null, true);
+}
+
+async function runExport(prefix) {
+  syncExportChoice(prefix);
+  const directory = exportChoice.directory.trim();
+  if (!directory) {
+    statusEl.textContent = "Choose an output folder";
+    return;
+  }
+  const filename = exportChoice.filename.trim().replace(/[\\/]/g, "");
+  if (!filename || filename === "." || filename === "..") {
+    statusEl.textContent = "Enter a file name";
+    return;
+  }
+  const button = document.getElementById(`${prefix}-export-go`);
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch("/api/export-to", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: exportChoice.kind,
+        directory,
+        filename,
+        query: (state.decodeQuery || "").trim() || null,
+      }),
+    });
+    const text = await response.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch (_) { json = { error: text }; }
+    if (!response.ok || json.ok === false) throw new Error(json.error || "export failed");
+    if (json.rows != null && json.total != null && Number(json.rows) !== Number(json.total)) {
+      statusEl.textContent = `exported ${Number(json.rows).toLocaleString()} of ${Number(json.total).toLocaleString()} samples`;
+    } else {
+      statusEl.textContent = "saved " + (json.path || filename);
+    }
+    advanceExportName();
+  } catch (err) {
+    statusEl.textContent = err.message || "export failed";
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function openExportDialog() {
+  paintExportFields(null, true);
+  const dialog = document.getElementById("export-dialog");
+  const logo = dialog.querySelector(".export-logo");
+  dialog.showModal();
+  if (logo && !logo.naturalWidth) {
+    logo.removeAttribute("src");
+    logo.src = "/assets/ExportFileLogo.png";
+  }
+}
+
+function closeExportDialog() {
+  const dialog = document.getElementById("export-dialog");
+  if (dialog.open) dialog.close();
+}
+
 function setupDocument() {
   const v = view();
   const mode = document.getElementById("cursor-mode");
@@ -3456,7 +4032,9 @@ function setupDocument() {
     hidden: [...state.hidden],
     buses: v.buses || [],
     nextBus: v.nextBus || 1,
-    selected: v.selected || null,
+    selection: ensureSelection().selection,
+    anchor: v.anchor || null,
+    selected: v.anchor || null,
     colors: v.colors || {},
     markers: (v.markers || []).map((marker) => ({
       id: marker.id,
@@ -3522,8 +4100,19 @@ async function applySetup(doc) {
   v.names = doc.names && typeof doc.names === "object" ? doc.names : {};
   v.colors = doc.colors && typeof doc.colors === "object" ? doc.colors : {};
   v.buses = Array.isArray(doc.buses) ? doc.buses : [];
+  for (const bus of v.buses) normalizeContainerInPlace(bus);
   v.nextBus = Number(doc.nextBus) || v.nextBus || 1;
-  v.selected = doc.selected || null;
+  if (Array.isArray(doc.selection)) {
+    v.selection = doc.selection;
+    v.anchor = doc.anchor || doc.selection[0] || null;
+  } else if (doc.selected) {
+    v.selection = [doc.selected];
+    v.anchor = doc.selected;
+  } else {
+    v.selection = [];
+    v.anchor = null;
+  }
+  v.selected = v.anchor;
   v.markers = Array.isArray(doc.markers) ? doc.markers : [];
   const maxMarker = v.markers.reduce((max, marker) => Math.max(max, Number(marker.id) || 0), 0);
   state.nextMarker = Math.max(state.nextMarker, maxMarker + 1);
@@ -3673,6 +4262,72 @@ async function openCaptureFile(file) {
   await applyImportedCapture(json.data, file.name);
 }
 
+let pendingFilePick = null;
+
+function pickCaptureFile(kind) {
+  if (window.ipc) {
+    return new Promise((resolve) => {
+      if (pendingFilePick) pendingFilePick.resolve(null);
+      pendingFilePick = { kind, resolve };
+      window.ipc.postMessage("pick-file:" + kind);
+    });
+  }
+  const input = document.getElementById(kind === "load" ? "load-file" : "import-file");
+  return new Promise((resolve) => {
+    const onChange = () => {
+      input.removeEventListener("change", onChange);
+      const file = input.files && input.files[0];
+      input.value = "";
+      resolve(file || null);
+    };
+    input.addEventListener("change", onChange);
+    input.click();
+  });
+}
+
+window.logicviewFileSelected = (kind, path) => {
+  const pending = pendingFilePick;
+  pendingFilePick = null;
+  if (!pending || pending.kind !== kind) return;
+  pending.resolve(path || null);
+};
+
+function captureLeaf(picked) {
+  if (!picked) return "";
+  if (typeof picked === "string") return picked.split(/[\\/]/).pop() || "";
+  return picked.name || "";
+}
+
+async function openPickedCapture(picked) {
+  if (typeof picked === "string") await openNativeCapture(picked);
+  else await openCaptureFile(picked);
+}
+
+async function loadSavedCapture() {
+  const picked = await pickCaptureFile("load");
+  if (!picked) return;
+  if (!captureLeaf(picked).toLowerCase().endsWith(".lvcap")) {
+    statusEl.textContent = "Load a .lvcap capture";
+    return;
+  }
+  await openPickedCapture(picked);
+}
+
+async function importCapture() {
+  const picked = await pickCaptureFile("import");
+  if (!picked) return;
+  if (!isCaptureName(captureLeaf(picked))) {
+    statusEl.textContent = "Import a .lvcap or .dsl capture";
+    return;
+  }
+  await openPickedCapture(picked);
+}
+
+function closeLogicView() {
+  if (window.ipc) window.ipc.postMessage("close");
+  else window.close();
+}
+
 async function applyImportedCapture(data, name) {
   state.tiles = {};
   state.annotations = [];
@@ -3728,7 +4383,7 @@ function bindCaptureDrop() {
   window.addEventListener("drop", (ev) => {
     if (!dragHasFile(ev)) return;
     ev.preventDefault();
-    if (ev.target.closest && ev.target.closest(".wave-stage, #preferences-dialog")) return;
+    if (ev.target.closest && ev.target.closest(".wave-stage, #preferences-dialog, .export-location")) return;
     statusEl.textContent = "Drop the capture on the waveform";
   });
 }
@@ -4272,12 +4927,17 @@ function bindSplitters() {
 
 const MENUS = {
   file: [
-    ["Save setup…", () => saveSetup()],
-    ["Open setup…", () => document.getElementById("setup-file").click()],
-    ["Export CSV…", () => saveCaptureExport("csv")],
-    ["Export Excel…", () => saveCaptureExport("xlsx")],
-    ["Save .lvcap…", () => saveCaptureExport("lvcap")],
-    ["Save .dsl…", () => saveCaptureExport("dsl")],
+    { label: "New Capture", shortcut: "Ctrl+N", run: () => addSession() },
+    { label: "Load Saved Capture", shortcut: "Ctrl+O", run: () => loadSavedCapture() },
+    { label: "Save Capture As…", shortcut: "Ctrl+Shift+S", run: () => saveCaptureExport("lvcap") },
+    { separator: true },
+    { label: "Save setup…", run: () => saveSetup() },
+    { label: "Open setup…", run: () => document.getElementById("setup-file").click() },
+    { separator: true },
+    { label: "Export Capture…", shortcut: "Ctrl+E", run: () => openExportDialog() },
+    { label: "Import Capture…", shortcut: "Ctrl+I", run: () => importCapture() },
+    { separator: true },
+    { label: "Close LogicView", shortcut: "Alt+F4", run: () => closeLogicView() },
   ],
   edit: [["Clear markers", () => {
     view().markers = [];
@@ -4299,7 +4959,7 @@ const MENUS = {
     ["Previous edge", () => stepEdge(false)],
     ["Next edge", () => stepEdge(true)],
     ["Add marker", () => setTool("marker")],
-    ["Group channels as a bus", () => openBusDialog()],
+    ["Create group…", () => openBusDialog()],
   ],
   help: [["About...", () => document.getElementById("about-dialog").showModal()]],
 };
@@ -4350,13 +5010,30 @@ function openMenu(button) {
       pop.append(item);
     }
   }
-  for (const [label, fn] of MENUS[name]) {
+  for (const entry of MENUS[name]) {
+    if (entry && entry.separator) {
+      const separator = document.createElement("div");
+      separator.className = "menu-separator";
+      pop.append(separator);
+      continue;
+    }
+    const label = Array.isArray(entry) ? entry[0] : entry.label;
+    const run = Array.isArray(entry) ? entry[1] : entry.run;
+    const shortcut = Array.isArray(entry) ? "" : entry.shortcut;
     const item = document.createElement("button");
     item.type = "button";
-    item.textContent = label;
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.append(text);
+    if (shortcut) {
+      const key = document.createElement("span");
+      key.className = "menu-key";
+      key.textContent = shortcut;
+      item.append(key);
+    }
     item.addEventListener("click", () => {
       closeMenu();
-      fn();
+      run();
     });
     pop.appendChild(item);
   }
@@ -4468,9 +5145,39 @@ document.addEventListener("click", (ev) => {
 
 document.getElementById("about-close").addEventListener("click", () => document.getElementById("about-dialog").close());
 
+function menuChord(ev) {
+  if (ev.altKey && ev.key === "F4") return null;
+  if (!(ev.ctrlKey || ev.metaKey || ev.altKey)) return null;
+  const parts = [];
+  if (ev.ctrlKey || ev.metaKey) parts.push("Ctrl");
+  if (ev.shiftKey) parts.push("Shift");
+  if (ev.altKey) parts.push("Alt");
+  const key = ev.key.length === 1 ? ev.key.toUpperCase() : ev.key;
+  if (key === "Control" || key === "Shift" || key === "Alt" || key === "Meta") return null;
+  parts.push(key);
+  return parts.join("+");
+}
+
+function runMenuShortcut(chord) {
+  for (const entries of Object.values(MENUS)) {
+    for (const entry of entries) {
+      if (!entry || Array.isArray(entry) || entry.shortcut !== chord || typeof entry.run !== "function") continue;
+      entry.run();
+      return true;
+    }
+  }
+  return false;
+}
+
 window.addEventListener("keydown", (ev) => {
-  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open) return;
+  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open || document.getElementById("export-dialog").open) return;
   if (ev.target.matches("input, select, textarea")) return;
+  const chord = menuChord(ev);
+  if (chord && runMenuShortcut(chord)) {
+    ev.preventDefault();
+    return;
+  }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
   const key = ev.key;
   if (key === " " || key === "s" || key === "S") {
     ev.preventDefault();
@@ -4638,20 +5345,52 @@ function showTriggered() {
   }, 700);
 }
 
-function openBusDialog() {
-  const host = document.getElementById("bus-channels");
-  const probes = state.probes.length ? state.probes : state.channels;
-  host.replaceChildren();
-  for (const probe of probes) {
-    const label = document.createElement("label");
-    label.className = "check";
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.value = String(probe.index);
-    label.append(box, document.createTextNode(" " + probe.name));
-    host.appendChild(label);
+function syncGroupDialog() {
+  const type = document.querySelector('input[name="group-type"]:checked');
+  const bus = !type || type.value === "bus";
+  document.getElementById("bus-radix").classList.toggle("hidden", !bus);
+  document.getElementById("bus-msb").classList.toggle("hidden", !bus);
+  document.getElementById("group-label-note").classList.toggle("hidden", bus);
+  const count = document.querySelectorAll("#bus-channels .channel-line").length;
+  const hint = document.getElementById("bus-hint");
+  const submit = document.querySelector("#bus-form button[type=submit]");
+  const msb = document.getElementById("bus-msb-first");
+  if (bus && count < 2) hint.textContent = "A bus needs at least two channels";
+  else if (!count) hint.textContent = "Select a logic channel";
+  else if (bus) hint.textContent = msb && msb.checked ? "Top channel is the high bit" : "Top channel is the low bit";
+  else hint.textContent = "";
+  if (submit) submit.disabled = (bus && count < 2) || !count;
+  const name = document.getElementById("bus-name");
+  if (/^(Bus|Group) \d+$/.test(name.value)) {
+    name.value = (bus ? "Bus " : "Group ") + name.value.split(" ")[1];
   }
-  document.getElementById("bus-name").value = "Bus " + (view().nextBus || 1);
+}
+
+function openBusDialog() {
+  const indexes = selectedLogicIndexes();
+  if (!indexes.length) {
+    statusEl.textContent = "Select logic channels, then create a group";
+    return;
+  }
+  const host = document.getElementById("bus-channels");
+  host.replaceChildren();
+  for (const index of indexes) {
+    const channel = state.channels.find((item) => item.index === index);
+    const line = document.createElement("div");
+    line.className = "channel-line";
+    line.textContent = channel ? channel.name : ("Channel " + index);
+    host.appendChild(line);
+  }
+  const type = indexes.length >= 2 ? "bus" : "group";
+  const radio = document.querySelector(`input[name="group-type"][value="${type}"]`);
+  if (radio) radio.checked = true;
+  const hex = document.querySelector('input[name="bus-radix"][value="hex"]');
+  if (hex) hex.checked = true;
+  const msb = document.getElementById("bus-msb-first");
+  if (msb) msb.checked = true;
+  const name = document.getElementById("bus-name");
+  name.value = (type === "group" ? "Group " : "Bus ") + (view().nextBus || 1);
+  syncGroupDialog();
   document.getElementById("bus-dialog").classList.remove("hidden");
 }
 
@@ -4664,6 +5403,12 @@ function closeBusMenu() {
   if (menu) menu.classList.add("hidden");
 }
 
+function placeBusMenu(menu, x, y) {
+  menu.classList.remove("hidden");
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+}
+
 function openBusMenu(bus, x, y) {
   const menu = document.getElementById("bus-menu");
   menu.replaceChildren();
@@ -4671,38 +5416,171 @@ function openBusMenu(bus, x, y) {
   item.type = "button";
   item.textContent = bus.analog ? "Hex view" : "Analog view";
   item.addEventListener("click", () => {
-    if (bus.decode) {
-      const analog = !bus.analog;
-      if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
-      state.spiView[bus.decode].analog = analog;
-      const pref = decodePref(bus.decode);
-      if (analog) pref.format = "analog";
-      else if (pref.format === "analog") pref.format = "hex";
-    } else {
-      bus.analog = !bus.analog;
-    }
+    const analog = !bus.analog;
+    if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
+    state.spiView[bus.decode].analog = analog;
+    const pref = decodePref(bus.decode);
+    if (analog) pref.format = "analog";
+    else if (pref.format === "analog") pref.format = "hex";
     state.gutterSig = "";
     closeBusMenu();
     renderGutter();
     drawWave();
   });
   menu.append(item);
-  if (!bus.decode) {
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.textContent = "Remove bus";
-    remove.addEventListener("click", () => {
-      view().buses = view().buses.filter((entry) => entry.id !== bus.id);
-      state.gutterSig = "";
+  placeBusMenu(menu, x, y);
+}
+
+function openCreateGroupMenu(x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  const item = document.createElement("button");
+  item.type = "button";
+  item.textContent = "Create group…";
+  item.addEventListener("click", () => {
+    closeBusMenu();
+    openBusDialog();
+  });
+  menu.append(item);
+  placeBusMenu(menu, x, y);
+}
+
+function openContainerMenu(bus, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  if (bus.type !== "group") {
+    for (const [value, label] of [["hex", "Hex"], ["dec", "Decimal"], ["bin", "Binary"], ["oct", "Octal"]]) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.textContent = (bus.radix === value ? "✓ " : "") + label;
+      item.addEventListener("click", () => {
+        bus.radix = value;
+        bus.analog = false;
+        state.gutterSig = "";
+        closeBusMenu();
+        renderGutter();
+        drawWave();
+      });
+      menu.append(item);
+    }
+    const msb = document.createElement("button");
+    msb.type = "button";
+    msb.textContent = (bus.msbFirst ? "✓ " : "") + "MSB first";
+    msb.addEventListener("click", () => {
+      bus.msbFirst = !bus.msbFirst;
       closeBusMenu();
-      renderGutter();
       drawWave();
     });
-    menu.append(remove);
+    menu.append(msb);
   }
-  menu.classList.remove("hidden");
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = bus.type === "group" ? "Remove group" : "Remove bus";
+  remove.addEventListener("click", () => {
+    removeContainer(bus.id);
+    closeBusMenu();
+  });
+  menu.append(remove);
+  placeBusMenu(menu, x, y);
+}
+
+function deleteEmptyContainers() {
+  let guard = view().buses.length + 1;
+  while (guard-- > 0) {
+    const empty = new Set(view().buses.filter((container) => !(container.members || []).length).map((container) => Number(container.id)));
+    if (!empty.size) return;
+    for (const container of view().buses) {
+      container.members = (container.members || []).filter((member) => !(member.kind === "group" && empty.has(Number(member.id))));
+      container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+    }
+    view().buses = view().buses.filter((container) => !empty.has(Number(container.id)));
+  }
+}
+
+function placeTopLevelOrder(container, channelIndexes) {
+  const key = "bus:" + container.id;
+  const order = (view().order && view().order.length ? [...view().order] : sourceRows().map((row) => row.key)).filter((item) => item !== key);
+  const firstAt = order.indexOf("logic:" + channelIndexes[0]);
+  if (firstAt >= 0) order.splice(firstAt, 0, key);
+  else order.unshift(key);
+  persistOrder(order);
+}
+
+function removeContainer(id) {
+  const container = sessionContainers().find((item) => Number(item.id) === Number(id));
+  if (!container) return;
+  const parent = parentContainer(id);
+  const members = container.members || [];
+  if (parent) {
+    const at = parent.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(id));
+    const rest = parent.members.filter((_, index) => index !== at);
+    const insert = at < 0 ? rest.length : at;
+    parent.members = [...rest.slice(0, insert), ...members, ...rest.slice(insert)];
+    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  } else {
+    const order = view().order ? [...view().order] : [];
+    const at = order.indexOf("bus:" + id);
+    const childKeys = members.filter((member) => member.kind === "group").map((member) => "bus:" + member.id);
+    if (at >= 0) order.splice(at, 1, ...childKeys);
+    else order.push(...childKeys);
+    if (order.length) persistOrder(order.filter((key) => key !== "bus:" + id));
+  }
+  view().buses = view().buses.filter((item) => Number(item.id) !== Number(id));
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function createChannelGroup(type, name, radix, msbFirst) {
+  const indexes = selectedLogicIndexes();
+  if (type === "bus" && indexes.length < 2) {
+    statusEl.textContent = "A bus needs at least two channels";
+    return false;
+  }
+  if (!indexes.length) {
+    statusEl.textContent = "Select a logic channel";
+    return false;
+  }
+  const v = view();
+  const used = sessionContainers().reduce((max, container) => Math.max(max, Number(container.id) || 0), 0);
+  const id = Math.max(v.nextBus || 1, used + 1);
+  v.nextBus = id + 1;
+  const container = {
+    id,
+    name,
+    type,
+    members: indexes.map((index) => ({ kind: "channel", index })),
+    channels: indexes.slice(),
+    radix: type === "bus" ? radix : "hex",
+    msbFirst: type === "bus" ? !!msbFirst : false,
+    folded: false,
+    analog: false,
+  };
+  const parents = indexes.map((index) => directParentOfChannel(index));
+  const shared = parents[0] && parents.every((parent) => parent && parent.id === parents[0].id);
+  if (shared) {
+    const parent = parents[0];
+    let first = parent.members.findIndex((member) => member.kind === "channel" && indexes.includes(Number(member.index)));
+    if (first < 0) first = parent.members.length;
+    parent.members = parent.members.filter((member) => !(member.kind === "channel" && indexes.includes(Number(member.index))));
+    parent.members.splice(first, 0, { kind: "group", id });
+    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => member.index);
+    v.buses.push(container);
+  } else {
+    for (const existing of sessionContainers()) {
+      existing.members = (existing.members || []).filter((member) => !(member.kind === "channel" && indexes.includes(Number(member.index))));
+      existing.channels = existing.members.filter((member) => member.kind === "channel").map((member) => member.index);
+    }
+    v.buses.push(container);
+    deleteEmptyContainers();
+    placeTopLevelOrder(container, indexes);
+  }
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+  return true;
 }
 
 function channelSpec(channel) {
@@ -4888,15 +5766,30 @@ document.addEventListener("click", (ev) => {
     document.getElementById("mcp-open").setAttribute("aria-expanded", "false");
   }
 });
-for (const button of document.querySelectorAll(".path-browse")) {
-  button.addEventListener("click", () => {
-    if (window.ipc) window.ipc.postMessage("pick-directory:" + button.dataset.pathTarget);
-    else document.getElementById("preferences-error").textContent = "Folder selection is available in the desktop app; enter a path here.";
-  });
-}
+document.addEventListener("click", (ev) => {
+  const source = ev.target.nodeType === 1 ? ev.target : ev.target.parentElement;
+  const button = source && source.closest(".path-browse");
+  if (!button) return;
+  if (window.ipc) {
+    window.ipc.postMessage("pick-directory:" + button.dataset.pathTarget);
+    return;
+  }
+  const message = "Folder selection is available in the desktop app; enter a path here.";
+  if (String(button.dataset.pathTarget || "").startsWith("preferences-")) {
+    document.getElementById("preferences-error").textContent = message;
+  } else {
+    statusEl.textContent = message;
+  }
+});
 window.logicviewDirectorySelected = (target, path) => {
-  if (!document.getElementById("preferences-dialog").open) return;
-  if (target === "preferences-firmware" || target === "preferences-scripts") document.getElementById(target).value = path;
+  const input = document.getElementById(target);
+  if (!input) return;
+  const preferences = target === "preferences-firmware" || target === "preferences-scripts";
+  if (preferences && !document.getElementById("preferences-dialog").open) return;
+  input.value = path;
+  if (target === "panel-export-dir" || target === "dialog-export-dir") {
+    syncExportChoice(target.startsWith("dialog-") ? "dialog" : "panel");
+  }
 };
 window.logicviewNativeDrop = (path, x, y) => {
   const target = document.elementFromPoint(x / window.devicePixelRatio, y / window.devicePixelRatio);
@@ -4905,14 +5798,27 @@ window.logicviewNativeDrop = (path, x, y) => {
     else document.getElementById("preferences-error").textContent = "Drop a folder on the directory field.";
     return;
   }
+  const row = target && target.closest && target.closest(".export-location");
+  if (row) {
+    const input = row.querySelector("input");
+    const folder = path.isDirectory ? path.value : parentDirectory(path.value);
+    if (!input || !folder) {
+      statusEl.textContent = "Drop a folder on the location field.";
+      return;
+    }
+    assignExportDirectory(input, folder);
+    return;
+  }
   if (target && target.closest(".wave-stage") && !path.isDirectory && isCaptureName(path.value)) openNativeCapture(path.value);
 };
 async function openNativeCapture(path) {
   try {
     const response = await fetch("/api/import-path", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
-    const json = await response.json();
+    const text = await response.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch (_) { json = { error: text }; }
     if (!response.ok || !json.ok) throw new Error(json.error || "Could not open capture");
-    applyImportedCapture(json.data, path.split(/[\\/]/).pop());
+    await applyImportedCapture(json.data, path.split(/[\\/]/).pop());
   } catch (err) { statusEl.textContent = err.message; }
 }
 
@@ -4971,6 +5877,13 @@ async function boot() {
 
 fillColorSwatches();
 bindCaptureDrop();
+document.getElementById("export-dialog-fields").innerHTML = exportFormHtml("dialog");
+bindExportForm("dialog");
+document.getElementById("export-dialog-cancel").addEventListener("click", closeExportDialog);
+document.getElementById("export-dialog-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  runExport("dialog");
+});
 document.getElementById("save-cancel").addEventListener("click", closeSaveDialog);
 document.getElementById("save-form").addEventListener("submit", (ev) => confirmSave(ev));
 document.getElementById("save-form").addEventListener("keydown", (ev) => {
@@ -4990,21 +5903,20 @@ document.getElementById("setup-file").addEventListener("change", (ev) => {
   if (file) openSetupFile(file);
 });
 document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
+for (const radio of document.querySelectorAll('input[name="group-type"]')) {
+  radio.addEventListener("change", syncGroupDialog);
+}
+document.getElementById("bus-msb-first").addEventListener("change", syncGroupDialog);
 document.getElementById("bus-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const channels = [...document.querySelectorAll("#bus-channels input:checked")].map((box) => Number(box.value));
-  if (channels.length < 2) {
-    statusEl.textContent = "A bus needs at least two channels";
-    return;
-  }
+  const type = document.querySelector('input[name="group-type"]:checked');
+  const radix = document.querySelector('input[name="bus-radix"]:checked');
+  const groupType = type ? type.value : "bus";
   const v = view();
-  const name = document.getElementById("bus-name").value.trim() || ("Bus " + v.nextBus);
-  v.buses.push({ id: v.nextBus, name, channels, analog: false });
-  v.nextBus += 1;
-  state.gutterSig = "";
-  closeBusDialog();
-  renderGutter();
-  drawWave();
+  const fallback = (groupType === "group" ? "Group " : "Bus ") + (v.nextBus || 1);
+  const name = document.getElementById("bus-name").value.trim() || fallback;
+  const created = createChannelGroup(groupType, name, radix ? radix.value : "hex", document.getElementById("bus-msb-first").checked);
+  if (created) closeBusDialog();
 });
 
 document.getElementById("decode-config-cancel").addEventListener("click", closeDecodeConfig);

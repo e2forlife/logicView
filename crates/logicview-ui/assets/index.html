@@ -181,11 +181,28 @@
     </form>
   </div>
   <input id="setup-file" type="file" accept=".json,.lvsetup,application/json" hidden>
-  <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Group a bus">
+  <input id="load-file" type="file" accept=".lvcap,application/zip" hidden>
+  <input id="import-file" type="file" accept=".lvcap,.dsl,application/zip" hidden>
+  <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Create a group">
     <form class="wait-card bus-card" id="bus-form">
-      <h2>Group a bus</h2>
+      <h2>Create group</h2>
       <label class="field">Name <input id="bus-name" type="text" value="Bus 1"></label>
+      <fieldset class="theme-choices">
+        <legend>Type</legend>
+        <label><input type="radio" name="group-type" value="bus" checked><span>Bus</span></label>
+        <label><input type="radio" name="group-type" value="group"><span>Group</span></label>
+      </fieldset>
+      <fieldset id="bus-radix" class="theme-choices">
+        <legend>Display</legend>
+        <label><input type="radio" name="bus-radix" value="hex" checked><span>Hex</span></label>
+        <label><input type="radio" name="bus-radix" value="dec"><span>Decimal</span></label>
+        <label><input type="radio" name="bus-radix" value="bin"><span>Binary</span></label>
+        <label><input type="radio" name="bus-radix" value="oct"><span>Octal</span></label>
+      </fieldset>
+      <label id="bus-msb" class="mcp-switch"><input id="bus-msb-first" type="checkbox" role="switch" checked><span>MSB first</span></label>
+      <p id="group-label-note" class="hint hidden">Display <b>Label</b></p>
       <div id="bus-channels"></div>
+      <p id="bus-hint" class="hint"></p>
       <div class="bus-actions">
         <button type="button" id="bus-cancel">Cancel</button>
         <button type="submit">Create</button>
@@ -199,6 +216,16 @@
     <p class="mcp-note">Port changes apply after disabling and re-enabling the server.</p>
     <p id="mcp-error" class="mcp-error" role="alert"></p>
   </section>
+  <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-dialog-title">
+    <form id="export-dialog-form">
+      <img class="export-logo" src="/assets/ExportFileLogo.png" alt="">
+      <h2 id="export-dialog-title" class="sr-only">Export capture</h2>
+      <div id="export-dialog-fields" class="export-form"></div>
+      <div class="export-actions">
+        <button type="button" id="export-dialog-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="preferences-dialog" class="preferences-dialog" aria-labelledby="preferences-title">
     <form id="preferences-form">
       <h2 id="preferences-title">Preferences</h2>

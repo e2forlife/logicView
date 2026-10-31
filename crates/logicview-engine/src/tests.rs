@@ -667,26 +667,50 @@ async fn imported_capture_bytes_replace_the_open_session() {
 async fn plus_ten_ms_capture_pipeline() {
     let engine = Engine::new();
     engine.connect("usb:2a0e:0020").await.unwrap();
-    engine.configure(None, SessionConfig {
-        sample_rate_hz: 100_000_000,
-        duration_ms: 10,
-        channel_enable: 0x0f,
-        ..SessionConfig::default()
-    }).await.unwrap();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 100_000_000,
+                duration_ms: 10,
+                channel_enable: 0x0f,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
     let started = std::time::Instant::now();
     engine.start(None, StartMode::Normal).await.unwrap();
-    let status = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
-    eprintln!("engine capture: {:?}, {} samples, phase {}, error {:?}", started.elapsed(), status.sample_count, status.phase, status.error);
+    let status = engine
+        .wait_until_settled("ses-1", Duration::from_secs(15))
+        .await
+        .unwrap();
+    eprintln!(
+        "engine capture: {:?}, {} samples, phase {}, error {:?}",
+        started.elapsed(),
+        status.sample_count,
+        status.phase,
+        status.error
+    );
     assert_eq!(status.phase, "stopped");
     assert_eq!(status.sample_count, 1_000_000);
-    engine.configure(None, SessionConfig {
-        sample_rate_hz: 100_000_000,
-        duration_ms: 50,
-        channel_enable: 0x0f,
-        ..SessionConfig::default()
-    }).await.unwrap();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 100_000_000,
+                duration_ms: 50,
+                channel_enable: 0x0f,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
     engine.start(None, StartMode::Normal).await.unwrap();
-    let long = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
+    let long = engine
+        .wait_until_settled("ses-1", Duration::from_secs(15))
+        .await
+        .unwrap();
     assert_eq!(long.phase, "stopped", "{:?}", long.error);
     assert_eq!(long.sample_count, 5_000_000);
 }
@@ -718,7 +742,11 @@ async fn combined_usb_catalog_rates_and_refusals() {
     let engine = Engine::new();
     {
         let mut state = engine.shared.state.lock().await;
-        let slot = state.slots.iter_mut().find(|slot| slot.id == "ses-1").unwrap();
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
         install_usb_catalog(
             slot,
             &[
@@ -742,10 +770,7 @@ async fn combined_usb_catalog_rates_and_refusals() {
         .attach_device(None, "usb:2a0e:0020")
         .await
         .unwrap_err();
-    assert!(
-        same.to_string().contains("same product"),
-        "{same}"
-    );
+    assert!(same.to_string().contains("same product"), "{same}");
 
     engine
         .configure(
@@ -809,7 +834,10 @@ async fn combined_usb_catalog_rates_and_refusals() {
         .await
         .unwrap();
     let trigger = engine.start(None, StartMode::Normal).await.unwrap_err();
-    assert!(trigger.to_string().contains("hardware trigger"), "{trigger}");
+    assert!(
+        trigger.to_string().contains("hardware trigger"),
+        "{trigger}"
+    );
 
     engine
         .configure(
@@ -837,8 +865,14 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
     engine.attach_device(None, "usb:2a0e:002c").await.unwrap();
     let attached = engine.status(None).await.unwrap();
     assert_eq!(attached.probes.len(), 48);
-    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:0020"));
-    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:002c"));
+    assert!(attached
+        .devices
+        .iter()
+        .any(|device| device.id == "usb:2a0e:0020"));
+    assert!(attached
+        .devices
+        .iter()
+        .any(|device| device.id == "usb:2a0e:002c"));
     engine
         .configure(
             None,
@@ -861,7 +895,11 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
         .unwrap();
     assert_eq!(status.phase, "stopped", "{:?}", status.error);
     assert!(status.error.is_none());
-    assert!(status.sample_count > 0, "sample_count {}", status.sample_count);
+    assert!(
+        status.sample_count > 0,
+        "sample_count {}",
+        status.sample_count
+    );
     assert_eq!(status.channels.len(), 48);
     assert_eq!(status.channels[0].device_id, "usb:2a0e:0020");
     assert_eq!(status.channels[16].device_id, "usb:2a0e:002c");
@@ -877,8 +915,6 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
     );
     eprintln!(
         "combined buffer: {} samples, plus {}, u3 {}",
-        status.sample_count,
-        status.channels[0].name,
-        status.channels[16].name
+        status.sample_count, status.channels[0].name, status.channels[16].name
     );
 }

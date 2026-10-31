@@ -658,10 +658,18 @@ mod tests {
     /// Checks that cached waveform summaries preserve the transitions found in original samples.
     #[test]
     fn aligned_word_summary_counts_transitions() {
-        for word in [0, u64::MAX, 0x5555_5555_5555_5555, 0x8000_0000_0000_0001, 0x1278_351f_0000_8c31] {
+        for word in [
+            0,
+            u64::MAX,
+            0x5555_5555_5555_5555,
+            0x8000_0000_0000_0001,
+            0x1278_351f_0000_8c31,
+        ] {
             let bytes = word.to_le_bytes();
             let summary = super::scan(&bytes, 0, 64);
-            let edges = (1..64).filter(|&i| ((word >> i) & 1) != ((word >> (i - 1)) & 1)).count() as u16;
+            let edges = (1..64)
+                .filter(|&i| ((word >> i) & 1) != ((word >> (i - 1)) & 1))
+                .count() as u16;
             assert_eq!(summary.edges, edges);
             assert_eq!(summary.first, word & 1 != 0);
             assert_eq!(summary.last, word >> 63 != 0);

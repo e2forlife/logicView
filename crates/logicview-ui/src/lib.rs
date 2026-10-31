@@ -45,6 +45,7 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
+const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
 const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
@@ -80,6 +81,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/app.js", get(js))
         .route("/assets/settings.svg", get(settings_icon))
         .route("/assets/AppLogo.png", get(app_logo))
+        .route("/assets/ExportFileLogo.png", get(export_logo))
         .route("/assets/E2logo.png", get(e2_logo))
         .route("/api/contributors", get(contributors_json))
         .route(
@@ -98,6 +100,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/api/export/dsl", get(export_dsl))
         .route("/api/export/csv", get(export_csv))
         .route("/api/export/xlsx", get(export_xlsx))
+        .route("/api/export-to", post(export_to))
         .route(
             "/api/import",
             post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
@@ -164,6 +167,11 @@ async fn index() -> impl IntoResponse {
 /// Serves the embedded splash artwork to the desktop webview.
 async fn app_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], APP_LOGO)
+}
+
+/// Serves the export dialog artwork.
+async fn export_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EXPORT_LOGO)
 }
 
 /// Serves the locally embedded Material Symbols settings icon.
@@ -395,6 +403,115 @@ async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
         file.rows,
         file.total,
     ))
+}
+
+/// Folder, file name, and format for a capture written by the export form.
+#[derive(Deserialize)]
+struct ExportTo {
+    kind: String,
+    directory: std::path::PathBuf,
+    filename: String,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Builds the requested export and saves it under the chosen folder.
+async fn export_to(
+    State(app): State<AppState>,
+    Json(input): Json<ExportTo>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let meta = std::fs::metadata(&input.directory).map_err(|err| export_error(err.to_string()))?;
+    if !meta.is_dir() {
+        return Err(export_error("Choose an existing folder"));
+    }
+    let (ext, bytes, rows, total) = match input.kind.as_str() {
+        "csv" => {
+            let file = app
+                .engine
+                .export_samples_csv(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".csv", file.body, Some(file.rows), Some(file.total))
+        }
+        "xlsx" => {
+            let file = app
+                .engine
+                .export_samples_xlsx(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".xlsx", file.body, Some(file.rows), Some(file.total))
+        }
+        "lvcap" => {
+            let status = app
+                .engine
+                .status(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            if status.sample_count == 0 {
+                return Err(export_error("nothing captured yet"));
+            }
+            let bytes = app
+                .engine
+                .export_zip(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".lvcap", bytes, None, None)
+        }
+        "dsl" => {
+            let bytes = app
+                .engine
+                .export_dsl(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".dsl", bytes, None, None)
+        }
+        "annotations" => {
+            let text = app
+                .engine
+                .export_annotations(None, "csv", input.query.as_deref())
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".csv", text.into_bytes(), None, None)
+        }
+        _ => return Err(export_error("Unknown export type")),
+    };
+    let name = safe_export_name(&input.filename, ext)?;
+    let path = input.directory.join(&name);
+    if path.file_name().and_then(|value| value.to_str()) != Some(name.as_str()) {
+        return Err(export_error("Enter a file name without a folder"));
+    }
+    std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "path": path.to_string_lossy(),
+        "rows": rows,
+        "total": total,
+    })))
+}
+
+/// Rejects a file name that would escape the chosen folder, and adds the format extension.
+fn safe_export_name(raw: &str, ext: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains(['/', '\\', '\0'])
+    {
+        return Err(export_error("Enter a file name without a folder"));
+    }
+    if trimmed.to_ascii_lowercase().ends_with(ext) {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("{trimmed}{ext}"))
+    }
+}
+
+/// Reports an export problem as JSON the page can show in the status line.
+fn export_error(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok": false, "error": message.into()})),
+    )
 }
 
 /// Downloads individual capture samples as an Excel workbook.
@@ -1304,6 +1421,25 @@ mod tests {
         assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
         let logo_bytes = logo.into_body().collect().await.unwrap().to_bytes();
         assert!(logo_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let export_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/ExportFileLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export_logo.status(), StatusCode::OK);
+        assert_eq!(export_logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(export_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
         let e2_logo = app
             .clone()
             .oneshot(
@@ -1351,10 +1487,12 @@ mod tests {
         assert!(html.contains("id=\"device-select\""));
         assert!(html.contains("id=\"device-name\""));
         assert!(html.contains("id=\"cursor-mode\""));
-        assert!(html.contains("id=\"trig-arm\""));
+        assert!(html.contains("id=\"export-dialog\""));
+        assert!(html.contains("ExportFileLogo.png"));
         assert!(html.contains("id=\"trig-kind\""));
         assert!(html.contains("id=\"trig-channel\""));
         assert!(html.contains("id=\"trig-pre\""));
+        assert!(html.contains("class=\"tool-divider\""));
         assert!(html.contains("about-copy-app"));
         assert!(html.contains("about-copy-e2"));
         assert!(html.contains("passionate about engineering"));
@@ -1373,7 +1511,7 @@ mod tests {
         let credits_body = credits.into_body().collect().await.unwrap().to_bytes();
         let credits_json: Value = serde_json::from_slice(&credits_body).unwrap();
         assert_eq!(credits_json[0]["name"], "Chuck");
-        assert!(!credits_json[0]["contribution"].as_str().unwrap().is_empty());
+        assert!(credits_json[0]["contribution"].as_str().unwrap().len() > 0);
         assert!(!html.contains("DreamSourceLab"));
         assert!(!html.contains(">Instant<"));
         assert!(!html.contains("Use Demo"));
@@ -1814,6 +1952,105 @@ mod tests {
         assert!(xlsx.windows(6).any(|window| window == b"time_s"));
         assert!(xlsx.windows(3).any(|window| window == b"CLK"));
         assert!(xlsx.windows(4).any(|window| window == b"SINE"));
+    }
+
+    /// Writes a capture into a chosen folder and rejects a path that is not a folder.
+    #[tokio::test]
+    async fn export_to_writes_the_chosen_folder() {
+        let app = router(Engine::new());
+        let missing = std::env::temp_dir().join("logicview-export-missing");
+        let _ = std::fs::remove_dir_all(&missing);
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": missing,
+                            "filename": "Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+
+        let dir = std::env::temp_dir().join(format!("logicview-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": dir,
+                            "filename": "../Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::BAD_REQUEST);
+
+        let saved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": &dir,
+                            "filename": "Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(saved.status().is_success());
+        let body = saved.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        let written = std::fs::read(dir.join("Capture(1).csv")).unwrap();
+        assert!(written.starts_with(b"time_s"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Checks that the UI listener stays on the local host.
