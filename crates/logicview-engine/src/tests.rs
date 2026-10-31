@@ -295,10 +295,31 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
         .await
         .unwrap();
 
+    let lua_channels = BTreeMap::from([
+        ("clk".into(), "demo:spi/SCK".into()),
+        ("mosi".into(), "demo:spi/MOSI".into()),
+        ("miso".into(), "demo:spi/MISO".into()),
+        ("cs".into(), "demo:spi/CS".into()),
+    ]);
+    let lua_spi = engine
+        .add_decoder(None, "1:spi", &lua_channels, &BTreeMap::new(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(lua_spi.channels.len(), 4);
+    let updated = engine
+        .update_decoder(None, &lua_spi.id, &lua_channels, &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(updated.channels.len(), 4);
+
     let rows = engine
         .read_annotations(None, None, None, None, None, 0, 5_000)
         .await
         .unwrap();
+    assert!(
+        rows.iter().any(|row| row.decoder == lua_spi.id),
+        "Lua SPI should emit annotations"
+    );
     assert!(rows.iter().any(|row| {
         row.protocol == "i2c"
             && row.class == "address"

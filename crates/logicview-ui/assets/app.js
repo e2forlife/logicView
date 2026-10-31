@@ -1992,8 +1992,12 @@ function dataLineTargets(decoder) {
     const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
     return [{ channel: parent && parent.channels ? parent.channels.sda : null, decoderId: parent && parent.id, label: text }];
   }
-  const first = Object.values(channels)[0];
-  return [{ channel: first, label: text }];
+  const schema = (state.decoderCatalog || []).find((item) => item.id === decoder.protocol);
+  const names = [...(schema?.channels || []), ...(schema?.optional_channels || [])];
+  const first = names.find((name) => channels[name] != null);
+  if (first != null) return [{ channel: channels[first], label: text }];
+  const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
+  return parent ? dataLineTargets(parent).map((target) => ({ ...target, decoderId: target.decoderId || parent.id, label: text })) : [];
 }
 
 function traceHexagon(ctx, x, y, w, h) {
@@ -4189,17 +4193,19 @@ function emitsProtocol(protocol, expected) {
   return Array.isArray(schema?.outputs) && schema.outputs.includes(expected);
 }
 
-async function addDecoder(protocol) {
+async function addDecoder(protocol, channelIndex) {
   protocol = protocol || protocolToAdd();
   if (!protocol) return;
   try {
     const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
     const parent = schema?.stack_on && state.decoders.find((row) => emitsProtocol(row.protocol, schema.stack_on));
+    const firstInput = [...(schema?.channels || []), ...(schema?.optional_channels || [])][0];
+    const channels = channelIndex != null && firstInput ? { [firstInput]: channelSpecByIndex(channelIndex) } : {};
     const created = await api({
       cmd: "add_decoder",
       session: state.active,
       protocol,
-      channels: {},
+      channels,
       stack_on: parent ? parent.id : null,
     });
     state.selectedDecoder = created.id;
@@ -4406,7 +4412,7 @@ function rowAt(clientY) {
   for (const item of layout) {
     if (y >= item.top && y < item.top + item.height) return item.row;
   }
-  return layout[layout.length - 1].row;
+  return null;
 }
 
 function placeEdgeButtons(clientY) {
@@ -5410,6 +5416,11 @@ async function snapMarker(marker, clientX, clientY) {
 
 wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
+  if (row && row.kind === "logic") {
+    ev.preventDefault();
+    openSignalMenu(row, ev.clientX, ev.clientY);
+    return;
+  }
   if (!row || !row.bus) return;
   if ((row.kind === "group" || row.kind === "bus") && !row.bus.decode) {
     ev.preventDefault();
@@ -6571,7 +6582,7 @@ function closeBusDialog() {
 
 function closeBusMenu() {
   const menu = document.getElementById("bus-menu");
-  if (menu) menu.classList.add("hidden");
+  if (menu) { menu.classList.add("hidden"); menu.classList.remove("signal-decoder-menu"); }
 }
 
 function placeBusMenu(menu, x, y) {
@@ -6653,6 +6664,13 @@ function ungroupSignal(row) {
 function openSignalMenu(row, x, y) {
   const menu = document.getElementById("bus-menu");
   menu.replaceChildren();
+  if (row.kind === "logic") {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "Add decoder…";
+    add.addEventListener("click", () => openSignalDecoderMenu(row, x, y));
+    menu.append(add);
+  }
   if (canUngroupSignal(row)) {
     const item = document.createElement("button");
     item.type = "button";
@@ -6675,6 +6693,30 @@ function openSignalMenu(row, x, y) {
   }
   if (!menu.childElementCount) return;
   placeBusMenu(menu, x, y);
+}
+
+function openSignalDecoderMenu(row, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  menu.classList.add("signal-decoder-menu");
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search decoders";
+  search.setAttribute("aria-label", "Search decoders");
+  menu.append(search);
+  const choices = (state.decoderCatalog || []).filter((item) => !item.stack_on && [...(item.channels || []), ...(item.optional_channels || [])].length);
+  for (const schema of choices) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = schema.name || schema.id;
+    button.addEventListener("click", () => { closeBusMenu(); addDecoder(schema.id, row.channel); });
+    menu.append(button);
+  }
+  search.addEventListener("input", () => {
+    [...menu.querySelectorAll("button")].forEach((button, index) => { button.hidden = !decoderMatches(choices[index], search.value); });
+  });
+  placeBusMenu(menu, x, y);
+  search.focus();
 }
 
 function openContainerMenu(bus, x, y) {
@@ -6900,7 +6942,7 @@ function openDecodeConfig(decoder) {
       </label>`);
   }
   const schema = state.decoderCatalog.find((item) => item.id === decoder.protocol);
-  const signals = schema ? schema.channels : Object.keys(channels);
+  const signals = schema ? [...new Set([...(schema.channels || []), ...(schema.optional_channels || [])])] : Object.keys(channels);
   parts.push(...signals.map((name) => signalField(name, channels[name])));
   if (decoder.protocol === "spi") {
     const cpol = options.cpol === "1" || options.cpol === "true" || options.cpol === "high";

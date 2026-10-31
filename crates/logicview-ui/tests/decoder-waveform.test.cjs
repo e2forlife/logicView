@@ -5,6 +5,29 @@ const vm = require("node:vm");
 const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "../assets/app.js"), "utf8");
 
+test("Lua overlays use declared input order and stacked decoders use their parent waveform", () => {
+  const parent = { id: "p", protocol: "lua", channels: { clock: 1, data: 3 } };
+  const child = { id: "c", protocol: "child", channels: {}, stack_on: "p" };
+  const state = { decoders: [parent, child], decoderCatalog: [{ id: "lua", channels: ["data"], optional_channels: ["clock"] }] };
+  const context = { state, annotationLabel: row => row.text };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("function dataLineTargets("), source.indexOf("function traceHexagon(")), context);
+  assert.equal(context.dataLineTargets(parent)[0].channel, 3);
+  assert.equal(context.dataLineTargets(child)[0].channel, 3);
+  assert.equal(context.dataLineTargets(child)[0].decoderId, "p");
+});
+
+test("adding a decoder from a waveform binds its first declared input", async () => {
+  let request;
+  const state = { active: "s", decoders: [], decoderCatalog: [{ id: "lua", channels: ["data", "clock"] }] };
+  const context = { state, channelSpecByIndex: index => `ch${index}`, api: async args => { request = args; return { id: "new" }; }, refreshDecoders: async () => {}, loadAnnotations: async () => {}, statusEl: {} };
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf("async function addDecoder("), source.indexOf("async function refreshDecoders(")), context);
+  await context.addDecoder("lua", 4);
+  assert.equal(request.channels.data, "ch4");
+  assert.equal(Object.keys(request.channels).length, 1);
+});
+
 test("SPI lanes have separate clock and chip-select rows with unique keys", () => {
   const state = { channels: [0, 1, 2, 3].map(index => ({ index, name: String(index), color: "white" })), decodeView: {}, spiView: {} };
   const context = { state, view: () => ({ colors: {} }), protocolLabel: () => "SPI", decodeFormat: () => "hex", decoderCondensed: () => false };

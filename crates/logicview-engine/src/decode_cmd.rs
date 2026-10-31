@@ -48,7 +48,7 @@ impl Engine {
             None
         };
         let mut resolved = BTreeMap::new();
-        for name in schema.channels {
+        for name in schema.channels.into_iter().chain(schema.optional_channels) {
             if let Some(spec) = channels.get(&name).filter(|spec| !spec.is_empty()) {
                 resolved.insert(name, resolve_channel(slot, spec)?);
             }
@@ -135,7 +135,7 @@ impl Engine {
             .find(|item| item.id == protocol)
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
         let mut resolved = BTreeMap::new();
-        for name in schema.channels {
+        for name in schema.channels.into_iter().chain(schema.optional_channels) {
             if let Some(spec) = channels.get(&name).filter(|spec| !spec.is_empty()) {
                 resolved.insert(name, resolve_channel(slot, spec)?);
             }
