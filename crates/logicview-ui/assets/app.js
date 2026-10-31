@@ -102,6 +102,8 @@ let tileAgain = false;
 let commandBusy = false;
 let hoverTimer = null;
 let pointer = null;
+let zoomAnchor = null;
+let zoomAnchorTimer = null;
 
 function view() {
   const id = state.active || "pending";
@@ -718,29 +720,36 @@ function applyStatus(status, fromLive) {
   paintWait();
 }
 
+function fitSpp() {
+  const width = Math.max(1, wave.clientWidth || 1);
+  if (state.total <= 0) return 1;
+  return state.total / width;
+}
+
 function fitView() {
   const v = view();
-  const width = Math.max(1, wave.clientWidth || 1);
   if (state.total <= 0) {
     v.start = 0;
     v.spp = 1;
     return;
   }
-  const fit = state.total / width;
   v.start = 0;
-  v.spp = fit;
+  v.spp = fitSpp();
 }
 
 function clampView() {
   const v = view();
   const width = Math.max(1, wave.clientWidth || 1);
-  const span = width * v.spp;
   if (state.total <= 0) {
     v.start = 0;
     return;
   }
+  const fit = fitSpp();
+  if (!(v.spp > 0) || v.spp > fit) v.spp = fit;
+  const span = width * v.spp;
   if (span >= state.total) {
     v.start = 0;
+    v.spp = fit;
     return;
   }
   if (v.start < 0) v.start = 0;
@@ -4631,7 +4640,17 @@ wave.addEventListener("contextmenu", (ev) => {
 wave.addEventListener("wheel", (ev) => {
   ev.preventDefault();
   if (state.total <= 0) return;
-  stepZoom(ev.deltaY > 0);
+  if (!zoomAnchor) {
+    const rect = wave.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const v = view();
+    zoomAnchor = { x, sample: v.start + x * v.spp };
+  }
+  clearTimeout(zoomAnchorTimer);
+  zoomAnchorTimer = setTimeout(() => {
+    zoomAnchor = null;
+  }, 300);
+  stepZoom(ev.deltaY > 0, zoomAnchor);
 }, { passive: false });
 
 function currentTimebaseIndex() {
@@ -4642,14 +4661,15 @@ function currentTimebaseIndex() {
   return index;
 }
 
-function stepZoom(out) {
+function stepZoom(out, anchor) {
   const slider = document.getElementById("timebase");
   if (!slider || state.total <= 0) return;
+  if (out && view().spp >= fitSpp() * (1 - 1e-9)) return;
   const current = currentTimebaseIndex();
   const next = Math.max(0, Math.min(TIME_DIVS.length - 1, current + (out ? 1 : -1)));
   if (next === current) return;
   slider.value = String(next);
-  applyTimebase(next);
+  applyTimebase(next, anchor);
   drawWave();
 }
 
@@ -4657,7 +4677,7 @@ function zoomAt(sample, x, factor) {
   const v = view();
   const width = Math.max(1, wave.clientWidth);
   const minSpp = 1 / 32;
-  const maxSpp = Math.max(minSpp, (Math.max(state.total, 1) / width) * 4);
+  const maxSpp = state.total > 0 ? state.total / width : minSpp;
   const before = v.spp;
   v.spp = Math.min(maxSpp, Math.max(minSpp, before * factor));
   if (v.spp === before) return;
@@ -5004,23 +5024,24 @@ function formatDiv(seconds) {
   return formatSeconds(seconds).replace(/\.000(?=\s)/, "") + "/div";
 }
 
-function applyTimebase(index) {
+function applyTimebase(index, anchor) {
   if (!Number.isInteger(index) || index < 0 || index >= TIME_DIVS.length) return;
   const seconds = TIME_DIVS[index];
   const px = Math.max(40, (wave.clientWidth || 800) / 10);
   const v = view();
   const width = Math.max(1, wave.clientWidth);
-  const mid = v.start + (width / 2) * v.spp;
-  v.spp = (seconds * Math.max(1, state.rate)) / px;
-  v.start = mid - (width / 2) * v.spp;
+  const sample = anchor ? anchor.sample : v.start + (width / 2) * v.spp;
+  const x = anchor ? anchor.x : width / 2;
+  const fit = state.total > 0 ? fitSpp() : v.spp;
+  v.spp = Math.min(fit, (seconds * Math.max(1, state.rate)) / px);
+  v.start = sample - x * v.spp;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
   drawWave();
   drawRuler();
   drawOverview();
-  const label = document.getElementById("timebase-label");
-  if (label) label.textContent = formatDiv(seconds);
+  syncTimebaseLabel();
 }
 
 function bindSplitters() {
