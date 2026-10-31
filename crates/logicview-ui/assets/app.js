@@ -846,14 +846,66 @@ function selectOnly(key) {
   applySelection(key, { shiftKey: false, ctrlKey: false, metaKey: false });
 }
 
-function selectedLogicIndexes() {
-  const selected = new Set(ensureSelection().selection);
-  const indexes = [];
-  for (const row of layoutRows()) {
-    if (!selected.has(row.key) || row.kind !== "logic") continue;
-    if (!indexes.includes(row.channel)) indexes.push(row.channel);
+function selectedAncestorCovers(row, selected) {
+  let container = null;
+  if (row.kind === "logic" && row.containerId != null) {
+    container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId)) || null;
+  } else if (containerHeader(row)) {
+    container = parentContainer(row.bus.id);
   }
-  return indexes;
+  let guard = 0;
+  while (container && guard++ < 32) {
+    if (selected.has("bus:" + container.id)) return true;
+    container = parentContainer(container.id);
+  }
+  return false;
+}
+
+function selectedGroupMembers() {
+  const selected = new Set(ensureSelection().selection);
+  const members = [];
+  const seenChannels = new Set();
+  const seenGroups = new Set();
+  for (const row of layoutRows()) {
+    if (!selected.has(row.key) || selectedAncestorCovers(row, selected)) continue;
+    if (row.kind === "logic") {
+      const index = Number(row.channel);
+      if (!Number.isFinite(index) || seenChannels.has(index)) continue;
+      seenChannels.add(index);
+      members.push({ kind: "channel", index });
+      continue;
+    }
+    if (!containerHeader(row)) continue;
+    const id = Number(row.bus.id);
+    if (!Number.isFinite(id) || seenGroups.has(id)) continue;
+    seenGroups.add(id);
+    members.push({ kind: "group", id });
+  }
+  return members;
+}
+
+function memberLeafChannels(members) {
+  const out = [];
+  for (const member of members || []) {
+    if (member.kind === "channel") out.push(Number(member.index));
+    else if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (child) out.push(...descendantChannels(child));
+    }
+  }
+  return out;
+}
+
+function memberCurrentParent(member) {
+  if (!member) return null;
+  if (member.kind === "channel") return directParentOfChannel(member.index);
+  return parentContainer(member.id);
+}
+
+function memberMatches(member, item) {
+  if (!member || !item) return false;
+  if (item.kind === "channel") return member.kind === "channel" && Number(member.index) === Number(item.index);
+  return member.kind === "group" && Number(member.id) === Number(item.id);
 }
 
 let channelDrag = null;
@@ -1203,11 +1255,19 @@ function moveChannel(fromKey, toKey) {
     insertChannelInContainer(from, container, to);
     return;
   }
+  if (container && containerHeader(from) && Number(container.id) !== Number(from.bus.id)) {
+    insertGroupInContainer(from, container, to);
+    return;
+  }
   if (isTopLevelRow(from) && isTopLevelRow(to)) reorderTopLevel(fromKey, toKey);
 }
 
 function plainLogic(row) {
   return !!row && row.kind === "logic" && !row.decoderId;
+}
+
+function containerHeader(row) {
+  return !!(row && row.header && row.bus && !row.bus.decode && (row.kind === "group" || row.kind === "bus"));
 }
 
 function dropContainer(row) {
@@ -1238,6 +1298,58 @@ function insertChannelInContainer(fromRow, container, toRow) {
   detachChannel(index);
   const members = container.members || (container.members = []);
   members.splice(Math.max(0, Math.min(at, members.length)), 0, { kind: "channel", index });
+  container.channels = members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function groupContains(container, id, guard = 0) {
+  if (!container || guard > 32) return false;
+  const wanted = Number(id);
+  if (Number(container.id) === wanted) return true;
+  for (const member of container.members || []) {
+    if (member.kind !== "group") continue;
+    if (Number(member.id) === wanted) return true;
+    const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+    if (child && groupContains(child, wanted, guard + 1)) return true;
+  }
+  return false;
+}
+
+function detachGroupMember(id) {
+  const wanted = Number(id);
+  for (const container of sessionContainers()) {
+    const members = container.members || [];
+    if (!members.some((member) => member.kind === "group" && Number(member.id) === wanted)) continue;
+    container.members = members.filter((member) => !(member.kind === "group" && Number(member.id) === wanted));
+    container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  }
+}
+
+function forgetTopLevelKey(key) {
+  const order = view().order;
+  if (!order || !order.includes(key)) return;
+  persistOrder(order.filter((item) => item !== key));
+}
+
+function insertGroupInContainer(fromRow, container, toRow) {
+  const id = Number(fromRow.bus.id);
+  if (!Number.isFinite(id) || !container || Number(container.id) === id) return;
+  if (groupContains(fromRow.bus, container.id)) return;
+  let at = 0;
+  if (!(toRow.header && toRow.bus && Number(toRow.bus.id) === Number(container.id))) {
+    const target = memberPosition(container, toRow);
+    at = target >= 0 ? target : (container.members || []).length;
+  }
+  const fromAt = memberPosition(container, fromRow);
+  if (fromAt >= 0 && fromAt < at) at -= 1;
+  detachGroupMember(id);
+  forgetTopLevelKey("bus:" + id);
+  const members = container.members || (container.members = []);
+  members.splice(Math.max(0, Math.min(at, members.length)), 0, { kind: "group", id });
   container.channels = members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
   deleteEmptyContainers();
   state.gutterSig = "";
@@ -1646,7 +1758,7 @@ function drawGrid(ctx, w, h, layout, palette = wavePalette()) {
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
     } else if (row.kind === "bus" && row.bus && (row.bus.analog || row.bus.radix === "analog")) {
-      const bits = (row.bus.channels || []).length;
+      const bits = descendantChannels(row.bus).length;
       const max = bits ? (1n << BigInt(bits)) - 1n : 1n;
       ctx.fillStyle = palette.label;
       ctx.font = "10px sans-serif";
@@ -2099,12 +2211,12 @@ function drawAnalog(ctx, cols, top, height, color) {
   ctx.stroke();
 }
 
-function busValueAt(bus, index) {
-  const channels = bus.channels || [];
+function busValueAt(bus, index, channels) {
+  const bitsSource = channels || descendantChannels(bus);
   let value = 0n;
-  const bits = channels.length;
+  const bits = bitsSource.length;
   for (let bit = 0; bit < bits; bit++) {
-    const cols = state.tiles["logic:" + channels[bit]];
+    const cols = state.tiles["logic:" + bitsSource[bit]];
     const column = cols && cols[index];
     if (!(column && column.valid !== false && column.last)) continue;
     const shift = bus.msbFirst ? BigInt(bits - 1 - bit) : BigInt(bit);
@@ -2161,37 +2273,91 @@ function drawDecodeBus(ctx, item, bus) {
   }
 }
 
-function drawBuses(ctx, layout) {
-  for (const item of layout) {
-    const row = item.row;
-    if (row.kind !== "bus" || state.hidden.has(row.key)) continue;
-    const bus = row.bus;
-    if (bus.decode) {
-      drawDecodeBus(ctx, item, bus);
+function drawLabelBar(ctx, item) {
+  const pad = Math.max(8, item.height * 0.22);
+  const span = Math.max(1, item.height - pad * 2);
+  const barH = Math.max(2, span / 3);
+  const y = item.top + (item.height - barH) / 2;
+  ctx.fillStyle = traceColor(item.row.color);
+  ctx.fillRect(0, y, Math.max(wave.clientWidth || 0, 1), barH);
+}
+
+function busColumns(channels) {
+  let cols = null;
+  for (const index of channels) {
+    const candidate = state.tiles["logic:" + index];
+    if (candidate && (!cols || candidate.length > cols.length)) cols = candidate;
+  }
+  return cols;
+}
+
+function busValueRuns(bus, channels, cols) {
+  const bits = channels.length;
+  const runs = [];
+  let prev = null;
+  let start = 0;
+  let last = -1;
+  for (let i = 0; i < cols.length; i++) {
+    if (tileSample(i) >= state.total) break;
+    last = i;
+    const value = busValueAt(bus, i, channels);
+    if (prev == null) {
+      prev = value;
+      start = i;
       continue;
     }
-    const channels = bus.channels || [];
-    if (!channels.length) continue;
-    let cols = null;
-    for (const index of channels) {
-      const candidate = state.tiles["logic:" + index];
-      if (candidate && (!cols || candidate.length > cols.length)) cols = candidate;
+    if (value !== prev) {
+      runs.push({ start_sample: tileSample(start), end_sample: tileSample(i), value: prev, bits });
+      prev = value;
+      start = i;
     }
+  }
+  if (prev != null && last >= start) {
+    const spp = state.tileView && state.tileView.spp > 0 ? state.tileView.spp : view().spp;
+    runs.push({
+      start_sample: tileSample(start),
+      end_sample: tileSample(last) + spp,
+      value: prev,
+      bits,
+    });
+  }
+  return runs;
+}
+
+function drawBuses(ctx, layout) {
+  const canvasW = Math.max(wave.clientWidth || 0, 1);
+  for (const item of layout) {
+    const row = item.row;
+    if ((row.kind !== "bus" && row.kind !== "group") || state.hidden.has(row.key)) continue;
+    const bus = row.bus;
+    if (!bus) continue;
+    if (bus.decode) {
+      if (row.kind === "bus") drawDecodeBus(ctx, item, bus);
+      continue;
+    }
+    if (bus.type === "group" || row.kind === "group") {
+      drawLabelBar(ctx, item);
+      continue;
+    }
+    const channels = descendantChannels(bus);
+    if (!channels.length) continue;
+    const cols = busColumns(channels);
     if (!cols) continue;
     const pad = Math.max(8, item.height * 0.22);
     const top = item.top + pad;
     const bot = item.top + item.height - pad;
     const bits = channels.length;
+    const color = traceColor(row.color);
     const analog = bus.analog || bus.radix === "analog";
     if (analog) {
       const max = Number((1n << BigInt(bits)) - 1n) || 1;
       ctx.beginPath();
-      ctx.strokeStyle = traceColor("#7dcea0");
+      ctx.strokeStyle = color;
       ctx.lineWidth = 1.4;
       let started = false;
       for (let i = 0; i < cols.length; i++) {
         if (tileSample(i) >= state.total) break;
-        const y = bot - (Number(busValueAt(bus, i)) / max) * (bot - top);
+        const y = bot - (Number(busValueAt(bus, i, channels)) / max) * (bot - top);
         const x = traceX(i);
         if (!started) {
           ctx.moveTo(x, y);
@@ -2201,25 +2367,13 @@ function drawBuses(ctx, layout) {
       ctx.stroke();
       continue;
     }
+    const runs = busValueRuns(bus, channels, cols);
+    const hexH = Math.min(48, Math.max(16, bot - top));
+    const mid = (top + bot) / 2;
     ctx.font = "12px sans-serif";
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = wavePalette().ink;
-    let prev = null;
-    let lastX = -1e9;
-    for (let i = 0; i < cols.length; i++) {
-      if (tileSample(i) >= state.total) break;
-      const value = busValueAt(bus, i);
-      const x = traceX(i);
-      if (prev == null) prev = value;
-      if (value !== prev || i === 0) {
-        const text = formatBusValue(value, bus.radix || "hex", bits);
-        if (x - lastX > ctx.measureText(text).width + 8) {
-          ctx.fillText(text, x + 4, (top + bot) / 2);
-          lastX = x;
-        }
-        prev = value;
-      }
-    }
+    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82);
   }
 }
 
@@ -2294,7 +2448,7 @@ function tileRequests() {
   }
   for (const bus of sessionContainers()) {
     if (bus.type === "group" || bus.decode) continue;
-    for (const index of bus.channels || []) {
+    for (const index of descendantChannels(bus)) {
       add({ kind: "logic", channel: index, tileKey: "logic:" + index }, "logic:" + index);
     }
   }
@@ -2608,6 +2762,65 @@ function panelHtml(name) {
     <div id="saved-measures"></div>`;
 }
 
+function streamCeiling(bands) {
+  if (!bands || !bands.length) return 0;
+  let max = 0;
+  for (const band of bands) max = Math.max(max, band.max_hz || 0);
+  return max;
+}
+
+function podLinkReduced(device) {
+  if (!device || device.kind !== "usb" || device.super_speed) return false;
+  const pid = Number.parseInt(String(device.id).split(":").pop(), 16);
+  const profile = (state.profiles || []).find((item) => item.product_id === pid);
+  if (profile) return streamCeiling(profile.super_stream_rates) > streamCeiling(profile.stream_rates);
+  return pid === 0x002c;
+}
+
+function reducedLinkTitle() {
+  const pods = (state.devices || []).filter(podLinkReduced);
+  if (!pods.length) return "";
+  const names = pods.map((device) => device.name).join(", ");
+  if (pods.length === 1) return `${names} is connected at USB 2. This pod supports USB 3.`;
+  return `${names} are connected at USB 2. These pods support USB 3.`;
+}
+
+function podIconHtml(count) {
+  const n = Math.max(1, Math.min(count || 1, 3));
+  const imgs = [];
+  for (let i = 0; i < n; i += 1) {
+    const back = n - 1 - i;
+    imgs.push(`<img class="pod" src="/assets/logicDevice.png" alt="" style="--stack:${back}">`);
+  }
+  return `<span class="pod-stack" data-count="${n}">${imgs.join("")}</span>`;
+}
+
+function connectedMarkup() {
+  const title = reducedLinkTitle();
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  const klass = title ? "connected reduced" : "connected";
+  return `<span class="${klass}"${titleAttr}><i class="dot"></i> Connected</span>`;
+}
+
+function paintPodIcons() {
+  const html = podIconHtml(Math.max(1, (state.devices || []).length));
+  for (const host of [document.querySelector(".device-chip"), document.getElementById("device-card")]) {
+    if (!host) continue;
+    const stack = host.querySelector(".pod-stack");
+    if (stack) stack.outerHTML = html;
+    else host.insertAdjacentHTML("afterbegin", html);
+  }
+}
+
+function paintConnected() {
+  const title = reducedLinkTitle();
+  for (const el of document.querySelectorAll(".device-chip .connected, .device-card .connected")) {
+    el.classList.toggle("reduced", !!title);
+    if (title) el.title = title;
+    else el.removeAttribute("title");
+  }
+}
+
 function devicePanel() {
   const devices = state.devices || [];
   const title = devices.map((device) => device.name).join(" + ") || settings.deviceName || "Demo";
@@ -2621,10 +2834,10 @@ function devicePanel() {
     : "";
   return `<h2>Device Settings</h2>
     <button type="button" class="device-card" id="device-card">
-      <svg class="pod" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 6V4M12 6V4M17 6V4M7 20v-2M12 20v-2M17 20v-2"></path></svg>
+      ${podIconHtml(Math.max(1, devices.length))}
       <div>
         <strong>${title}</strong>
-        <span class="connected"><i class="dot"></i> Connected</span>
+        ${connectedMarkup()}
         <p class="hint">${hardware ? "DreamSourceLab" : "Software demo"}</p>
       </div>
     </button>
@@ -3438,6 +3651,8 @@ function syncDeviceSelect() {
   const name = document.getElementById("device-name");
   const key = (state.devices || []).map((device) => device.id).join("+");
   if (name) name.textContent = deviceLabel(key);
+  paintPodIcons();
+  paintConnected();
 }
 
 function deviceMenuButton(id, label) {
@@ -3532,6 +3747,7 @@ async function loadDeviceChoices() {
         note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
       }
       if (state.tab === "device") refillRateSelect();
+      syncDeviceSelect();
     }).catch(() => {});
   } catch (err) {
     statusEl.textContent = err.message;
@@ -4991,7 +5207,13 @@ async function snapMarker(marker, clientX, clientY) {
 
 wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
-  if (!row || (row.kind !== "bus" && row.kind !== "decode") || !row.bus) return;
+  if (!row || !row.bus) return;
+  if ((row.kind === "group" || row.kind === "bus") && !row.bus.decode) {
+    ev.preventDefault();
+    openContainerMenu(row.bus, ev.clientX, ev.clientY);
+    return;
+  }
+  if (row.kind !== "bus" && row.kind !== "decode") return;
   ev.preventDefault();
   openBusMenu(row.bus, ev.clientX, ev.clientY);
 });
@@ -5235,7 +5457,7 @@ async function decodedHoverBounds(row, sample, session, sequence) {
 }
 
 async function busHoverBounds(row, sample, session) {
-  const channels = [...new Set(row.bus.channels || [])];
+  const channels = [...new Set(descendantChannels(row.bus))];
   if (!channels.length) return null;
   const metrics = await Promise.all(channels.map((channel) => api({ cmd: "measure", session, channel, sample })));
   const starts = metrics.map((item) => item.pulse_start);
@@ -5898,15 +6120,55 @@ function showTriggered() {
   }, 700);
 }
 
+let editingGroupId = null;
+
+function displayedContainerName(container) {
+  const names = view().names;
+  const key = "bus:" + container.id;
+  return (names && names[key]) || container.name || ("Group " + container.id);
+}
+
+function groupMemberLabel(member) {
+  if (member.kind === "group") {
+    const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+    return child ? displayedContainerName(child) : ("Group " + member.id);
+  }
+  const channel = state.channels.find((item) => item.index === Number(member.index));
+  return channel ? channel.name : ("Channel " + member.index);
+}
+
+function setGroupDialogMode(editing) {
+  const dialog = document.getElementById("bus-dialog");
+  const title = document.getElementById("bus-dialog-title");
+  const submit = document.getElementById("bus-submit");
+  if (dialog) dialog.setAttribute("aria-label", editing ? "Edit a group" : "Create a group");
+  if (title) title.textContent = editing ? "Edit group" : "Create group";
+  if (submit) submit.textContent = editing ? "Apply" : "Create";
+}
+
+function paintGroupMembers(members, leaves) {
+  const host = document.getElementById("bus-channels");
+  host.replaceChildren();
+  host.dataset.leaves = String(leaves);
+  for (const member of members) {
+    const line = document.createElement("div");
+    line.className = "channel-line";
+    line.textContent = groupMemberLabel(member);
+    host.appendChild(line);
+  }
+}
+
 function syncGroupDialog() {
   const type = document.querySelector('input[name="group-type"]:checked');
   const bus = !type || type.value === "bus";
   document.getElementById("bus-radix").classList.toggle("hidden", !bus);
   document.getElementById("bus-msb").classList.toggle("hidden", !bus);
   document.getElementById("group-label-note").classList.toggle("hidden", bus);
-  const count = document.querySelectorAll("#bus-channels .channel-line").length;
+  const host = document.getElementById("bus-channels");
+  const stored = Number(host && host.dataset.leaves);
+  const count = Number.isFinite(stored) ? stored : document.querySelectorAll("#bus-channels .channel-line").length;
   const hint = document.getElementById("bus-hint");
-  const submit = document.querySelector("#bus-form button[type=submit]");
+  const submit = document.getElementById("bus-submit");
   const msb = document.getElementById("bus-msb-first");
   if (bus && count < 2) hint.textContent = "A bus needs at least two channels";
   else if (!count) hint.textContent = "Select a logic channel";
@@ -5914,27 +6176,21 @@ function syncGroupDialog() {
   else hint.textContent = "";
   if (submit) submit.disabled = (bus && count < 2) || !count;
   const name = document.getElementById("bus-name");
-  if (/^(Bus|Group) \d+$/.test(name.value)) {
+  if (editingGroupId == null && /^(Bus|Group) \d+$/.test(name.value)) {
     name.value = (bus ? "Bus " : "Group ") + name.value.split(" ")[1];
   }
 }
 
 function openBusDialog() {
-  const indexes = selectedLogicIndexes();
-  if (!indexes.length) {
+  const members = selectedGroupMembers();
+  if (!members.length) {
     statusEl.textContent = "Select logic channels, then create a group";
     return;
   }
-  const host = document.getElementById("bus-channels");
-  host.replaceChildren();
-  for (const index of indexes) {
-    const channel = state.channels.find((item) => item.index === index);
-    const line = document.createElement("div");
-    line.className = "channel-line";
-    line.textContent = channel ? channel.name : ("Channel " + index);
-    host.appendChild(line);
-  }
-  const type = indexes.length >= 2 ? "bus" : "group";
+  editingGroupId = null;
+  const leaves = memberLeafChannels(members);
+  paintGroupMembers(members, leaves.length);
+  const type = leaves.length >= 2 ? "bus" : "group";
   const radio = document.querySelector(`input[name="group-type"][value="${type}"]`);
   if (radio) radio.checked = true;
   const hex = document.querySelector('input[name="bus-radix"][value="hex"]');
@@ -5943,11 +6199,36 @@ function openBusDialog() {
   if (msb) msb.checked = true;
   const name = document.getElementById("bus-name");
   name.value = (type === "group" ? "Group " : "Bus ") + (view().nextBus || 1);
+  setGroupDialogMode(false);
+  syncGroupDialog();
+  document.getElementById("bus-dialog").classList.remove("hidden");
+}
+
+function openEditGroup(bus) {
+  if (!bus || bus.decode) return;
+  editingGroupId = Number(bus.id);
+  const members = (bus.members || []).map((member) => (
+    member.kind === "group"
+      ? { kind: "group", id: Number(member.id) }
+      : { kind: "channel", index: Number(member.index) }
+  ));
+  paintGroupMembers(members, descendantChannels(bus).length);
+  const type = bus.type === "group" ? "group" : "bus";
+  const radio = document.querySelector(`input[name="group-type"][value="${type}"]`);
+  if (radio) radio.checked = true;
+  const radix = bus.radix && bus.radix !== "analog" ? bus.radix : "hex";
+  const radixRadio = document.querySelector(`input[name="bus-radix"][value="${radix}"]`);
+  if (radixRadio) radixRadio.checked = true;
+  const msb = document.getElementById("bus-msb-first");
+  if (msb) msb.checked = !!bus.msbFirst;
+  document.getElementById("bus-name").value = displayedContainerName(bus);
+  setGroupDialogMode(true);
   syncGroupDialog();
   document.getElementById("bus-dialog").classList.remove("hidden");
 }
 
 function closeBusDialog() {
+  editingGroupId = null;
   document.getElementById("bus-dialog").classList.add("hidden");
 }
 
@@ -6046,7 +6327,7 @@ function openSignalMenu(row, x, y) {
     });
     menu.append(item);
   }
-  if (selectedLogicIndexes().length) {
+  if (selectedGroupMembers().length) {
     const item = document.createElement("button");
     item.type = "button";
     item.textContent = "Create group…";
@@ -6088,6 +6369,14 @@ function openContainerMenu(bus, x, y) {
     });
     menu.append(msb);
   }
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.textContent = "Edit Group";
+  edit.addEventListener("click", () => {
+    closeBusMenu();
+    openEditGroup(bus);
+  });
+  menu.append(edit);
   const remove = document.createElement("button");
   remove.type = "button";
   remove.textContent = bus.type === "group" ? "Ungroup" : "Remove bus";
@@ -6112,13 +6401,16 @@ function deleteEmptyContainers() {
   }
 }
 
-function placeTopLevelOrder(container, channelIndexes) {
+function placeTopLevelOrder(container, anchorKey, removedKeys, orderSnapshot) {
   const key = "bus:" + container.id;
-  const order = (view().order && view().order.length ? [...view().order] : sourceRows().map((row) => row.key)).filter((item) => item !== key);
-  const firstAt = order.indexOf("logic:" + channelIndexes[0]);
-  if (firstAt >= 0) order.splice(firstAt, 0, key);
-  else order.unshift(key);
-  persistOrder(order);
+  const order = orderSnapshot && orderSnapshot.length ? [...orderSnapshot] : sourceRows().map((row) => row.key);
+  const drop = new Set(removedKeys || []);
+  drop.add(key);
+  const anchorAt = anchorKey ? order.indexOf(anchorKey) : -1;
+  const next = order.filter((item) => !drop.has(item));
+  const insertAt = anchorAt < 0 ? 0 : order.slice(0, anchorAt).filter((item) => !drop.has(item)).length;
+  next.splice(Math.max(0, Math.min(insertAt, next.length)), 0, key);
+  persistOrder(next);
 }
 
 function removeContainer(id) {
@@ -6148,12 +6440,13 @@ function removeContainer(id) {
 }
 
 function createChannelGroup(type, name, radix, msbFirst) {
-  const indexes = selectedLogicIndexes();
-  if (type === "bus" && indexes.length < 2) {
+  const picked = selectedGroupMembers();
+  const leaves = memberLeafChannels(picked);
+  if (type === "bus" && leaves.length < 2) {
     statusEl.textContent = "A bus needs at least two channels";
     return false;
   }
-  if (!indexes.length) {
+  if (!picked.length || !leaves.length) {
     statusEl.textContent = "Select a logic channel";
     return false;
   }
@@ -6165,32 +6458,69 @@ function createChannelGroup(type, name, radix, msbFirst) {
     id,
     name,
     type,
-    members: indexes.map((index) => ({ kind: "channel", index })),
-    channels: indexes.slice(),
+    members: picked.map((member) => (
+      member.kind === "group"
+        ? { kind: "group", id: Number(member.id) }
+        : { kind: "channel", index: Number(member.index) }
+    )),
+    channels: picked.filter((member) => member.kind === "channel").map((member) => Number(member.index)),
     radix: type === "bus" ? radix : "hex",
     msbFirst: type === "bus" ? !!msbFirst : false,
     folded: false,
     analog: false,
   };
-  const parents = indexes.map((index) => directParentOfChannel(index));
-  const shared = parents[0] && parents.every((parent) => parent && parent.id === parents[0].id);
-  if (shared) {
-    const parent = parents[0];
-    let first = parent.members.findIndex((member) => member.kind === "channel" && indexes.includes(Number(member.index)));
-    if (first < 0) first = parent.members.length;
-    parent.members = parent.members.filter((member) => !(member.kind === "channel" && indexes.includes(Number(member.index))));
-    parent.members.splice(first, 0, { kind: "group", id });
-    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => member.index);
+  const parents = picked.map((member) => memberCurrentParent(member));
+  const firstParent = parents[0] || null;
+  const shared = parents.every((parent) => (
+    !parent && !firstParent ? true : !!(parent && firstParent && Number(parent.id) === Number(firstParent.id))
+  ));
+  if (shared && firstParent) {
+    let first = firstParent.members.findIndex((member) => picked.some((item) => memberMatches(member, item)));
+    if (first < 0) first = firstParent.members.length;
+    firstParent.members = firstParent.members.filter((member) => !picked.some((item) => memberMatches(member, item)));
+    firstParent.members.splice(first, 0, { kind: "group", id });
+    firstParent.channels = firstParent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+    for (const member of picked) {
+      if (member.kind === "group") forgetTopLevelKey("bus:" + member.id);
+    }
     v.buses.push(container);
   } else {
-    for (const existing of sessionContainers()) {
-      existing.members = (existing.members || []).filter((member) => !(member.kind === "channel" && indexes.includes(Number(member.index))));
-      existing.channels = existing.members.filter((member) => member.kind === "channel").map((member) => member.index);
+    const anchorKey = picked[0].kind === "group" ? ("bus:" + picked[0].id) : ("logic:" + picked[0].index);
+    const snapshot = v.order && v.order.length ? [...v.order] : sourceRows().map((row) => row.key);
+    for (const member of picked) {
+      if (member.kind === "channel") detachChannel(member.index);
+      else detachGroupMember(member.id);
     }
     v.buses.push(container);
     deleteEmptyContainers();
-    placeTopLevelOrder(container, indexes);
+    const removed = picked.filter((member) => member.kind === "group").map((member) => "bus:" + member.id);
+    placeTopLevelOrder(container, anchorKey, removed, snapshot);
   }
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+  return true;
+}
+
+function applyGroupEdits(id, type, name, radix, msbFirst) {
+  const container = sessionContainers().find((item) => Number(item.id) === Number(id));
+  if (!container) return false;
+  const leaves = descendantChannels(container).length;
+  if (type === "bus" && leaves < 2) {
+    statusEl.textContent = "A bus needs at least two channels";
+    return false;
+  }
+  if (!leaves) {
+    statusEl.textContent = "Select a logic channel";
+    return false;
+  }
+  container.name = name;
+  container.type = type === "group" ? "group" : "bus";
+  container.radix = container.type === "bus" ? radix : "hex";
+  container.msbFirst = container.type === "bus" ? !!msbFirst : false;
+  container.analog = false;
+  if (view().names) delete view().names["bus:" + container.id];
   state.gutterSig = "";
   renderGutter();
   drawWave();
@@ -6563,10 +6893,14 @@ document.getElementById("bus-form").addEventListener("submit", (ev) => {
   const radix = document.querySelector('input[name="bus-radix"]:checked');
   const groupType = type ? type.value : "bus";
   const v = view();
-  const fallback = (groupType === "group" ? "Group " : "Bus ") + (v.nextBus || 1);
+  const fallback = (groupType === "group" ? "Group " : "Bus ") + (editingGroupId || v.nextBus || 1);
   const name = document.getElementById("bus-name").value.trim() || fallback;
-  const created = createChannelGroup(groupType, name, radix ? radix.value : "hex", document.getElementById("bus-msb-first").checked);
-  if (created) closeBusDialog();
+  const radixValue = radix ? radix.value : "hex";
+  const msbFirst = document.getElementById("bus-msb-first").checked;
+  const done = editingGroupId != null
+    ? applyGroupEdits(editingGroupId, groupType, name, radixValue, msbFirst)
+    : createChannelGroup(groupType, name, radixValue, msbFirst);
+  if (done) closeBusDialog();
 });
 
 document.getElementById("decode-config-cancel").addEventListener("click", closeDecodeConfig);

@@ -49,6 +49,7 @@ const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
 const PREFS_LOGO: &[u8] = include_bytes!("../assets/PrefsLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
+const LOGIC_DEVICE: &[u8] = include_bytes!("../assets/logicDevice.png");
 const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
 
 /// Shares the same engine across all HTTP and WebSocket handlers.
@@ -85,6 +86,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/ExportFileLogo.png", get(export_logo))
         .route("/assets/PrefsLogo.png", get(prefs_logo))
         .route("/assets/E2logo.png", get(e2_logo))
+        .route("/assets/logicDevice.png", get(logic_device))
         .route("/api/contributors", get(contributors_json))
         .route(
             "/api/preferences",
@@ -207,6 +209,11 @@ async fn settings_icon() -> impl IntoResponse {
 /// Serves the embedded E2 artwork for the About dialog.
 async fn e2_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], E2_LOGO)
+}
+
+/// Serves the pod photograph used in the device chip and device pane.
+async fn logic_device() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], LOGIC_DEVICE)
 }
 
 /// One person shown in the About dialog as `name -- contribution`.
@@ -1559,6 +1566,25 @@ mod tests {
             .unwrap()
             .to_bytes()
             .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let device_icon = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/logicDevice.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(device_icon.status(), StatusCode::OK);
+        assert_eq!(device_icon.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(device_icon
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
         let settings = app
             .clone()
             .oneshot(
@@ -1590,6 +1616,7 @@ mod tests {
         assert!(html.contains("id=\"export-dialog\""));
         assert!(html.contains("ExportFileLogo.png"));
         assert!(html.contains("PrefsLogo.png"));
+        assert!(html.contains("logicDevice.png"));
         assert!(html.contains("id=\"trig-kind\""));
         assert!(html.contains("id=\"trig-channel\""));
         assert!(html.contains("id=\"trig-pre\""));

@@ -27,7 +27,7 @@
     </header>
     <div class="toolbar">
       <div class="device-chip" title="Device">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
+        <span class="pod-stack" data-count="1"><img class="pod" src="/assets/logicDevice.png" alt="" style="--stack:0"></span>
         <span class="device-meta">
           <strong id="device-name">Demo</strong>
           <span class="connected"><i class="dot"></i> Connected</span>
@@ -185,7 +185,7 @@
   <input id="import-file" type="file" accept=".lvcap,.dsl,application/zip" hidden>
   <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Create a group">
     <form class="wait-card bus-card" id="bus-form">
-      <h2>Create group</h2>
+      <h2 id="bus-dialog-title">Create group</h2>
       <label class="field">Name <input id="bus-name" type="text" value="Bus 1"></label>
       <fieldset class="theme-choices">
         <legend>Type</legend>
@@ -205,7 +205,7 @@
       <p id="bus-hint" class="hint"></p>
       <div class="bus-actions">
         <button type="button" id="bus-cancel">Cancel</button>
-        <button type="submit">Create</button>
+        <button type="submit" id="bus-submit">Create</button>
       </div>
     </form>
   </div>
