@@ -19,6 +19,9 @@ use crate::DEMO_HW_MAX_RATE;
 /// Hard stop so a bad duration cannot allocate without bound.
 pub const MAX_SAMPLES: u64 = 16_000_000;
 
+/// Largest buffered record one channel can hold. Matches `logicview_hal::MEMORY_BITS`.
+pub const MAX_BUFFER_SAMPLES: u64 = 256 * 1024 * 1024;
+
 /// Samples produced per demo poll. A multiple of the 64-sample atom.
 pub const DEMO_CHUNK_SAMPLES: u64 = 65_536;
 
@@ -128,8 +131,10 @@ pub struct HostClock {
 pub struct SessionConfig {
     /// Requested samples per second, validated against the selected hardware limits.
     pub sample_rate_hz: u64,
-    /// Requested record duration used to plan a bounded sample count.
+    /// Requested record length in milliseconds. Ignored when [`Self::duration_ns`] is set.
     pub duration_ms: u64,
+    /// Requested record length in nanoseconds. Zero keeps [`Self::duration_ms`].
+    pub duration_ns: u64,
     /// Paces demo delivery for live playback instead of generating the record as fast as possible.
     pub realtime: bool,
     /// Enables trigger settings for normal capture; instant capture bypasses them.
@@ -171,6 +176,7 @@ impl Default for SessionConfig {
         Self {
             sample_rate_hz: 1_000_000,
             duration_ms: 2_000,
+            duration_ns: 0,
             realtime: false,
             trigger_enabled: false,
             trigger_percent: 10.0,
@@ -797,22 +803,33 @@ fn build_arm(
 }
 
 /// How many samples a config will store, after atom alignment.
+///
+/// A set [`SessionConfig::duration_ns`] wins over milliseconds. Stream captures
+/// stop at [`MAX_SAMPLES`]. Buffer captures may fill one channel of pod memory.
 pub fn planned_samples(config: &SessionConfig) -> Result<u64, CaptureError> {
     if config.sample_rate_hz == 0 {
         return Err(CaptureError::BadRate);
     }
-    if config.duration_ms == 0 {
+    let nanos = if config.duration_ns > 0 {
+        config.duration_ns
+    } else if config.duration_ms > 0 {
+        config.duration_ms.saturating_mul(1_000_000)
+    } else {
         return Err(CaptureError::BadDuration);
-    }
-    let mut total = config.sample_rate_hz.saturating_mul(config.duration_ms) / 1000;
+    };
+    let mut total = config.sample_rate_hz.saturating_mul(nanos) / 1_000_000_000;
     total -= total % 64;
     if total == 0 {
         return Err(CaptureError::BadDuration);
     }
-    if total > MAX_SAMPLES {
+    let ceiling = match config.depth {
+        DepthMode::Stream => MAX_SAMPLES,
+        DepthMode::Buffer => MAX_BUFFER_SAMPLES,
+    };
+    if total > ceiling {
         return Err(CaptureError::TooLarge {
             requested: total,
-            ceiling: MAX_SAMPLES,
+            ceiling,
         });
     }
     Ok(total)
@@ -1055,6 +1072,44 @@ mod tests {
         assert!(!armed.mode.contains(ModeFlags::SLOW_ACQUISITION));
         assert!(!armed.mode.contains(ModeFlags::HALF_RATE));
         assert!(armed.upper.is_some());
+    }
+
+    /// Nanoseconds override milliseconds, and a buffer may fill one channel of memory.
+    #[test]
+    fn duration_ns_plans_short_captures_and_buffer_can_fill_memory() {
+        let short = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            duration_ns: 64_000,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&short).unwrap(), 64);
+
+        let millis = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            duration_ns: 0,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&millis).unwrap(), 9_984);
+
+        let full = SessionConfig {
+            sample_rate_hz: MAX_BUFFER_SAMPLES,
+            duration_ms: 0,
+            duration_ns: 1_000_000_000,
+            depth: DepthMode::Buffer,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&full).unwrap(), MAX_BUFFER_SAMPLES);
+
+        let stream = SessionConfig {
+            depth: DepthMode::Stream,
+            ..full.clone()
+        };
+        match planned_samples(&stream) {
+            Err(CaptureError::TooLarge { ceiling, .. }) => assert_eq!(ceiling, MAX_SAMPLES),
+            other => panic!("expected a stream ceiling, got {other:?}"),
+        }
     }
 
     /// Checks that unsupported trigger depth is rejected before arming.

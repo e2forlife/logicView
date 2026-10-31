@@ -75,7 +75,7 @@ const state = {
 
 const settings = {
   rate: 1_000_000,
-  duration: 2000,
+  durationNs: 2_000_000_000,
   trigger: false,
   percent: 10,
   depth: "buffer",
@@ -2492,13 +2492,13 @@ async function runCapture() {
   try {
     view().userNavigated = false;
     state.captureStarted = performance.now();
-    state.planned = Math.floor(settings.rate * settings.duration / 1000);
-    state.planned -= state.planned % 64;
+    state.planned = samplesForDuration(settings.durationNs, settings.rate);
     const status = await api({
       cmd: "configure",
       session: state.active,
       sample_rate_hz: settings.rate,
-      duration_ms: settings.duration,
+      duration_ms: Math.round(settings.durationNs / 1e6),
+      duration_ns: settings.durationNs,
       realtime: true,
       trigger_enabled: settings.trigger,
       trigger_percent: settings.percent,
@@ -2636,14 +2636,10 @@ function devicePanel() {
     </label>
     <p id="rate-note" class="hint">${rateNote()}</p>
     <label class="acq-row">Length
-      <select id="set-duration" aria-label="Capture length">
-        <option value="10">10 ms</option>
-        <option value="100">100 ms</option>
-        <option value="1000">1.0 s</option>
-        <option value="2000">2.0 s</option>
-        <option value="5000">5.0 s</option>
-      </select>
+      <input id="set-duration" list="duration-presets" type="text" aria-label="Capture length" spellcheck="false" autocomplete="off">
     </label>
+    <datalist id="duration-presets"></datalist>
+    <p id="duration-note" class="hint"></p>
     <label class="acq-row">Buffer
       <select id="set-depth" aria-label="Buffer mode">
         <option value="buffer">Buffer</option>
@@ -2888,7 +2884,9 @@ function bindPanel(name) {
   if (name === "device") {
     loadDeviceChoices();
     bindSelect("set-rate", "rate", true);
-    bindSelect("set-duration", "duration", true);
+    const rate = document.getElementById("set-rate");
+    if (rate) rate.addEventListener("change", () => refillDurationField());
+    bindDurationField();
     bindSelect("set-depth", "depth", false);
     const depth = document.getElementById("set-depth");
     if (depth) {
@@ -3128,6 +3126,8 @@ function bindSelect(id, key, numeric) {
   });
 }
 
+const HOST_MAX_SAMPLES = 16_000_000;
+
 const RATE_LADDER = [
   10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
   1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000, 25_000_000,
@@ -3279,6 +3279,145 @@ function refillRateSelect() {
     select.value = String(settings.rate);
   }
   if (note) note.textContent = rateNote();
+  refillDurationField();
+}
+
+function profileMemoryBits(profile) {
+  return profile && profile.memory_bits ? profile.memory_bits : 256 * 1024 * 1024;
+}
+
+function memoryBits() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid)
+    || (state.profiles || []).find((item) => item.product_id === 0x0020);
+  return profileMemoryBits(profile);
+}
+
+function sessionSampleCeiling() {
+  if (settings.depth === "stream") return HOST_MAX_SAMPLES;
+  const devices = (state.devices || []).filter((device) => String(device.id).startsWith("usb:"));
+  if (devices.length < 1) return HOST_MAX_SAMPLES;
+  if (devices.length < 2) return Math.floor(memoryBits() / enabledChannelCount());
+  let offset = 0;
+  let ceiling = Infinity;
+  for (const device of devices) {
+    const pid = Number.parseInt(String(device.id).split(":").pop(), 16);
+    const profile = (state.profiles || []).find((item) => item.product_id === pid);
+    const width = profile ? profile.channels : (pid === 0x002c ? 32 : 16);
+    let count = 0;
+    for (let index = 0; index < width; index += 1) {
+      if (channelIsEnabled(offset + index)) count += 1;
+    }
+    offset += width;
+    if (!count) continue;
+    const share = Math.floor(profileMemoryBits(profile) / count);
+    if (share < ceiling) ceiling = share;
+  }
+  return Number.isFinite(ceiling) ? ceiling : HOST_MAX_SAMPLES;
+}
+
+function durationLimits() {
+  const rate = Math.max(1, settings.rate);
+  const ceiling = sessionSampleCeiling();
+  const aligned = ceiling - (ceiling % 64);
+  const minNs = Number((64n * 1_000_000_000n + BigInt(rate) - 1n) / BigInt(rate));
+  const maxNs = Number((BigInt(Math.max(aligned, 64)) * 1_000_000_000n) / BigInt(rate));
+  return { minNs, maxNs: Math.max(minNs, maxNs), ceiling: Math.max(aligned, 64), rate };
+}
+
+function samplesForDuration(ns, rate) {
+  const total = Number((BigInt(Math.max(0, rate)) * BigInt(Math.max(0, ns))) / 1_000_000_000n);
+  return total - (total % 64);
+}
+
+function parseDurationNs(text) {
+  const match = String(text).trim().match(/^(\d+(?:\.\d+)?)\s*(ns|us|µs|μs|ms|s)?$/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value < 0) return null;
+  const unit = (match[2] || "ms").toLowerCase();
+  const scale = unit === "s" ? 1e9 : unit === "ms" ? 1e6 : (unit === "us" || unit === "µs" || unit === "μs") ? 1e3 : 1;
+  const ns = Math.round(value * scale);
+  if (!Number.isSafeInteger(ns)) return null;
+  return ns;
+}
+
+function formatDuration(ns) {
+  const units = [[1e9, "s"], [1e6, "ms"], [1e3, "us"], [1, "ns"]];
+  for (const [scale, unit] of units) {
+    if (ns + 0.5 < scale) continue;
+    const rounded = Math.round((ns / scale) * 1000) / 1000;
+    if (rounded < 1 && unit !== "ns") continue;
+    const text = Number.isInteger(rounded) ? String(rounded) : String(rounded);
+    return text + " " + unit;
+  }
+  return "0 ns";
+}
+
+function durationPresets(limits) {
+  const picked = new Set([limits.minNs, limits.maxNs]);
+  if (2_000_000_000 >= limits.minNs && 2_000_000_000 <= limits.maxNs) picked.add(2_000_000_000);
+  for (let base = 1; base <= limits.maxNs; base *= 10) {
+    for (const step of [1, 2, 5]) {
+      const ns = step * base;
+      if (ns >= limits.minNs && ns <= limits.maxNs) picked.add(ns);
+    }
+    if (base > limits.maxNs / 10) break;
+  }
+  return [...picked].sort((a, b) => a - b);
+}
+
+function durationNote(limits) {
+  return `${formatDuration(limits.minNs)} to ${formatDuration(limits.maxNs)}. The capture is rounded down to a multiple of 64 samples.`;
+}
+
+function clampDuration(limits) {
+  if (!(settings.durationNs > 0)) settings.durationNs = 2_000_000_000;
+  if (settings.durationNs < limits.minNs) settings.durationNs = limits.minNs;
+  if (settings.durationNs > limits.maxNs) settings.durationNs = limits.maxNs;
+}
+
+function refillDurationField() {
+  const input = document.getElementById("set-duration");
+  const list = document.getElementById("duration-presets");
+  const note = document.getElementById("duration-note");
+  if (!input && !list && !note) return;
+  const limits = durationLimits();
+  clampDuration(limits);
+  if (list) {
+    list.innerHTML = durationPresets(limits).map((ns) => `<option value="${formatDuration(ns)}"></option>`).join("");
+  }
+  if (input && document.activeElement !== input) input.value = formatDuration(settings.durationNs);
+  if (note) note.textContent = durationNote(limits);
+}
+
+function commitDuration(text) {
+  const ns = parseDurationNs(text);
+  if (ns == null) {
+    refillDurationField();
+    const note = document.getElementById("duration-note");
+    if (note) note.textContent = "Use a length like 250 us, 10 ms, or 2 s.";
+    return;
+  }
+  const limits = durationLimits();
+  const samples = samplesForDuration(ns, limits.rate);
+  if (samples < 64) settings.durationNs = limits.minNs;
+  else if (samples > limits.ceiling) settings.durationNs = limits.maxNs;
+  else settings.durationNs = ns;
+  refillDurationField();
+}
+
+function bindDurationField() {
+  refillDurationField();
+  const input = document.getElementById("set-duration");
+  if (!input) return;
+  const commit = () => commitDuration(input.value);
+  input.addEventListener("change", commit);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    commit();
+  });
 }
 
 function bindCheck(id, key) {

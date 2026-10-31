@@ -677,6 +677,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             session,
             sample_rate_hz,
             duration_ms,
+            duration_ns,
             realtime,
             trigger_enabled,
             trigger_percent,
@@ -700,6 +701,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                     SessionConfig {
                         sample_rate_hz,
                         duration_ms,
+                        duration_ns,
                         realtime,
                         trigger_enabled,
                         trigger_percent,
@@ -1171,6 +1173,8 @@ enum Command {
         session: Option<String>,
         sample_rate_hz: u64,
         duration_ms: u64,
+        #[serde(default)]
+        duration_ns: u64,
         #[serde(default)]
         realtime: bool,
         #[serde(default)]

@@ -100,6 +100,8 @@ pub struct ProfileInfo {
     /// Stream ceilings when the bound U3Pro32 enumerated at SuperSpeed.
     /// High-speed links keep [`Self::stream_rates`].
     pub super_stream_rates: Vec<RateBandInfo>,
+    /// Sample memory in bits. Buffered captures split this across enabled channels.
+    pub memory_bits: u64,
 }
 
 /// A discovered or bound device as presented to UI and automation clients.
@@ -350,6 +352,7 @@ impl Engine {
                 buffer_rates: rate_bands(profile.product_id, false, false),
                 stream_rates: rate_bands(profile.product_id, true, false),
                 super_stream_rates: rate_bands(profile.product_id, true, true),
+                memory_bits: logicview_hal::MEMORY_BITS,
             })
             .collect()
     }
@@ -653,7 +656,15 @@ impl Engine {
             return Err(logicview_capture::CaptureError::Busy.into());
         }
         clamp_sample_rate(slot, &mut config);
-        planned_samples(&config)?;
+        let total = planned_samples(&config)?;
+        let ceiling = session_sample_ceiling(slot, &config);
+        if total > ceiling {
+            return Err(logicview_capture::CaptureError::TooLarge {
+                requested: total,
+                ceiling,
+            }
+            .into());
+        }
         logicview_capture::check_trigger(&config)?;
         slot.session.config = config;
         Ok(())
@@ -1919,6 +1930,48 @@ fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     let max = session_rate_ceiling(slot, config);
     if config.sample_rate_hz > max {
         config.sample_rate_hz = max;
+    }
+}
+
+/// Most samples this session can store for the current mode and enabled channels.
+///
+/// Stream and demo captures stay within [`logicview_capture::MAX_SAMPLES`].
+/// A buffered USB pod can use its sample memory, split across the channels
+/// enabled on that pod. Two pods are limited by the smaller share.
+fn session_sample_ceiling(slot: &Slot, config: &SessionConfig) -> u64 {
+    if config.depth == DepthMode::Stream {
+        return logicview_capture::MAX_SAMPLES;
+    }
+    let usb: Vec<&BoundDevice> = slot
+        .devices
+        .iter()
+        .filter(|device| device.kind == "usb")
+        .collect();
+    if usb.is_empty() {
+        return logicview_capture::MAX_SAMPLES;
+    }
+    let mut offset = 0usize;
+    let mut ceiling = u64::MAX;
+    for device in usb {
+        let Some(pid) = usb_product_id(&device.id) else {
+            continue;
+        };
+        let width = logicview_hal::logic_profile(pid)
+            .map(|profile| usize::from(profile.channels))
+            .unwrap_or(16);
+        let local = local_enable(config.channel_enable, offset, width);
+        offset += width;
+        let count = local.count_ones();
+        if count == 0 {
+            continue;
+        }
+        let share = logicview_hal::MEMORY_BITS / u64::from(count);
+        ceiling = ceiling.min(share);
+    }
+    if ceiling == u64::MAX {
+        logicview_capture::MAX_SAMPLES
+    } else {
+        ceiling
     }
 }
 

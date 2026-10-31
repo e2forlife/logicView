@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use logicview_capture::{DepthMode, RunPolicy, SessionConfig, TriggerStep};
+use logicview_capture::{CaptureError, DepthMode, RunPolicy, SessionConfig, TriggerStep};
 use logicview_proto::{decode_arm, ModeFlags};
 
 use super::{
     hardware_before_demo, install_usb_catalog, local_enable, BoundDevice, DeviceInfo, Engine,
-    StartMode,
+    EngineError, StartMode,
 };
 
 /// Checks that native persistence preserves captured logic, analog values, and subsequent edge
@@ -917,4 +917,106 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
         "combined buffer: {} samples, plus {}, u3 {}",
         status.sample_count, status.channels[0].name, status.channels[16].name
     );
+}
+
+/// Demo and stream stay at the host sample cap. A buffered pod can use its memory,
+/// split across the channels enabled on that pod.
+#[tokio::test]
+async fn buffer_length_stops_at_the_pod_memory_share() {
+    let engine = Engine::new();
+    let demo = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match demo {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_capture::MAX_SAMPLES);
+        }
+        other => panic!("demo buffer should stop at the host cap, got {other}"),
+    }
+
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
+        install_usb_catalog(slot, &[bound_usb("usb:2a0e:0020", "DSLogic Plus")]).unwrap();
+    }
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                channel_enable: 1,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let wide = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                channel_enable: 0,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match wide {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_hal::MEMORY_BITS / 16);
+        }
+        other => panic!("16 channels should split the pod memory, got {other}"),
+    }
+
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
+        install_usb_catalog(
+            slot,
+            &[
+                bound_usb("usb:2a0e:0020", "DSLogic Plus"),
+                bound_usb("usb:2a0e:002c", "DSLogic U3Pro32"),
+            ],
+        )
+        .unwrap();
+    }
+    let stacked = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 9_000,
+                channel_enable: 0,
+                depth: DepthMode::Buffer,
+                run: RunPolicy::Single,
+                trigger_enabled: false,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match stacked {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_hal::MEMORY_BITS / 32);
+        }
+        other => panic!("two pods should use the smaller memory share, got {other}"),
+    }
 }

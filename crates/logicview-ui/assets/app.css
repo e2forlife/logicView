@@ -971,6 +971,7 @@ table.ann tr:hover { background: #222733; }
 
 .acq-row select,
 .acq-row input[type="number"],
+.acq-row input[type="text"],
 .acq-row input[type="range"] {
   margin: 0;
   max-width: 158px;
@@ -1263,7 +1264,7 @@ details.advanced summary {
 .side-body h3 { font-size: 14px; padding-top: 8px; border-top: 1px solid var(--line); }
 .device-card { border-radius: 4px; }
 .acq-row { font-size: 13px; border: 0; }
-.acq-row select { min-width: 155px; }
+.acq-row select, .acq-row input[type="text"] { min-width: 155px; }
 @media (max-width: 980px) { .gutter-col { width: 170px; } .toolbar { gap: 8px; } .device-chip { width: 210px; } }
 
 
