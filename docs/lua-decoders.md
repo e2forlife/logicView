@@ -1,6 +1,6 @@
 ﻿# Writing Lua decoders for LogicView
 
-LogicView decoders turn captured digital samples or lower-level protocol events into annotations. This tutorial builds a small signal decoder, adds an option, and shows how to consume and emit events in a decoder stack. See the [README](../README.md#lua-decoders) for setup and the current list of examples.
+LogicView decoders turn captured digital samples or lower-level protocol events into annotations. This tutorial builds a small signal decoder, adds an option, and shows how to consume and emit events in a decoder stack. The [decoder developers guide](decoder-developers-guide.md) is the full interface reference for writing a decoder from a component datasheet. See the [README](../README.md#lua-decoders) for setup and the current list of examples.
 
 ## 1. Install and load a script
 

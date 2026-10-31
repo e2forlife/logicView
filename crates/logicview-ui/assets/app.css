@@ -649,7 +649,71 @@ table.ann tr:hover { background: #222733; }
 .decode-help { width: 20px; height: 20px; padding: 0; border: 1px solid #526176; border-radius: 50%; background: transparent; color: var(--muted); font-weight: bold; }
 .decode-protocol-label, .decode-list-label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
 .decode-add-row { display: flex; align-items: stretch; gap: 6px; margin-bottom: 12px; }
-.decode-add-row select { flex: 1; min-width: 0; }
+.decoder-picker { position: relative; flex: 1; min-width: 0; }
+.decoder-kind {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 28px;
+  text-align: left;
+  background: #12171e;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 22px 4px 8px;
+  font-size: 12px;
+  position: relative;
+}
+.decoder-kind > span,
+.decoder-kind-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.decoder-kind::after {
+  content: "";
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-70%) rotate(45deg);
+}
+.decoder-kind-menu {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: #1a212c;
+  border: 1px solid #3a4558;
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.decoder-kind-menu input[type="search"],
+.decode-menu-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 4px;
+  background: #12171e;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: inherit;
+}
+#decoder-kind-list { list-style: none; margin: 0; padding: 0; overflow: auto; min-height: 0; }
+#decoder-kind-list [role="option"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+}
+#decoder-kind-list [role="option"][aria-selected="true"],
+#decoder-kind-list [role="option"]:hover { background: #2a3648; }
+.decoder-kind-id { flex: none; color: var(--muted); font-size: 11px; }
+.decoder-kind-empty { padding: 6px 8px; color: var(--muted); font-size: 12px; }
 .decode-add { display: grid; place-items: center; width: 32px; padding: 4px; border: 1px solid #3d4b63; border-radius: 6px; background: #243044; color: var(--text); }
 .decode-add:hover { background: #34445d; }
 .decode-add svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
@@ -1276,8 +1340,11 @@ details.advanced summary {
 .decode-menu-sub { position: relative; }
 .menu-pop .decode-menu-trigger { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .decode-menu-trigger::after { content: ""; width: 6px; height: 6px; border-top: 1.5px solid currentColor; border-right: 1.5px solid currentColor; transform: rotate(45deg); margin-right: 3px; }
-.decode-menu-choices { display: none; position: absolute; left: 100%; top: -4px; min-width: 170px; padding: 4px; background: #1a212c; border: 1px solid #3a4558; border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
+.decode-menu-choices { display: none; position: absolute; left: 100%; top: -4px; min-width: 240px; max-height: 280px; overflow: auto; padding: 4px; background: #1a212c; border: 1px solid #3a4558; border-radius: 8px; box-shadow: 0 12px 32px rgba(0,0,0,.45); }
 .decode-menu-sub:hover .decode-menu-choices, .decode-menu-sub:focus-within .decode-menu-choices, .decode-menu-sub.open .decode-menu-choices { display: block; }
+.decode-menu-search { position: sticky; top: 0; z-index: 1; }
+.decode-menu-choices button.filtered-out,
+.decode-menu-choices .decoder-kind-empty.filtered-out { display: none; }
 .menu-separator { border-top: 1px solid #3a4558; margin: 4px 6px; }
 
 .preferences-open { position: absolute; top: 9px; right: 18px; width: 34px; height: 34px; border: 0; border-radius: 5px; background: transparent; color: var(--text); padding: 6px; }
@@ -1301,7 +1368,9 @@ details.advanced summary {
 #preferences-error { color: #ed6972; }
 :root[data-theme="light"] { color-scheme: light; --bg: #f2f5f9; --bg-elev: #ffffff; --bg-bar: #e9eef4; --line: #c6d0dc; --text: #1b2a3a; --muted: #586b80; --chip: #e5ebf2; }
 :root[data-theme="light"] .titlebar, :root[data-theme="light"] .toolbar, :root[data-theme="light"] .gutter-head, :root[data-theme="light"] .gutter-col, :root[data-theme="light"] .session-bar, :root[data-theme="light"] .side-panel, :root[data-theme="light"] .side-rail, :root[data-theme="light"] .side-sheet, :root[data-theme="light"] .side-body, :root[data-theme="light"] .statusbar { background: var(--bg-elev); color: var(--text); }
-:root[data-theme="light"] .menu-pop, :root[data-theme="light"] .device-menu, :root[data-theme="light"] .device-submenu, :root[data-theme="light"] .decode-menu-choices, :root[data-theme="light"] .wait-card, :root[data-theme="light"] .about-dialog, :root[data-theme="light"] .export-dialog, :root[data-theme="light"] .device-card { background: var(--bg-elev); color: var(--text); border-color: var(--line); }
+:root[data-theme="light"] .menu-pop, :root[data-theme="light"] .device-menu, :root[data-theme="light"] .device-submenu, :root[data-theme="light"] .decode-menu-choices, :root[data-theme="light"] .decoder-kind-menu, :root[data-theme="light"] .wait-card, :root[data-theme="light"] .about-dialog, :root[data-theme="light"] .export-dialog, :root[data-theme="light"] .device-card { background: var(--bg-elev); color: var(--text); border-color: var(--line); }
+:root[data-theme="light"] .decoder-kind, :root[data-theme="light"] .decoder-kind-menu input[type="search"], :root[data-theme="light"] .decode-menu-search { background: #e8eef5; color: var(--text); border-color: var(--line); }
+:root[data-theme="light"] #decoder-kind-list [role="option"]:hover, :root[data-theme="light"] #decoder-kind-list [role="option"][aria-selected="true"] { background: #dbe6f2; color: var(--text); }
 :root[data-theme="light"] .menu-key { color: #5c6b7e; }
 :root[data-theme="light"] select, :root[data-theme="light"] input, :root[data-theme="light"] .device-chip, :root[data-theme="light"] .ch, :root[data-theme="light"] .tab.active, :root[data-theme="light"] .decoder-row.selected, :root[data-theme="light"] .decode-add, :root[data-theme="light"] .ch-all { background: #e8eef5; color: var(--text); border-color: var(--line); }
 :root[data-theme="light"] .ch.selected { background: #c9ddf6; box-shadow: inset 4px 0 0 #075db8; }

@@ -57,6 +57,7 @@ const state = {
   decoderCatalog: [],
   selectedDecoder: null,
   decodeQuery: "",
+  decoderProtocol: "",
   spiView: {},
   decodeView: {},
   gutterSig: "",
@@ -2558,13 +2559,19 @@ function panelHtml(name) {
   if (name === "decode") {
     const query = escapeHtml(state.decodeQuery || "");
     return `<div class="decode-heading"><h2>Decode</h2>
-        <button class="decode-help" type="button" aria-label="Decoder panel help" title="Choose a protocol and press plus to add it. Select an enabled decoder to show its table; use its gear to configure channels, options, and overlay, or its trash icon to remove it. The arrow beside each decoded bus folds or shows its waveform channels, and the eye hides a row. A channel used by multiple decoders appears in each group.">?</button>
+        <button class="decode-help" type="button" aria-label="Decoder panel help" title="Open the protocol list, type to filter decoders, and press plus to add the highlighted one. Select an enabled decoder to show its table; use its gear to configure channels, options, and overlay, or its trash icon to remove it. The arrow beside each decoded bus folds or shows its waveform channels, and the eye hides a row. A channel used by multiple decoders appears in each group.">?</button>
       </div>
       <label class="decode-protocol-label" for="decoder-kind">Protocol</label>
       <div class="decode-add-row">
-        <select id="decoder-kind">
-          ${state.decoderCatalog.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("")}
-        </select>
+        <div class="decoder-picker" id="decoder-kind-picker">
+          <button type="button" id="decoder-kind" class="decoder-kind" aria-haspopup="listbox" aria-expanded="false" aria-controls="decoder-kind-list">
+            <span id="decoder-kind-label"></span>
+          </button>
+          <div id="decoder-kind-menu" class="decoder-kind-menu hidden">
+            <input id="decoder-kind-search" type="search" placeholder="Search decoders" aria-label="Search decoders" aria-controls="decoder-kind-list" aria-autocomplete="list" autocomplete="off" spellcheck="false">
+            <ul id="decoder-kind-list" role="listbox"></ul>
+          </div>
+        </div>
         <button id="add-decoder" class="decode-add" type="button" title="Add decoder" aria-label="Add decoder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
       </div>
       <div class="decode-list-label">Enabled decoders</div>
@@ -3012,6 +3019,7 @@ function bindPanel(name) {
     }
   }
   if (name === "decode") {
+    bindDecoderPicker();
     document.getElementById("add-decoder").addEventListener("click", () => addDecoder());
     const search = document.getElementById("decode-search");
     search.addEventListener("input", () => {
@@ -3443,6 +3451,177 @@ function protocolLabel(protocol) {
   return state.decoderCatalog.find((item) => item.id === protocol)?.name || PROTOCOL_LABEL[protocol] || protocol;
 }
 
+function decoderMatches(item, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return true;
+  const tags = Array.isArray(item.tags) ? item.tags.join(" ") : "";
+  return [item.name, item.id, item.longname, item.desc, tags]
+    .filter((part) => part != null && part !== "")
+    .join("\n")
+    .toLowerCase()
+    .includes(needle);
+}
+
+function chosenDecoderProtocol() {
+  const catalog = state.decoderCatalog || [];
+  if (state.decoderProtocol && catalog.some((item) => item.id === state.decoderProtocol)) {
+    return state.decoderProtocol;
+  }
+  return catalog[0] ? catalog[0].id : "";
+}
+
+function protocolToAdd() {
+  const menu = document.getElementById("decoder-kind-menu");
+  if (menu && !menu.classList.contains("hidden")) {
+    const active = menu.querySelector("[role='option'][aria-selected='true']");
+    if (active && active.dataset.id) return active.dataset.id;
+  }
+  return chosenDecoderProtocol();
+}
+
+let decoderPickIndex = 0;
+
+function placeDecoderPicker() {
+  const button = document.getElementById("decoder-kind");
+  const menu = document.getElementById("decoder-kind-menu");
+  if (!button || !menu || menu.classList.contains("hidden")) return;
+  const rect = button.getBoundingClientRect();
+  const gap = 4;
+  const below = window.innerHeight - rect.bottom - gap - 8;
+  const above = rect.top - gap - 8;
+  const downward = below >= 160 || below >= above;
+  const limit = Math.max(120, Math.min(240, downward ? below : above));
+  menu.style.left = rect.left + "px";
+  menu.style.width = rect.width + "px";
+  menu.style.maxHeight = limit + "px";
+  if (downward) {
+    menu.style.top = (rect.bottom + gap) + "px";
+    return;
+  }
+  menu.style.top = "0px";
+  menu.style.top = Math.max(8, rect.top - gap - menu.offsetHeight) + "px";
+}
+
+function renderDecoderPickerList(matches) {
+  const list = document.getElementById("decoder-kind-list");
+  const search = document.getElementById("decoder-kind-search");
+  if (!list) return;
+  list.replaceChildren();
+  if (!matches.length) {
+    const empty = document.createElement("li");
+    empty.className = "decoder-kind-empty";
+    empty.textContent = "No matching decoders";
+    list.append(empty);
+    decoderPickIndex = -1;
+    if (search) search.setAttribute("aria-activedescendant", "");
+    return;
+  }
+  if (decoderPickIndex < 0 || decoderPickIndex >= matches.length) decoderPickIndex = 0;
+  matches.forEach((item, index) => {
+    const row = document.createElement("li");
+    row.setAttribute("role", "option");
+    row.dataset.id = item.id;
+    row.id = "decoder-kind-opt-" + index;
+    if (index === decoderPickIndex) row.setAttribute("aria-selected", "true");
+    const name = document.createElement("span");
+    name.className = "decoder-kind-name";
+    name.textContent = item.name || item.id;
+    const id = document.createElement("span");
+    id.className = "decoder-kind-id";
+    id.textContent = item.id;
+    row.append(name, id);
+    row.addEventListener("pointerdown", (ev) => ev.preventDefault());
+    row.addEventListener("click", () => chooseDecoderProtocol(item.id));
+    list.append(row);
+  });
+  const active = list.querySelector("[aria-selected='true']");
+  if (search) search.setAttribute("aria-activedescendant", active ? active.id : "");
+}
+
+function closeDecoderPicker() {
+  const menu = document.getElementById("decoder-kind-menu");
+  const button = document.getElementById("decoder-kind");
+  if (!menu || !button) return;
+  menu.classList.add("hidden");
+  button.setAttribute("aria-expanded", "false");
+  const search = document.getElementById("decoder-kind-search");
+  if (search) {
+    search.value = "";
+    search.setAttribute("aria-activedescendant", "");
+  }
+}
+
+function openDecoderPicker() {
+  const menu = document.getElementById("decoder-kind-menu");
+  const button = document.getElementById("decoder-kind");
+  const search = document.getElementById("decoder-kind-search");
+  if (!menu || !button || !search) return;
+  menu.classList.remove("hidden");
+  button.setAttribute("aria-expanded", "true");
+  search.value = "";
+  const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, ""));
+  const selected = chosenDecoderProtocol();
+  const found = matches.findIndex((item) => item.id === selected);
+  decoderPickIndex = found >= 0 ? found : 0;
+  renderDecoderPickerList(matches);
+  placeDecoderPicker();
+  search.focus();
+  const active = document.getElementById("decoder-kind-list").querySelector("[aria-selected='true']");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function chooseDecoderProtocol(id) {
+  state.decoderProtocol = id;
+  const label = document.getElementById("decoder-kind-label");
+  if (label) label.textContent = protocolLabel(id);
+  closeDecoderPicker();
+}
+
+function bindDecoderPicker() {
+  const button = document.getElementById("decoder-kind");
+  const picker = document.getElementById("decoder-kind-picker");
+  const search = document.getElementById("decoder-kind-search");
+  if (!button || !picker || !search) return;
+  const current = chosenDecoderProtocol();
+  if (current) state.decoderProtocol = current;
+  const label = document.getElementById("decoder-kind-label");
+  if (label) label.textContent = current ? protocolLabel(current) : "Decoder";
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const menu = document.getElementById("decoder-kind-menu");
+    if (menu.classList.contains("hidden")) openDecoderPicker();
+    else closeDecoderPicker();
+  });
+  picker.addEventListener("click", (ev) => ev.stopPropagation());
+  search.addEventListener("input", () => {
+    const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, search.value));
+    decoderPickIndex = matches.length ? 0 : -1;
+    renderDecoderPickerList(matches);
+  });
+  search.addEventListener("keydown", (ev) => {
+    const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, search.value));
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!matches.length) return;
+      const delta = ev.key === "ArrowDown" ? 1 : -1;
+      const base = decoderPickIndex < 0 ? 0 : decoderPickIndex;
+      decoderPickIndex = (base + delta + matches.length) % matches.length;
+      renderDecoderPickerList(matches);
+      const active = document.getElementById("decoder-kind-list").querySelector("[aria-selected='true']");
+      if (active) active.scrollIntoView({ block: "nearest" });
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      const match = matches[decoderPickIndex];
+      if (match) chooseDecoderProtocol(match.id);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeDecoderPicker();
+      button.focus();
+    }
+  });
+}
+
 function emitsProtocol(protocol, expected) {
   if (!expected) return false;
   if (protocol === expected) return true;
@@ -3451,7 +3630,8 @@ function emitsProtocol(protocol, expected) {
 }
 
 async function addDecoder(protocol) {
-  protocol = protocol || document.getElementById("decoder-kind").value;
+  protocol = protocol || protocolToAdd();
+  if (!protocol) return;
   try {
     const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
     const parent = schema?.stack_on && state.decoders.find((row) => emitsProtocol(row.protocol, schema.stack_on));
@@ -5132,13 +5312,56 @@ function openMenu(button) {
     add.setAttribute("aria-haspopup", "true");
     const submenu = document.createElement("div");
     submenu.className = "decode-menu-choices";
-    for (const { id: protocol, name: label } of state.decoderCatalog) {
+    const search = document.createElement("input");
+    search.type = "search";
+    search.className = "decode-menu-search";
+    search.placeholder = "Search decoders";
+    search.setAttribute("aria-label", "Search decoders");
+    search.autocomplete = "off";
+    search.spellcheck = false;
+    const applyMenuFilter = () => {
+      let visible = 0;
+      for (const choice of submenu.querySelectorAll("button")) {
+        const item = (state.decoderCatalog || []).find((row) => row.id === choice.dataset.id);
+        const hide = !item || !decoderMatches(item, search.value);
+        choice.classList.toggle("filtered-out", hide);
+        if (!hide) visible += 1;
+      }
+      const empty = submenu.querySelector(".decoder-kind-empty");
+      if (empty) empty.classList.toggle("filtered-out", visible > 0);
+    };
+    search.addEventListener("click", (ev) => ev.stopPropagation());
+    search.addEventListener("input", applyMenuFilter);
+    search.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeMenu();
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const choice = [...submenu.querySelectorAll("button")].find((button) => !button.classList.contains("filtered-out"));
+        if (choice) choice.click();
+      }
+    });
+    submenu.append(search);
+    for (const item of state.decoderCatalog) {
       const choice = document.createElement("button");
       choice.type = "button";
-      choice.textContent = label;
-      choice.addEventListener("click", () => { closeMenu(); addDecoder(protocol); });
+      choice.dataset.id = item.id;
+      const name = document.createElement("span");
+      name.className = "decoder-kind-name";
+      name.textContent = item.name || item.id;
+      const id = document.createElement("span");
+      id.className = "decoder-kind-id";
+      id.textContent = item.id;
+      choice.append(name, id);
+      choice.addEventListener("click", () => { closeMenu(); addDecoder(item.id); });
       submenu.append(choice);
     }
+    const empty = document.createElement("div");
+    empty.className = "decoder-kind-empty filtered-out";
+    empty.textContent = "No matching decoders";
+    submenu.append(empty);
     add.addEventListener("click", () => wrapper.classList.toggle("open"));
     wrapper.append(add, submenu);
     pop.append(wrapper);
@@ -5277,7 +5500,10 @@ for (const button of document.querySelectorAll(".menubar button")) {
     openMenu(button);
   });
 }
+sideBody.addEventListener("scroll", () => placeDecoderPicker());
+window.addEventListener("resize", () => placeDecoderPicker());
 document.addEventListener("click", (ev) => {
+  if (!ev.target.closest("#decoder-kind-picker")) closeDecoderPicker();
   if (!ev.target.closest(".menu-pop") && !ev.target.closest(".menubar")) closeMenu();
   if (!ev.target.closest("#device-menu") && !ev.target.closest("#device-select") && !ev.target.closest("#device-card")) {
     closeDeviceMenu();
@@ -5340,6 +5566,11 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (key === "Escape") {
+    const pickerMenu = document.getElementById("decoder-kind-menu");
+    if (pickerMenu && !pickerMenu.classList.contains("hidden")) {
+      closeDecoderPicker();
+      return;
+    }
     const save = document.getElementById("save-dialog");
     const fly = document.getElementById("color-flyout");
     if (save && !save.classList.contains("hidden")) closeSaveDialog();
