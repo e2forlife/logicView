@@ -47,6 +47,7 @@ const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
+const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
 
 /// Shares the same engine across all HTTP and WebSocket handlers.
 #[derive(Clone)]
@@ -80,8 +81,15 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/settings.svg", get(settings_icon))
         .route("/assets/AppLogo.png", get(app_logo))
         .route("/assets/E2logo.png", get(e2_logo))
-        .route("/api/preferences", get(get_preferences).post(save_preferences))
-        .route("/api/mcp", get(mcp_server::status).post(mcp_server::configure))
+        .route("/api/contributors", get(contributors_json))
+        .route(
+            "/api/preferences",
+            get(get_preferences).post(save_preferences),
+        )
+        .route(
+            "/api/mcp",
+            get(mcp_server::status).post(mcp_server::configure),
+        )
         .route("/api/health", get(health))
         .route("/api/command", post(command))
         .route("/api/events", get(events))
@@ -123,7 +131,9 @@ pub async fn serve_listener(
     let local = listener.local_addr()?;
     tracing::info!(%local, "LogicView UI listening");
     let control = mcp_server::Control::default();
-    if let Err(err) = control.restore(engine.clone()).await { tracing::warn!("MCP server: {err}"); }
+    if let Err(err) = control.restore(engine.clone()).await {
+        tracing::warn!("MCP server: {err}");
+    }
     axum::serve(listener, router_with_control(engine, control)).await?;
     Ok(())
 }
@@ -136,7 +146,9 @@ async fn get_preferences() -> Json<logicview_config::Preferences> {
     Json(prefs)
 }
 
-async fn save_preferences(Json(mut prefs): Json<logicview_config::Preferences>) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
+async fn save_preferences(
+    Json(mut prefs): Json<logicview_config::Preferences>,
+) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
     let current = logicview_config::load();
     prefs.mcp_enabled = current.mcp_enabled;
     prefs.mcp_port = current.mcp_port;
@@ -162,6 +174,55 @@ async fn settings_icon() -> impl IntoResponse {
 /// Serves the embedded E2 artwork for the About dialog.
 async fn e2_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], E2_LOGO)
+}
+
+/// One person shown in the About dialog as `name -- contribution`.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct Contributor {
+    name: String,
+    contribution: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ContributorFile {
+    #[serde(default)]
+    contributors: Vec<Contributor>,
+}
+
+/// Loads credits from an external file when one is present, otherwise the copy packaged with the app.
+fn contributors() -> &'static [Contributor] {
+    static LIST: std::sync::OnceLock<Vec<Contributor>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let explicit = std::env::var_os("LOGICVIEW_CONTRIB").map(std::path::PathBuf::from);
+        let candidates = explicit
+            .into_iter()
+            .chain([std::path::PathBuf::from("contrib.toml")])
+            .chain(
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|dir| dir.join("contrib.toml"))),
+            );
+        for path in candidates {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                match toml::from_str::<ContributorFile>(&contents) {
+                    Ok(file) if !file.contributors.is_empty() => return file.contributors,
+                    Ok(_) => eprintln!("{} contains no contributors", path.display()),
+                    Err(err) => eprintln!("Invalid contributors {}: {err}", path.display()),
+                }
+            }
+        }
+        toml::from_str::<ContributorFile>(CONTRIBUTORS_TOML)
+            .expect("bundled contributors are valid")
+            .contributors
+    })
+}
+
+/// Serves the About-dialog credits read from the packaged contributor list.
+async fn contributors_json() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(contributors().to_vec()),
+    )
 }
 
 /// Serves the embedded styles used by the waveform workspace.
@@ -237,16 +298,43 @@ struct ImportQuery {
 }
 
 #[derive(Deserialize)]
-struct ImportPath { path: std::path::PathBuf }
-async fn import_path(State(app): State<AppState>, Json(input): Json<ImportPath>) -> Result<Json<Value>, (StatusCode, String)> {
-    let name = input.path.file_name().and_then(|s| s.to_str()).ok_or((StatusCode::BAD_REQUEST, "Invalid file name".into()))?;
-    if !["lvcap", "dsl"].iter().any(|ext| input.path.extension().is_some_and(|value| value.eq_ignore_ascii_case(ext))) {
-        return Err((StatusCode::BAD_REQUEST, "Expected a .lvcap or .dsl file".into()));
+struct ImportPath {
+    path: std::path::PathBuf,
+}
+async fn import_path(
+    State(app): State<AppState>,
+    Json(input): Json<ImportPath>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = input
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid file name".into()))?;
+    if !["lvcap", "dsl"].iter().any(|ext| {
+        input
+            .path
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Expected a .lvcap or .dsl file".into(),
+        ));
     }
-    let metadata = std::fs::metadata(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 { return Err((StatusCode::BAD_REQUEST, "Invalid or oversized capture file".into())); }
+    let metadata =
+        std::fs::metadata(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid or oversized capture file".into(),
+        ));
+    }
     let bytes = std::fs::read(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let result = app.engine.import_capture(None, name, &bytes).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let result = app
+        .engine
+        .import_capture(None, name, &bytes)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(json!({"ok": true, "data": result})))
 }
 
@@ -256,10 +344,7 @@ async fn import_capture(
     Query(query): Query<ImportQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let status = app
-        .engine
-        .import_capture(None, &query.name, &body)
-        .await?;
+    let status = app.engine.import_capture(None, &query.name, &body).await?;
     Ok(Json(json!({"ok": true, "data": status})))
 }
 
@@ -515,6 +600,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                         trigger_channel,
                         trigger_kind: match trigger_kind.as_str() {
                             "falling" => TriggerKind::Falling,
+                            "any" | "either" => TriggerKind::Any,
                             "high" => TriggerKind::High,
                             "low" => TriggerKind::Low,
                             _ => TriggerKind::Rising,
@@ -1204,27 +1290,55 @@ mod tests {
             .await
             .unwrap();
         assert!(res.status().is_success());
-        let logo = app.clone()
-            .oneshot(Request::builder().uri("/assets/AppLogo.png").body(Body::empty()).unwrap())
-            .await.unwrap();
+        let logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/AppLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(logo.status(), StatusCode::OK);
         assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
         let logo_bytes = logo.into_body().collect().await.unwrap().to_bytes();
         assert!(logo_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-        let e2_logo = app.clone()
-            .oneshot(Request::builder().uri("/assets/E2logo.png").body(Body::empty()).unwrap())
-            .await.unwrap();
+        let e2_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/E2logo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(e2_logo.status(), StatusCode::OK);
         assert_eq!(e2_logo.headers()[header::CONTENT_TYPE], "image/png");
-        assert!(e2_logo.into_body().collect().await.unwrap().to_bytes().starts_with(b"\x89PNG\r\n\x1a\n"));
-        let settings = app.clone()
-            .oneshot(Request::builder().uri("/assets/settings.svg").body(Body::empty()).unwrap())
-            .await.unwrap();
+        assert!(e2_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let settings = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/settings.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(settings.status(), StatusCode::OK);
         assert_eq!(settings.headers()[header::CONTENT_TYPE], "image/svg+xml");
         let svg = settings.into_body().collect().await.unwrap().to_bytes();
         assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
         let page = app
+            .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -1237,6 +1351,29 @@ mod tests {
         assert!(html.contains("id=\"device-select\""));
         assert!(html.contains("id=\"device-name\""));
         assert!(html.contains("id=\"cursor-mode\""));
+        assert!(html.contains("id=\"trig-arm\""));
+        assert!(html.contains("id=\"trig-kind\""));
+        assert!(html.contains("id=\"trig-channel\""));
+        assert!(html.contains("id=\"trig-pre\""));
+        assert!(html.contains("about-copy-app"));
+        assert!(html.contains("about-copy-e2"));
+        assert!(html.contains("passionate about engineering"));
+        assert!(html.contains("id=\"about-contributors\""));
+        let credits = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/contributors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(credits.status(), StatusCode::OK);
+        let credits_body = credits.into_body().collect().await.unwrap().to_bytes();
+        let credits_json: Value = serde_json::from_slice(&credits_body).unwrap();
+        assert_eq!(credits_json[0]["name"], "Chuck");
+        assert!(!credits_json[0]["contribution"].as_str().unwrap().is_empty());
         assert!(!html.contains("DreamSourceLab"));
         assert!(!html.contains(">Instant<"));
         assert!(!html.contains("Use Demo"));

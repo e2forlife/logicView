@@ -446,9 +446,8 @@ impl Engine {
         if let Some(pid) = usb_product_id(device_id) {
             return self.attach_usb(id, device_id, pid).await;
         }
-        let pod = demo_pod(device_id).ok_or_else(|| {
-            EngineError::UnknownDevice(format!("unknown device {device_id}"))
-        })?;
+        let pod = demo_pod(device_id)
+            .ok_or_else(|| EngineError::UnknownDevice(format!("unknown device {device_id}")))?;
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         let slot = state.slot_mut(&id)?;
@@ -1613,6 +1612,7 @@ fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
     match config.trigger_kind {
         TriggerKind::Rising => "rising".into(),
         TriggerKind::Falling => "falling".into(),
+        TriggerKind::Any => "any".into(),
         TriggerKind::High => "high".into(),
         TriggerKind::Low => "low".into(),
     }
@@ -1733,7 +1733,11 @@ fn refuse_usb_attach(slot: &Slot, pid: u16) -> Result<(), EngineError> {
             "two pods with the same product id cannot share one capture".into(),
         ));
     }
-    let usb = slot.devices.iter().filter(|device| device.kind == "usb").count();
+    let usb = slot
+        .devices
+        .iter()
+        .filter(|device| device.kind == "usb")
+        .count();
     if usb != 1 {
         return Err(EngineError::Device(
             "a capture stacks at most two USB pods".into(),
@@ -1771,9 +1775,8 @@ fn install_usb_catalog(slot: &mut Slot, devices: &[BoundDevice]) -> Result<(), E
     let mut colors = Vec::new();
     let mut origins = Vec::new();
     for device in devices {
-        let pid = usb_product_id(&device.id).ok_or_else(|| {
-            EngineError::UnknownDevice(format!("{} is not a USB pod", device.id))
-        })?;
+        let pid = usb_product_id(&device.id)
+            .ok_or_else(|| EngineError::UnknownDevice(format!("{} is not a USB pod", device.id)))?;
         let width = logicview_hal::logic_profile(pid)
             .map(|profile| usize::from(profile.channels))
             .unwrap_or(16);
@@ -1820,9 +1823,8 @@ fn pod_captures(
     let mut jobs = Vec::new();
     let stream = config.depth == DepthMode::Stream;
     for device in devices.iter().filter(|device| device.kind == "usb") {
-        let pid = usb_product_id(&device.id).ok_or_else(|| {
-            EngineError::Device(format!("{} is not a USB pod", device.id))
-        })?;
+        let pid = usb_product_id(&device.id)
+            .ok_or_else(|| EngineError::Device(format!("{} is not a USB pod", device.id)))?;
         let width = logicview_hal::logic_profile(pid)
             .map(|profile| usize::from(profile.channels))
             .unwrap_or(16);
@@ -1832,7 +1834,13 @@ fn pod_captures(
         if count == 0 {
             continue;
         }
-        let clock = clock_for(pid, config.sample_rate_hz, local, stream, device.super_speed)?;
+        let clock = clock_for(
+            pid,
+            config.sample_rate_hz,
+            local,
+            stream,
+            device.super_speed,
+        )?;
         let image = logicview_capture::device_arm(config, samples, local, &clock)?;
         let threshold = if pid == logicview_hal::U3PRO32_PID {
             Some(logicview_hal::u3_threshold_code(config.threshold_volts))
@@ -1866,7 +1874,8 @@ fn clock_for(
         EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
     };
     if pid == logicview_hal::U3PRO32_PID {
-        let planned = logicview_hal::plan_u3_link(rate_hz, mask, stream, super_speed).map_err(map)?;
+        let planned =
+            logicview_hal::plan_u3_link(rate_hz, mask, stream, super_speed).map_err(map)?;
         Ok(HostClock {
             hw_max_hz: planned.hw_max_hz,
             half_rate_hz: Some(planned.half_rate_hz),

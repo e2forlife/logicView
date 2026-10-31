@@ -520,6 +520,7 @@ function renderChrome() {
   renderMeasureList();
   drawRuler();
   syncTimebaseLabel();
+  syncTriggerToolbar();
 }
 
 function paintStatus() {
@@ -2130,6 +2131,114 @@ function devicePanel() {
     </details>`;
 }
 
+const TRIGGER_KINDS = [
+  { id: "rising", label: "Rising edge", path: "M4 16h7V8h9" },
+  { id: "falling", label: "Falling edge", path: "M4 8h7v8h9" },
+  { id: "any", label: "Any edge", path: "M3 16h5V8h8v8h5" },
+  { id: "high", label: "High level", path: "M4 8h16" },
+  { id: "low", label: "Low level", path: "M4 16h16" },
+];
+const PRE_TRIGGER_CHOICES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+
+function triggerKindIndex() {
+  const index = TRIGGER_KINDS.findIndex((kind) => kind.id === settings.triggerKind);
+  return index < 0 ? 0 : index;
+}
+
+function activeTriggerChannels() {
+  const probes = state.probes.length ? state.probes : state.channels;
+  if (!probes.length) return [{ index: settings.triggerChannel || 0, label: "0" }];
+  const enabled = probes.filter((probe) => channelIsEnabled(probe.index));
+  const labels = enabled.map((probe) => probe.name || String(probe.index));
+  const shared = labels.some((label, index) => labels.indexOf(label) !== index);
+  return enabled.map((probe) => ({
+    index: probe.index,
+    label: shared
+      ? `${deviceTag(probe.device_name)} ${probe.name || probe.index}`
+      : (probe.name || String(probe.index)),
+  }));
+}
+
+function syncTriggerChannelSelect(select) {
+  if (!select) return;
+  const choices = activeTriggerChannels();
+  const sig = choices.map((choice) => `${choice.index}:${choice.label}`).join("|");
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.replaceChildren();
+    for (const choice of choices) {
+      const option = document.createElement("option");
+      option.value = String(choice.index);
+      option.textContent = choice.label;
+      select.appendChild(option);
+    }
+  }
+  if (!choices.length) return;
+  if (!choices.some((choice) => choice.index === settings.triggerChannel)) {
+    settings.triggerChannel = choices[0].index;
+  }
+  if (select.value !== String(settings.triggerChannel)) select.value = String(settings.triggerChannel);
+}
+
+function syncPreTriggerSelect() {
+  const select = document.getElementById("trig-pre");
+  if (!select) return;
+  const value = Math.max(0, Math.min(90, Math.round(Number(settings.percent) || 0)));
+  settings.percent = value;
+  const values = PRE_TRIGGER_CHOICES.includes(value)
+    ? PRE_TRIGGER_CHOICES
+    : [...PRE_TRIGGER_CHOICES, value].sort((a, b) => a - b);
+  const sig = values.join(",");
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.replaceChildren();
+    for (const item of values) {
+      const option = document.createElement("option");
+      option.value = String(item);
+      option.textContent = `${item}%`;
+      select.appendChild(option);
+    }
+  }
+  if (select.value !== String(value)) select.value = String(value);
+}
+
+function paintTriggerKind() {
+  const kind = TRIGGER_KINDS[triggerKindIndex()];
+  const button = document.getElementById("trig-kind");
+  const path = document.getElementById("trig-kind-path");
+  const label = document.getElementById("trig-kind-label");
+  if (!button || !path || !label) return;
+  path.setAttribute("d", kind.path);
+  label.textContent = kind.label;
+  button.title = kind.label;
+  button.setAttribute("aria-label", `Trigger type, ${kind.label}`);
+}
+
+function paintTriggerArm() {
+  const button = document.getElementById("trig-arm");
+  if (!button) return;
+  button.setAttribute("aria-pressed", settings.trigger ? "true" : "false");
+  button.title = settings.trigger ? "Trigger on" : "Trigger off";
+  button.setAttribute("aria-label", settings.trigger ? "Disable trigger" : "Enable trigger");
+}
+
+function syncTriggerToolbar() {
+  paintTriggerArm();
+  paintTriggerKind();
+  syncTriggerChannelSelect(document.getElementById("trig-channel"));
+  syncPreTriggerSelect();
+  const panel = document.getElementById("panel-trig-channel");
+  if (panel && document.activeElement !== panel) syncTriggerChannelSelect(panel);
+  const edge = document.getElementById("panel-trig-edge");
+  if (edge && document.activeElement !== edge && edge.value !== settings.triggerKind) edge.value = settings.triggerKind;
+  const position = document.getElementById("set-position");
+  const positionLabel = document.getElementById("set-position-label");
+  if (position && document.activeElement !== position) {
+    position.value = String(settings.percent);
+    if (positionLabel) positionLabel.textContent = `${settings.percent}%`;
+  }
+}
+
 function triggerPanel() {
   const steps = settings.triggerSteps
     .map((step, index) => `<div class="step">
@@ -2141,7 +2250,7 @@ function triggerPanel() {
         <button type="button" data-remove="${index}">Remove</button>
       </div>`)
     .join("");
-  const source = (state.channels.length ? state.channels : [{ index: 0, name: "0" }]).map((channel) => `<option value="${channel.index}">${escapeHtml(channel.name)}</option>`).join("");
+  const source = activeTriggerChannels().map((choice) => `<option value="${choice.index}">${escapeHtml(choice.label)}</option>`).join("");
   return `<h2>Triggers</h2>
     <label class="check"><input id="trig-enable" type="checkbox"> Enable trigger</label>
     <label class="acq-row">Source
@@ -2151,8 +2260,9 @@ function triggerPanel() {
       <select id="panel-trig-edge" aria-label="Trigger type">
         <option value="rising">Rising edge</option>
         <option value="falling">Falling edge</option>
-        <option value="high">High</option>
-        <option value="low">Low</option>
+        <option value="any">Any edge</option>
+        <option value="high">High level</option>
+        <option value="low">Low level</option>
       </select>
     </label>
     <label class="acq-row">Position
@@ -2267,6 +2377,7 @@ function bindPanel(name) {
       renderGutter();
       scheduleTiles();
       drawWave();
+      syncTriggerToolbar();
       selectTab("device");
     };
     for (const button of document.querySelectorAll("#channel-enable .ch-en")) {
@@ -2291,25 +2402,34 @@ function bindPanel(name) {
   if (name === "triggers") {
     const enable = document.getElementById("trig-enable");
     enable.checked = settings.trigger;
-    enable.addEventListener("change", () => { settings.trigger = enable.checked; });
+    enable.addEventListener("change", () => {
+      settings.trigger = enable.checked;
+      paintTriggerArm();
+    });
     const source = document.getElementById("panel-trig-channel");
     const edge = document.getElementById("panel-trig-edge");
     const position = document.getElementById("set-position");
     const positionLabel = document.getElementById("set-position-label");
     source.value = String(settings.triggerChannel);
-    if (!source.value) { source.selectedIndex = 0; settings.triggerChannel = Number(source.value || 0); }
+    if (source.options.length && !source.value) {
+      source.selectedIndex = 0;
+      settings.triggerChannel = Number(source.value || 0);
+    }
     edge.value = settings.triggerKind;
     position.value = String(settings.percent);
     positionLabel.textContent = settings.percent + "%";
     source.addEventListener("change", () => {
       settings.triggerChannel = Number(source.value);
+      syncTriggerChannelSelect(document.getElementById("trig-channel"));
     });
     edge.addEventListener("change", () => {
       settings.triggerKind = edge.value;
+      paintTriggerKind();
     });
     position.addEventListener("input", () => {
       settings.percent = Number(position.value);
       positionLabel.textContent = settings.percent + "%";
+      syncPreTriggerSelect();
     });
     document.getElementById("add-step").addEventListener("click", () => {
       const next = settings.triggerSteps.length === 0 ? 1 : settings.triggerSteps.length === 1 ? 3 : 0;
@@ -2317,6 +2437,7 @@ function bindPanel(name) {
       settings.trigger = true;
       const box = document.getElementById("trig-enable");
       if (box) box.checked = true;
+      paintTriggerArm();
       selectTab("triggers");
     });
     for (const input of document.querySelectorAll("#trigger-steps [data-field='channel']")) {
@@ -4262,6 +4383,29 @@ document.getElementById("tool-marker").addEventListener("click", () => setTool("
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
 document.getElementById("zoom-in").addEventListener("click", () => stepZoom(false));
 document.getElementById("zoom-out").addEventListener("click", () => stepZoom(true));
+document.getElementById("trig-arm").addEventListener("click", () => {
+  settings.trigger = !settings.trigger;
+  const enable = document.getElementById("trig-enable");
+  if (enable) enable.checked = settings.trigger;
+  paintTriggerArm();
+});
+document.getElementById("trig-kind").addEventListener("click", () => {
+  const next = TRIGGER_KINDS[(triggerKindIndex() + 1) % TRIGGER_KINDS.length];
+  settings.triggerKind = next.id;
+  syncTriggerToolbar();
+});
+document.getElementById("trig-channel").addEventListener("change", (ev) => {
+  settings.triggerChannel = Number(ev.target.value);
+  const panel = document.getElementById("panel-trig-channel");
+  if (panel) panel.value = ev.target.value;
+});
+document.getElementById("trig-pre").addEventListener("change", (ev) => {
+  settings.percent = Number(ev.target.value);
+  const position = document.getElementById("set-position");
+  const positionLabel = document.getElementById("set-position-label");
+  if (position) position.value = String(settings.percent);
+  if (positionLabel) positionLabel.textContent = `${settings.percent}%`;
+});
 document.getElementById("edge-prev").addEventListener("click", (ev) => {
   ev.stopPropagation();
   stepEdge(false, state.edgeChannel);
@@ -4772,9 +4916,37 @@ async function openNativeCapture(path) {
   } catch (err) { statusEl.textContent = err.message; }
 }
 
+async function loadContributors() {
+  const list = document.getElementById("about-contributors");
+  if (!list) return;
+  try {
+    const response = await fetch("/api/contributors");
+    if (!response.ok) return;
+    const people = await response.json();
+    list.replaceChildren();
+    for (const person of people) {
+      const name = person && person.name ? String(person.name) : "";
+      const contribution = person && person.contribution ? String(person.contribution) : "";
+      if (!name) continue;
+      const item = document.createElement("li");
+      item.textContent = `${name} -- ${contribution}`;
+      list.appendChild(item);
+    }
+    const box = list.parentElement;
+    if (box) box.classList.toggle("is-still", list.scrollHeight <= box.clientHeight);
+  } catch (_) { /* the credits list stays empty when the file cannot be read */ }
+}
+
 async function boot() {
   await loadPreferences();
-  try { const response = await fetch("/api/mcp"); if (response.ok) paintMcp(await response.json()); } catch (_) { /* status is available from the flyout */ }
+  await loadContributors();
+  try {
+    const loaded = await Promise.race([
+      fetch("/api/mcp").then((response) => (response.ok ? response.json() : null)),
+      new Promise((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+    if (loaded) paintMcp(loaded);
+  } catch (_) { /* status is available from the flyout */ }
   await loadDecoderCatalog();
   await refreshSessions();
   const listed = await api({ cmd: "list_sessions" });

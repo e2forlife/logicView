@@ -43,7 +43,22 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
         Stop
       </button>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
+      <div class="toolbar-section" role="group" aria-label="Trigger">
+        <button id="trig-arm" class="trig-arm" type="button" title="Trigger off" aria-label="Enable trigger" aria-pressed="false"></button>
+        <select id="trig-channel" aria-label="Trigger channel" title="Trigger channel"></select>
+        <button id="trig-kind" class="trig-kind" type="button" title="Rising edge" aria-label="Trigger type, rising edge">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path id="trig-kind-path" d="M4 16h7V8h9"></path></svg>
+          <span id="trig-kind-label">Rising edge</span>
+        </button>
+      </div>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
+      <div class="toolbar-section" role="group" aria-label="Pre-trigger">
+        <span class="tiny" id="trig-pre-label">Pre-trigger</span>
+        <select id="trig-pre" aria-labelledby="trig-pre-label" title="Pre-trigger"></select>
+      </div>
       <div class="spacer"></div>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
       <button id="zoom-out" class="icon-btn" type="button" title="Zoom out" aria-label="Zoom out">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6M14.5 14.5L20 20"></path></svg>
       </button>
@@ -202,15 +217,25 @@
   </dialog>
   <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
     <div class="about-card">
-      <div class="about-logo" aria-label="E2 and LogicView logos">
-        <img class="about-logo-e2" src="/assets/E2logo.png" alt="">
-        <img class="about-logo-app" src="/assets/AppLogo.png" alt="">
+      <div class="about-logo">
+        <img class="about-logo-app" src="/assets/AppLogo.png" alt="LogicView">
+        <img class="about-logo-e2" src="/assets/E2logo.png" alt="E2ForLife">
       </div>
-      <h2 id="about-title">About LogicView</h2>
-      <p>LogicView is an open-source workspace for capturing and exploring signals. It brings logic analysis, waveform measurements, and protocol decoding together, with demo devices for exploring without hardware.</p>
+      <div class="about-copy">
+        <div class="about-copy-app">
+          <h2 id="about-title">About LogicView</h2>
+          <p>LogicView is an open-source workspace for capturing and exploring signals. It brings logic analysis, waveform measurements, and protocol decoding together, with demo devices for exploring without hardware.</p>
+        </div>
+        <div class="about-copy-e2">
+          <h2>E2ForLife</h2>
+          <p>E2ForLife is a small organization passionate about engineering, embedded systems, firmware, and education.</p>
+          <p>We build tools like LogicView to make working with technology more approachable, useful, and enjoyable. Our goal is to help people learn, experiment, solve problems, and turn ideas into working projects.</p>
+          <p>We believe in the maker lifestyle: stay curious, keep building, share what you learn, and never stop exploring how things work.</p>
+        </div>
+      </div>
       <h3 id="about-contributors-title">Contributors</h3>
       <div class="about-credits" aria-labelledby="about-contributors-title">
-        <ul><li>Chuck</li></ul>
+        <ul id="about-contributors"></ul>
       </div>
       <button type="button" id="about-close">Close</button>
     </div>
