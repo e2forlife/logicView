@@ -5,10 +5,13 @@
 
 use std::time::Duration;
 
-use logicview_capture::{SessionConfig, TriggerStep};
+use logicview_capture::{DepthMode, RunPolicy, SessionConfig, TriggerStep};
 use logicview_proto::{decode_arm, ModeFlags};
 
-use super::{hardware_before_demo, DeviceInfo, Engine, StartMode};
+use super::{
+    hardware_before_demo, install_usb_catalog, local_enable, BoundDevice, DeviceInfo, Engine,
+    StartMode,
+};
 
 /// Checks that native persistence preserves captured logic, analog values, and subsequent edge
 /// searches.
@@ -686,4 +689,196 @@ async fn plus_ten_ms_capture_pipeline() {
     let long = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
     assert_eq!(long.phase, "stopped", "{:?}", long.error);
     assert_eq!(long.sample_count, 5_000_000);
+}
+
+/// Plus occupies the low 16 mask bits and the U3Pro32 the next 32 when the Plus is first.
+#[test]
+fn combined_mask_splits_plus_then_u3() {
+    let mask = 1u64 | (1u64 << 16);
+    assert_eq!(local_enable(0, 0, 16), 0xffff);
+    assert_eq!(local_enable(0, 16, 32), u32::MAX);
+    assert_eq!(local_enable(mask, 0, 16), 1);
+    assert_eq!(local_enable(mask, 16, 32), 1);
+    assert_eq!(local_enable(1, 16, 32), 0);
+}
+
+fn bound_usb(id: &str, name: &str) -> BoundDevice {
+    BoundDevice {
+        id: id.into(),
+        name: name.into(),
+        kind: "usb".into(),
+        super_speed: false,
+    }
+}
+
+/// Two USB pods share one catalog. Stream, trigger, loop, and a repeated product id are refused
+/// before any device is opened.
+#[tokio::test]
+async fn combined_usb_catalog_rates_and_refusals() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = state.slots.iter_mut().find(|slot| slot.id == "ses-1").unwrap();
+        install_usb_catalog(
+            slot,
+            &[
+                bound_usb("usb:2a0e:0020", "DSLogic Plus"),
+                bound_usb("usb:2a0e:002c", "DSLogic U3Pro32"),
+            ],
+        )
+        .unwrap();
+    }
+    let status = engine.status(None).await.unwrap();
+    assert_eq!(status.probes.len(), 48);
+    assert_eq!(status.probes[0].name, "Plus D0");
+    assert_eq!(status.probes[0].device_id, "usb:2a0e:0020");
+    assert_eq!(status.probes[15].name, "Plus D15");
+    assert_eq!(status.probes[16].name, "U3 D0");
+    assert_eq!(status.probes[16].device_id, "usb:2a0e:002c");
+    assert_eq!(status.probes[47].name, "U3 D31");
+    assert_eq!(status.devices.len(), 2);
+
+    let same = engine
+        .attach_device(None, "usb:2a0e:0020")
+        .await
+        .unwrap_err();
+    assert!(
+        same.to_string().contains("same product"),
+        "{same}"
+    );
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 400_000_000,
+                duration_ms: 10,
+                channel_enable: 0,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.status(None).await.unwrap().sample_rate_hz,
+        100_000_000
+    );
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000_000,
+                duration_ms: 10,
+                channel_enable: 1u64 | (1u64 << 16),
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.status(None).await.unwrap().sample_rate_hz,
+        400_000_000
+    );
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                depth: DepthMode::Stream,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stream = engine.start(None, StartMode::Normal).await.unwrap_err();
+    assert!(stream.to_string().contains("single buffer"), "{stream}");
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                trigger_enabled: true,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let trigger = engine.start(None, StartMode::Normal).await.unwrap_err();
+    assert!(trigger.to_string().contains("hardware trigger"), "{trigger}");
+
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                run: RunPolicy::Loop,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let looping = engine.start(None, StartMode::Normal).await.unwrap_err();
+    assert!(looping.to_string().contains("single buffer"), "{looping}");
+}
+
+/// Buffer-captures every probe on the connected Plus and U3Pro32 in one session.
+#[tokio::test]
+#[ignore = "needs the connected DSLogic Plus and DSLogic U3Pro32"]
+async fn plus_and_u3_ten_ms_combined_buffer() {
+    let _pods = logicview_hal::acquire_test_pod_lock();
+    let engine = Engine::new();
+    engine.connect("usb:2a0e:0020").await.unwrap();
+    engine.attach_device(None, "usb:2a0e:002c").await.unwrap();
+    let attached = engine.status(None).await.unwrap();
+    assert_eq!(attached.probes.len(), 48);
+    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:0020"));
+    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:002c"));
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 10,
+                channel_enable: 0,
+                trigger_enabled: false,
+                depth: DepthMode::Buffer,
+                run: RunPolicy::Single,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    engine.start(None, StartMode::Normal).await.unwrap();
+    let status = engine
+        .wait_until_settled("ses-1", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(status.phase, "stopped", "{:?}", status.error);
+    assert!(status.error.is_none());
+    assert!(status.sample_count > 0, "sample_count {}", status.sample_count);
+    assert_eq!(status.channels.len(), 48);
+    assert_eq!(status.channels[0].device_id, "usb:2a0e:0020");
+    assert_eq!(status.channels[16].device_id, "usb:2a0e:002c");
+    let plus = engine.tile(None, 0, 0.0, 8, 64.0).await.unwrap();
+    let u3 = engine.tile(None, 16, 0.0, 8, 64.0).await.unwrap();
+    assert!(
+        plus.iter().any(|column| column.valid),
+        "Plus channel had no samples"
+    );
+    assert!(
+        u3.iter().any(|column| column.valid),
+        "U3 channel had no samples"
+    );
+    eprintln!(
+        "combined buffer: {} samples, plus {}, u3 {}",
+        status.sample_count,
+        status.channels[0].name,
+        status.channels[16].name
+    );
 }

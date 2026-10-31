@@ -277,3 +277,201 @@ async fn settle(shared: &Shared, id: &str, generation: u64, error: Option<String
     };
     shared.emit(event);
 }
+
+/// One pod inside a combined buffer capture.
+pub(crate) struct PodJob {
+    pub image: Vec<u8>,
+    pub enabled: u64,
+    pub offset: usize,
+    pub product_id: u16,
+    pub threshold: Option<u8>,
+}
+
+enum PodNote {
+    Samples {
+        offset: usize,
+        enabled: usize,
+        chunk: Vec<u8>,
+    },
+    Ended {
+        result: Result<logicview_hal::CaptureReport, HalError>,
+    },
+}
+
+/// Runs every pod at once and appends each pod's channels at its store offset.
+pub(crate) async fn drive_dual(
+    shared: Arc<Shared>,
+    id: String,
+    generation: u64,
+    stop: Arc<AtomicBool>,
+    samples: u64,
+    header_wait: Duration,
+    discard: bool,
+    jobs: Vec<PodJob>,
+) {
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut workers = Vec::new();
+    for job in jobs {
+        let tx_thread = tx.clone();
+        let stop = Arc::clone(&stop);
+        workers.push(std::thread::spawn(move || {
+            let offset = job.offset;
+            let enabled = job.enabled as usize;
+            let capture = CaptureJob {
+                image: job.image,
+                enabled_channels: job.enabled,
+                requested_samples: samples,
+                threshold: job.threshold,
+                stream: false,
+                continuous: false,
+                stop,
+                on_stop: OnStop::Upload,
+                abort_after_header: false,
+                header_wait,
+                sample_limit: None,
+                product_id: Some(job.product_id),
+            };
+            let result = run_capture(&capture, |event| match event {
+                CaptureEvent::Header(_) => Ok(()),
+                CaptureEvent::Samples(chunk) => tx_thread
+                    .blocking_send(PodNote::Samples {
+                        offset,
+                        enabled,
+                        chunk,
+                    })
+                    .map_err(|_| HalError::Interrupted("the engine stopped reading".into())),
+            });
+            let _ = tx_thread.blocking_send(PodNote::Ended { result });
+        }));
+    }
+    drop(tx);
+
+    let mut pending = workers.len();
+    let mut failed: Option<String> = None;
+    while let Some(note) = rx.recv().await {
+        match note {
+            PodNote::Samples {
+                offset,
+                enabled,
+                chunk,
+            } => {
+                if failed.is_some() {
+                    continue;
+                }
+                if let Err(err) =
+                    apply_pod_samples(&shared, &id, generation, offset, enabled, &chunk).await
+                {
+                    failed = Some(err);
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            PodNote::Ended { result } => {
+                pending = pending.saturating_sub(1);
+                match result {
+                    Ok(report) => {
+                        if report.overflow {
+                            warn(
+                                &shared,
+                                &id,
+                                generation,
+                                "sample memory overflowed".into(),
+                            )
+                            .await;
+                        }
+                        if let Some(header) = report.header {
+                            if let Some(text) =
+                                capture_length_warning(false, samples, header.remaining)
+                            {
+                                warn(&shared, &id, generation, text).await;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if failed.is_none() {
+                            failed = Some(err.to_string());
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if pending == 0 {
+            break;
+        }
+    }
+    for worker in workers {
+        if worker.join().is_err() && failed.is_none() {
+            failed = Some("a pod capture thread stopped".into());
+        }
+    }
+    if failed.is_none() {
+        equalize(&shared, &id, generation).await;
+    }
+    let aborted = stop.load(Ordering::Relaxed);
+    settle(
+        &shared,
+        &id,
+        generation,
+        failed,
+        discard && aborted,
+    )
+    .await;
+}
+
+/// Unpacks one pod's atoms into its channel range.
+async fn apply_pod_samples(
+    shared: &Shared,
+    id: &str,
+    generation: u64,
+    offset: usize,
+    enabled: usize,
+    chunk: &[u8],
+) -> Result<(), String> {
+    if enabled == 0 {
+        return Err("pod capture had no channels".into());
+    }
+    let samples = (chunk.len() as u64).saturating_mul(8) / enabled as u64;
+    let split =
+        logicview_proto::unpack_logic_atoms(chunk, enabled).map_err(|err| err.to_string())?;
+    let mut state = shared.lock().await;
+    let Some(slot) = state.slots.iter_mut().find(|slot| slot.id == id) else {
+        return Ok(());
+    };
+    if slot.session.generation() != generation {
+        return Ok(());
+    }
+    for (index, bytes) in split.iter().enumerate() {
+        slot.session
+            .store
+            .append_channel(offset + index, bytes, samples)
+            .map_err(|err| err.to_string())?;
+    }
+    if matches!(slot.session.phase, Phase::Arming | Phase::WaitingTrigger) {
+        slot.session.phase = Phase::Running;
+    }
+    let phase = slot.session.phase.as_str().to_string();
+    let sample_count = slot.session.store.len();
+    shared.emit(EngineEvent::Appended {
+        session: id.to_string(),
+        phase,
+        sample_count,
+    });
+    Ok(())
+}
+
+/// Keeps the shorter pod record so every channel shares one sample index.
+async fn equalize(shared: &Shared, id: &str, generation: u64) {
+    let mut state = shared.lock().await;
+    let Some(slot) = state.slots.iter_mut().find(|slot| slot.id == id) else {
+        return;
+    };
+    if slot.session.generation() != generation {
+        return;
+    }
+    let (shortest, longest) = slot.session.store.sample_span();
+    if longest > shortest {
+        slot.session
+            .warn("the pods returned different lengths; the record keeps the shorter one");
+    }
+    slot.session.store.trim_to_shortest();
+}

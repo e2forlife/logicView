@@ -4,8 +4,8 @@ LogicView decoders turn captured digital samples or lower-level protocol events 
 
 ## 1. Install and load a script
 
-1. Choose a directory for your scripts. The repository's [`examples/decoders`](../examples/decoders) directory contains working examples.
-2. Open **Preferences** using the gear in the upper right and set the Lua decoder script directory to that directory. Save Preferences.
+1. Choose a directory for your scripts. A blank preference uses the repository's [`examples/decoders`](../examples/decoders) directory, which contains the translated DSView decoders and the shorter tutorials.
+2. Open **Preferences** using the gear in the upper right to point the Lua decoder script directory somewhere else. Save Preferences.
 3. Add your decoder from the Decode panel or menu, open its configuration, and map its signal roles to captured channels. Run a capture or use an existing capture to see its annotations.
 
 LogicView discovers `.lua` files directly in the configured directory at startup and when Preferences are saved. Save Preferences again after adding or changing a script to refresh the catalog. A script returns a Lua table; its `id` must be unique, nonempty, and contain only ASCII letters, digits, underscores, or hyphens. Built-in decoder IDs take precedence. Give your script a distinct ID such as `tutorial_high_pulses`.
@@ -85,7 +85,7 @@ Option defaults and values are strings. A `values` list produces a selection con
 local seconds = context.sample_rate_hz and width_samples / context.sample_rate_hz
 ```
 
-For a working settings and timing example, see [`pwm.lua`](../examples/decoders/pwm.lua).
+For a working settings and timing example, see [`dsview_pwm.lua`](../examples/decoders/dsview_pwm.lua).
 
 ## 4. Consume a lower-level decoder
 
@@ -122,7 +122,7 @@ return {
 
 The range check matters because a parent's region can differ from its child's. Decide whether to skip, clip, or reassemble events at a region boundary; never return an annotation outside the child's range. Test packet data types: missing SPI data lines are represented as null, not numeric zero.
 
-`context.lower` also contains the parent's annotations, including their ranges, classes, text, and fields. Use packets for structured protocol data when the parent provides them. The existing [`rgb_led_spi.lua`](../examples/decoders/rgb_led_spi.lua) groups three MOSI words into a color, while [`adns5020.lua`](../examples/decoders/adns5020.lua) also handles chip-select changes.
+`context.lower` also contains the parent's annotations, including their ranges, classes, text, and fields. Use packets for structured protocol data when the parent provides them. The existing [`dsview_rgb_led_spi.lua`](../examples/decoders/dsview_rgb_led_spi.lua) groups three MOSI words into a color, while [`dsview_adns5020.lua`](../examples/decoders/dsview_adns5020.lua) also handles chip-select changes.
 
 ## 5. Produce packets for another layer
 
@@ -190,7 +190,7 @@ end
 
 `put(start_sample, end_sample, output_id, data)` uses sigrok's inclusive end. A marker on one sample uses the same number for both ends. LogicView stores that marker as the half-open range `[start_sample, end_sample + 1)`. The functional callback's returned ranges stay exclusive.
 
-`wait` blocks until a condition matches, then sets `self.samplenum` and `self.matched` and returns the pin levels. Pins are ordered as required channels, then optional channels, one-based. A connected pin is `true` or `false`. A disconnected optional pin is `nil`.
+`wait` blocks until a condition matches, then sets `self.samplenum` and `self.matched` and returns the pin levels. Pins are ordered as required channels, then optional channels, one-based. A connected pin is `1` or `0`. A disconnected optional pin is `nil`.
 
 ```lua
 local pins = self:wait({ [0] = "r" })       -- rising edge on the first channel
@@ -201,7 +201,7 @@ local pins = self:wait({ skip = 8 })
 local pins = self:wait()                    -- the next sample
 ```
 
-Terms inside one table are combined with and. A list of tables is combined with or. `self.matched[i]` is true when condition `i` matched. The pin letters are `l`, `h`, `r`, `f`, `e`, and `n` (stable, the opposite of an edge); `0` and `1` mean low and high. `skip` counts samples forward from the previous position.
+Terms inside one table are combined with and. A list of tables is combined with or. `self.matched` is an integer bitmask: bit 0 is set when the first condition matched, bit 1 when the second matched, and so on. `self:has_channel(index)` reports whether that zero-based channel, required channels first, is connected. The pin letters are `l`, `h`, `r`, `f`, `e`, and `n` (stable, the opposite of an edge); `0` and `1` mean low and high. `skip` counts samples forward from the previous position.
 
 Before the first sample, `samplenum` is one less than the region start. At the beginning of a capture the previous level is the first sample, so that sample is not itself an edge. When the region starts later, the previous level is the sample just before the region. `wait` raises the end of the capture when no later sample can match; let that propagate out of `decode` so the `while true` loop stops. Output emitted before that point is kept.
 

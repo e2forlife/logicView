@@ -22,6 +22,41 @@ pub fn path() -> PathBuf {
     base.join("LogicView").join("preferences.json")
 }
 pub fn load() -> Preferences { load_from(&path()) }
+
+/// Directory used when the decoder-script preference is blank.
+///
+/// The source-tree `examples/decoders` directory is preferred, then the same
+/// relative path from the working directory and from the executable.
+pub fn default_scripts_dir() -> PathBuf {
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
+    let mut candidates = vec![compiled.clone(), PathBuf::from("examples/decoders")];
+    if let Ok(current) = std::env::current_dir() { candidates.push(current.join("examples/decoders")); }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|path| path.to_path_buf());
+        for _ in 0..6 {
+            let Some(path) = dir else { break };
+            candidates.push(path.join("examples/decoders"));
+            dir = path.parent().map(|parent| parent.to_path_buf());
+        }
+    }
+    for candidate in candidates {
+        if candidate.is_dir() {
+            let resolved = candidate.canonicalize().unwrap_or(candidate);
+            return friendly_path(resolved);
+        }
+    }
+    friendly_path(compiled)
+}
+
+/// The saved script directory, or [`default_scripts_dir`] when it is blank.
+pub fn effective_scripts_dir(prefs: &Preferences) -> String {
+    if prefs.scripts_dir.is_empty() { default_scripts_dir().display().to_string() } else { prefs.scripts_dir.clone() }
+}
+
+fn friendly_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").map(PathBuf::from).unwrap_or(path)
+}
 fn load_from(path: &std::path::Path) -> Preferences {
     std::fs::read(path).ok().and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default()
 }
@@ -49,6 +84,8 @@ mod tests {
         assert!(loaded.mcp_enabled);
         assert_eq!(loaded.mcp_port, 9135);
         assert!(!Preferences::default().mcp_enabled);
+        assert!(default_scripts_dir().ends_with("examples/decoders"));
+        assert!(effective_scripts_dir(&Preferences::default()).contains("examples"));
         assert!(save_to(&file, &Preferences { theme: "bad".into(), ..prefs }).is_err());
         assert_eq!(load_from(&file).theme, "light");
         std::fs::remove_file(file).unwrap();

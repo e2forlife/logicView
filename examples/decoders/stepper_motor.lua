@@ -1,38 +1,99 @@
--- Adapted from DSView/libsigrokdecode stepper_motor/pd.py.
--- Copyright (C) 2015 Petteri Aimonen. GPL-2.0-or-later.
--- Position starts at zero at the beginning of the requested region.
-return {
-  id = 'dsview_stepper_motor', name = 'Stepper motor (Lua)',
-  channels = {'step', 'dir'}, classes = {'position', 'speed'},
-  options = {
-    {id='unit', name='Unit', default='steps', values={'steps', 'mm'}},
-    {id='steps_per_mm', name='Steps per mm', default='100'},
-  },
-  decode = function(start_sample, end_sample, bit, options, context)
-    local rows, position, previous = {}, 0, nil
-    local scale = options.unit == 'mm' and (tonumber(options.steps_per_mm) or 100) or 1
-    if scale <= 0 then return rows end
-    local unit = options.unit == 'mm' and 'mm' or 'steps'
-    local function format(value) return unit == 'mm' and string.format('%.2f', value) or string.format('%.0f', value) end
-    if start_sample >= end_sample then return rows end
-    local old_step = bit('step', start_sample)
-    for sample = start_sample + 1, end_sample - 1 do
-      local step = bit('step', sample)
-      if step and not old_step then
-        if previous then
-          if context.sample_rate_hz and context.sample_rate_hz > 0 then
-            rows[#rows + 1] = {start_sample = previous, end_sample = sample,
-              class = 'speed', text = format(context.sample_rate_hz / (sample - previous) / scale) .. ' ' .. unit .. '/s'}
-          end
-          rows[#rows + 1] = {start_sample = previous, end_sample = sample,
-            class = 'position', text = format(position / scale) .. ' ' .. unit,
-            fields = {steps = tostring(position)}}
-        end
-        position = position + (bit('dir', sample) and 1 or -1)
-        previous = sample
-      end
-      old_step = step
-    end
-    return rows
-  end,
+-- Translated from DSView libsigrokdecode for the LogicView session API.
+-- License: gplv2+
+-- Copyright (C) 2015 Petteri Aimonen <jpa@sigrok.mail.kapsi.fi>
+
+local _type = type
+local _error = error
+local _pcall = pcall
+local _tostring = tostring
+local _tonumber = tonumber
+local _string = string
+local _table = table
+local _math = math
+local _pairs = pairs
+local _setmetatable = setmetatable
+local _select = select
+local _rawequal = rawequal
+local _coroutine = coroutine
+local Decoder
+local _decoder
+
+_decoder = {
+  api_version = 3,
+  id = "stepper_motor",
+  name = "Stepper motor",
+  longname = "Stepper motor position / speed",
+  desc = "Absolute position and movement speed from step/dir.",
+  license = "gplv2+",
+  inputs = { "logic" },
+  outputs = {  },
+  tags = { "Embedded/industrial" },
+  channels = { logicview.dict({ id = "step", name = "Step", desc = "Step pulse" }), logicview.dict({ id = "dir", name = "Direction", desc = "Direction select" }) },
+  optional_channels = {  },
+  options = { logicview.dict({ id = "unit", desc = "Unit", default = "steps", values = { "steps", "mm" } }), logicview.dict({ id = "steps_per_mm", desc = "Steps per mm", default = 100.0, values = {  } }) },
+  annotations = { { "speed", "Speed" }, { "position", "Position" } },
+  annotation_rows = { { "speed", "Speed", { 0 } }, { "position", "Position", { 1 } } },
+  binary = {  }
 }
+function _decoder.__init__(self)
+  self:reset()
+end
+function _decoder.reset(self)
+  self.samplerate = nil
+  self.oldstep = nil
+  self.ss_prev_step = nil
+  self.pos = 0
+  self.prev_speed = nil
+  self.prev_pos = nil
+end
+function _decoder.start(self)
+  self.out_ann = self:register(logicview.OUTPUT_ANN)
+  if logicview.truth(logicview.eq(logicview.idx(self.options, "unit"), "steps")) then
+    self.scale = 1
+    self.format = "%0.0f"
+    self.unit = "steps"
+  else
+    self.scale = logicview.idx(self.options, "steps_per_mm")
+    self.format = "%0.2f"
+    self.unit = "mm"
+  end
+end
+function _decoder.step(self, ss, direction)
+  local delta, speed, speed_txt, pos_txt
+  if logicview.truth((self.ss_prev_step ~= nil)) then
+    if logicview.truth(self.samplerate) then
+      delta = (ss - self.ss_prev_step)
+      speed = ((self.samplerate / delta) / self.scale)
+      speed_txt = logicview.pymod(self.format, speed)
+      self:put(self.ss_prev_step, ss, self.out_ann, { 0, { logicview.add(logicview.add(logicview.add(speed_txt, " "), self.unit), "/s"), speed_txt } })
+    end
+    pos_txt = logicview.pymod(self.format, (self.pos / self.scale))
+    self:put(self.ss_prev_step, ss, self.out_ann, { 1, { logicview.add(logicview.add(pos_txt, " "), self.unit), pos_txt } })
+  end
+  self.pos = logicview.add(self.pos, (function() if logicview.truth(direction) then return 1 else return (-1) end end)())
+  self.ss_prev_step = ss
+end
+function _decoder.metadata(self, key, value)
+  if logicview.truth(logicview.eq(key, logicview.SRD_CONF_SAMPLERATE)) then
+    self.samplerate = value
+  end
+end
+function _decoder.decode(self)
+  local step, direction
+  while true do
+    do
+      local _lv_seq = self:wait(logicview.dict({ [0] = "r" }))
+      if _type(_lv_seq) == 'function' then
+        local _lv_built = {}
+        for _lv_v in _lv_seq do _lv_built[#_lv_built + 1] = _lv_v end
+        _lv_seq = _lv_built
+      end
+      step = logicview.idx(_lv_seq, 0)
+      direction = logicview.idx(_lv_seq, 1)
+    end
+    self:step(self.samplenum, direction)
+    ::continue_1::
+  end
+end
+
+return _decoder

@@ -366,9 +366,11 @@ mod hw {
     use super::*;
 
     /// Serializes hardware tests so they do not claim or reconfigure the same pod concurrently.
-    fn pod_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn pod_lock() -> (crate::PodGuard, std::sync::MutexGuard<'static, ()>) {
+        let process = crate::acquire_test_pod_lock();
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|err| err.into_inner())
+        let thread = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        (process, thread)
     }
 
     /// Creates a standard hardware test job with optional cancellation after the header.

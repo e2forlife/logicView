@@ -25,7 +25,7 @@ name = "DSLogic Plus"
 channels = 16
 hardware_tested = true
 firmware = "DSLogicPlus.bin"
-note = "High-speed buffer and stream were checked on one Plus. Arming two USB pods at once is not verified."
+note = "High-speed buffer and stream were checked on one Plus. A short combined buffer capture with a U3Pro32 in the same session was checked. Stream and a hardware trigger were not part of that combined check."
 
 [[devices]]
 vendor_id = 0x2a0e
@@ -61,7 +61,7 @@ name = "DSLogic U3Pro32"
 channels = 32
 hardware_tested = true
 firmware = "DSLogicU3Pro32.bin"
-note = "High-speed and Super-speed buffer and stream were checked on one U3Pro32."
+note = "High-speed and Super-speed buffer and stream were checked on one U3Pro32. A short combined buffer capture with a Plus in the same session was checked. Stream and a hardware trigger were not part of that combined check."
 
 [[devices]]
 vendor_id = 0x2a0e

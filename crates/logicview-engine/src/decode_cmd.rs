@@ -34,6 +34,7 @@ impl Engine {
             .into_iter()
             .find(|item| item.id == protocol)
             .ok_or_else(|| EngineError::Decode(format!("unknown decoder {protocol}")))?;
+        let outputs = schema.outputs.clone();
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, session)?;
         let slot = state.slot_mut(&id)?;
@@ -61,6 +62,7 @@ impl Engine {
             options: options.clone(),
             region,
             stack_on: stack.clone(),
+            outputs,
         });
         rerun(slot);
         Ok(DecoderInfo {
@@ -353,7 +355,11 @@ fn decode_all(decoders: &[DecoderInst], packed: &[Vec<u8>], len: u64, sample_rat
     rows
 }
 
-/// Finds an unambiguous I2C parent for the supported EEPROM decoder stack.
+fn parent_emits(parent: &DecoderInst, expected: &str) -> bool {
+    parent.protocol == expected || parent.outputs.iter().any(|output| output == expected)
+}
+
+/// Finds an unambiguous parent whose id or output list matches the child's input.
 fn resolve_stack(slot: &Slot, stack_on: Option<&str>, expected: &str, child: Option<&str>) -> Result<String, EngineError> {
     if let Some(id) = stack_on {
         let parent = slot
@@ -361,7 +367,7 @@ fn resolve_stack(slot: &Slot, stack_on: Option<&str>, expected: &str, child: Opt
             .iter()
             .find(|decoder| decoder.id == id)
             .ok_or_else(|| EngineError::Decode(format!("no decoder {id} to stack on")))?;
-        if parent.protocol != expected {
+        if !parent_emits(parent, expected) {
             return Err(EngineError::Decode(
                 format!("decoder stacks on {expected}"),
             ));
@@ -376,7 +382,7 @@ fn resolve_stack(slot: &Slot, stack_on: Option<&str>, expected: &str, child: Opt
     let i2c: Vec<_> = slot
         .decoders
         .iter()
-        .filter(|decoder| decoder.protocol == expected && Some(decoder.id.as_str()) != child)
+        .filter(|decoder| parent_emits(decoder, expected) && Some(decoder.id.as_str()) != child)
         .collect();
     match i2c.as_slice() {
         [only] => Ok(only.id.clone()),

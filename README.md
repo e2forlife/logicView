@@ -12,7 +12,7 @@ LogicView is an independent project and is not affiliated with DreamSourceLab.
 
 LogicView is in early development. The Rust workspace includes a desktop waveform interface, a capture engine, simulated devices, protocol decoders, and a Model Context Protocol (MCP) server. You can explore the interface with the demo devices without connecting hardware.
 
-- **Hardware:** Buffer and stream captures have been checked on one DSLogic Plus (`0x2A0E:0x0020`) and one DSLogic U3Pro32 (`0x2A0E:0x002C`). Other listed DSLogic models cannot currently be opened and have not been tested. Simultaneous arming of two USB pods has not been verified.
+- **Hardware:** Buffer and stream captures have been checked on one DSLogic Plus (`0x2A0E:0x0020`) and one DSLogic U3Pro32 (`0x2A0E:0x002C`). A short combined buffer capture of both pods in one session was checked. Stream and a hardware trigger were not part of that combined check. Other listed DSLogic models cannot currently be opened and have not been tested.
 - **Analysis:** Waveform measurements and UART, I2C, SPI, and 24xx-style EEPROM decoding are available. The interface includes a data table and an ordered edge-trigger interface; hardware trigger stages have not been verified on a pod.
 - **Platforms:** Windows and Linux desktop builds are the current focus. macOS, Android, and iOS are goals for future investigation, not supported releases. Mobile support depends on platform and hardware-access constraints.
 - **Scope:** SCPI instruments, Ethernet-connected devices, oscilloscopes, and data acquisition are not supported in the current build.
@@ -40,7 +40,7 @@ Device identities, USB IDs, channel counts, bitstream filenames, and tested stat
 
 ### Lua decoders
 
-Lua 5.5 scripts can be used alongside built-in Rust decoders. Set the script directory in Preferences, then add a decoder from the Decode panel or menu and configure its channels. Files ending in `.lua` in that directory are discovered when the application starts and when Preferences are saved. [high_pulses.lua](examples/decoders/high_pulses.lua) is a complete example; copy it into your chosen directory to try it.
+Lua 5.5 scripts can be used alongside built-in Rust decoders. A blank decoder-script directory uses [examples/decoders](examples/decoders), which holds the translated DSView protocol decoders. Set another directory in Preferences to use your own scripts. Files ending in `.lua` in that directory are discovered when the application starts and when Preferences are saved. [high_pulses.lua](examples/decoders/high_pulses.lua) is a small tutorial; [session_edges.lua](examples/decoders/session_edges.lua) shows the session API.
 
 For a step-by-step guide to writing, configuring, testing, and stacking decoders, see the [Lua decoder tutorial](docs/lua-decoders.md).
 
@@ -48,7 +48,7 @@ Each script returns a table with unique `id`, `name`, `channels`, `classes`, and
 
 Set `api_version` to 3 to use the session host instead of that callback. It follows the [sigrok protocol decoder API](https://sigrok.org/wiki/Protocol_decoder_API): `start`, `reset`, and `metadata`, then `register`, `wait`, and `put` for annotation, Python, binary, and metadata outputs. [session_edges.lua](examples/decoders/session_edges.lua) is a complete session script. The [Lua decoder tutorial](docs/lua-decoders.md) describes both forms. The built-in decoder IDs take precedence over scripts with the same ID. Scripts run with limited standard libraries, memory, and instruction count; errors are logged and yield no annotations.
 
-The examples include adaptations of DSView's [7-segment display](examples/decoders/seven_segment.lua), [stepper motor](examples/decoders/stepper_motor.lua), [edge counter](examples/decoders/counter.lua), [PWM](examples/decoders/pwm.lua), [NES gamepad](examples/decoders/nes_gamepad.lua), [RGB LED SPI](examples/decoders/rgb_led_spi.lua), and [ADNS-5020](examples/decoders/adns5020.lua) decoders, plus the session-API [rising-edge decoder](examples/decoders/session_edges.lua). The NES decoder stacks on an SPI decoder configured for eight-bit MSB-first MISO words; the RGB and ADNS decoders use eight-bit MOSI words. The stepper position is relative to the selected region. These examples do not yet cover the rest of the installed DSView decoder library.
+The same directory contains a Lua translation of the DSView decoder set. Stacked decoders keep their sigrok inputs, so a script that reads `spi`, `i2c`, or `uart` can stack on the translated parent (`1:spi`, `1:i2c`, or `1:uart`) as well as on the built-in decoder with that id. Shorter adaptations of the [7-segment display](examples/decoders/dsview_seven_segment.lua), [stepper motor](examples/decoders/dsview_stepper_motor.lua), [edge counter](examples/decoders/dsview_counter.lua), [PWM](examples/decoders/dsview_pwm.lua), [NES gamepad](examples/decoders/dsview_nes_gamepad.lua), [RGB LED SPI](examples/decoders/dsview_rgb_led_spi.lua), and [ADNS-5020](examples/decoders/dsview_adns5020.lua) decoders remain available under their `dsview_` ids. The NES adaptation stacks on an SPI decoder configured for eight-bit MSB-first MISO words; the RGB and ADNS adaptations use eight-bit MOSI words. The stepper position is relative to the selected region.
 
 ## Device support
 

@@ -36,6 +36,7 @@ pub fn install(lua: &Lua) -> Result<(), DecodeError> {
     host.set("OUTPUT_META", OUTPUT_META).map_err(lua_err)?;
     host.set("SRD_CONF_SAMPLERATE", "samplerate").map_err(lua_err)?;
     lua.globals().set("logicview", host).map_err(lua_err)?;
+    super::lua_helpers::install(lua)?;
     Ok(())
 }
 
@@ -49,7 +50,7 @@ pub fn read_schema(module: &Table) -> Result<DecoderSchema, DecodeError> {
     };
     let id: String = module.get("id").map_err(lua_err)?;
     let name: String = module.get("name").map_err(lua_err)?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || name.is_empty() {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':') || name.is_empty() {
         return Err(DecodeError::Message("invalid scripted decoder metadata".into()));
     }
     let channel_details = parse_channels(module.get("channels").map_err(lua_err)?)?;
@@ -116,12 +117,14 @@ pub fn run_session(
             let hit = session.borrow_mut().wait(spec.as_ref(), cancel)?;
             let pins = lua.create_table()?;
             for (index, pin) in hit.pins.iter().enumerate() {
-                if let Some(level) = pin { pins.set(index + 1, *level)?; }
+                if let Some(level) = pin { pins.set(index + 1, if *level { 1 } else { 0 })?; }
             }
-            let matched = lua.create_table()?;
-            for (index, hit) in hit.matched.iter().enumerate() { matched.set(index + 1, *hit)?; }
+            let mut mask = 0i64;
+            for (index, hit) in hit.matched.iter().enumerate() {
+                if *hit && index < 63 { mask |= 1 << index; }
+            }
             module.set("samplenum", hit.samplenum)?;
-            module.set("matched", matched)?;
+            module.set("matched", mask)?;
             Ok(pins)
         })?;
         let put = scope.create_function(|lua, args: mlua::MultiValue| {
@@ -139,12 +142,39 @@ pub fn run_session(
         module.set("wait", wait)?;
         module.set("put", put)?;
         module.set("register", register)?;
-        module.set("options", option_table(lua, schema, request)?)?;
+        let pin_names = {
+            let mut names = schema.channels.clone();
+            for name in &schema.optional_channels {
+                if !names.contains(name) { names.push(name.clone()); }
+            }
+            names
+        };
+        let has_channel = scope.create_function(move |_, args: mlua::MultiValue| {
+            let args = method_args(args, instance_ptr);
+            let connected: Table = module.get("connected")?;
+            let Some(arg) = args.first() else { return Ok(false) };
+            let name = if let Some(index) = as_i64(arg) {
+                if index < 0 { return Ok(false); }
+                pin_names.get(usize::try_from(index).unwrap_or(usize::MAX)).cloned()
+            } else {
+                lua_text(arg)
+            };
+            let Some(name) = name else { return Ok(false) };
+            Ok(matches!(connected.get::<Value>(name)?, Value::Boolean(true)))
+        })?;
+        module.set("has_channel", has_channel)?;
+        let defaults = option_defaults(module)?;
+        module.set("options", option_table(lua, &defaults, schema, request)?)?;
         module.set("samplenum", start as i64 - 1)?;
-        module.set("matched", lua.create_table()?)?;
+        module.set("matched", 0)?;
         let connected = lua.create_table()?;
         for (name, _) in request.channels { connected.set(*name, true)?; }
         module.set("connected", connected)?;
+        // reset and __init__ run before metadata. Many DSView decoders clear
+        // samplerate inside reset, and start() both registers outputs and may
+        // read the sample rate, so the rate has to be applied between them.
+        call_if_present(module, "__init__", (module.clone(),))?;
+        call_if_present(module, "reset", (module.clone(),))?;
         if let Some(rate) = request.sample_rate_hz {
             module.set("sample_rate_hz", rate)?;
             call_if_present(module, "metadata", (module.clone(), "samplerate", rate))?;
@@ -152,7 +182,6 @@ pub fn run_session(
             module.set("sample_rate_hz", Value::Nil)?;
         }
         call_if_present(module, "start", (module.clone(),))?;
-        call_if_present(module, "reset", (module.clone(),))?;
         let decode: mlua::Function = match module.get("decode")? {
             Value::Function(function) => function,
             _ => return Err(runtime("decode must be a function")),
@@ -450,11 +479,44 @@ fn method_args(args: mlua::MultiValue, instance: *const std::ffi::c_void) -> Vec
     args
 }
 
-fn option_table(lua: &Lua, schema: &DecoderSchema, request: &DecodeRequest<'_>) -> Result<Table, mlua::Error> {
-    let mut options: std::collections::BTreeMap<String, String> = schema.options.iter()
-        .map(|option| (option.id.clone(), option.default.clone())).collect();
-    options.extend(request.options.iter().cloned());
-    lua.create_table_from(options)
+fn option_defaults(module: &Table) -> Result<std::collections::BTreeMap<String, Value>, mlua::Error> {
+    let mut defaults = std::collections::BTreeMap::new();
+    if let Value::Table(table) = module.get("options")? {
+        for item in table.sequence_values::<Table>() {
+            let item = item?;
+            let Some(id) = lua_text(&item.get("id")?) else { continue };
+            if id.is_empty() { continue; }
+            defaults.insert(id, item.get("default")?);
+        }
+    }
+    Ok(defaults)
+}
+
+fn option_table(lua: &Lua, defaults: &std::collections::BTreeMap<String, Value>, _schema: &DecoderSchema, request: &DecodeRequest<'_>) -> Result<Table, mlua::Error> {
+    let mut chosen = std::collections::BTreeMap::new();
+    for (key, value) in defaults { chosen.insert(key.clone(), value.clone()); }
+    for (key, text) in request.options {
+        let default = chosen.get(key).cloned().unwrap_or(Value::Nil);
+        chosen.insert(key.clone(), coerce_option(lua, &default, text)?);
+    }
+    let table = lua.create_table()?;
+    for (key, value) in chosen { table.set(key, value)?; }
+    Ok(table)
+}
+
+fn coerce_option(lua: &Lua, default: &Value, text: &str) -> Result<Value, mlua::Error> {
+    match default {
+        Value::Integer(_) => {
+            if let Ok(value) = text.parse::<i64>() { return Ok(Value::Integer(value)); }
+            if let Ok(value) = text.parse::<f64>() { return Ok(Value::Number(value)); }
+            Ok(Value::String(lua.create_string(text)?))
+        }
+        Value::Number(_) => {
+            if let Ok(value) = text.parse::<f64>() { Ok(Value::Number(value)) } else { Ok(Value::String(lua.create_string(text)?)) }
+        }
+        Value::Boolean(_) => Ok(Value::Boolean(matches!(text.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))),
+        _ => Ok(Value::String(lua.create_string(text)?)),
+    }
 }
 
 fn call_if_present<A: mlua::IntoLuaMulti>(module: &Table, name: &str, args: A) -> Result<(), mlua::Error> {
@@ -534,10 +596,24 @@ fn parse_classes(module: &Table) -> Result<Vec<AnnotationClass>, DecodeError> {
     Ok(parsed)
 }
 
+fn dsview_annotation(table: &Table) -> Result<Option<(String, String)>, DecodeError> {
+    if table.len().map_err(lua_err)? != 3 { return Ok(None); }
+    let Some(first) = lua_text(&table.get(1).map_err(lua_err)?) else { return Ok(None) };
+    let Some(second) = lua_text(&table.get(2).map_err(lua_err)?) else { return Ok(None) };
+    let Some(third) = lua_text(&table.get(3).map_err(lua_err)?) else { return Ok(None) };
+    if !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(Some((second, third)));
+    }
+    Ok(None)
+}
+
 fn parse_class(value: Value) -> Result<AnnotationClass, DecodeError> {
     match value {
         Value::String(text) => Ok(AnnotationClass { id: text.to_str().map_err(lua_err)?.to_string(), desc: String::new() }),
         Value::Table(table) => {
+            if table.get::<Value>("id").map_err(lua_err)?.is_nil() {
+                if let Some((id, desc)) = dsview_annotation(&table)? { return Ok(AnnotationClass { id, desc }); }
+            }
             let id = match table.get::<Value>("id").map_err(lua_err)? {
                 Value::Nil => lua_text(&table.get(1).map_err(lua_err)?),
                 value => lua_text(&value),

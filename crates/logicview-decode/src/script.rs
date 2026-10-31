@@ -8,8 +8,9 @@ use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value};
 use super::{Annotation, DecodeError, DecodeOutput, DecodeRequest, DecoderSchema};
 
 fn directory() -> Option<PathBuf> {
-    let dir = logicview_config::load().scripts_dir;
-    if dir.is_empty() { None } else { Some(PathBuf::from(dir)) }
+    let configured = logicview_config::load().scripts_dir;
+    let dir = if configured.is_empty() { logicview_config::default_scripts_dir() } else { PathBuf::from(configured) };
+    if dir.as_os_str().is_empty() { None } else { Some(dir) }
 }
 fn files() -> Vec<PathBuf> {
     let mut paths: Vec<_> = directory().and_then(|p| std::fs::read_dir(p).ok()).into_iter().flatten()
@@ -18,7 +19,7 @@ fn files() -> Vec<PathBuf> {
     paths.sort(); paths
 }
 fn lua() -> Result<Lua, DecodeError> {
-    let lua = Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH, LuaOptions::default())
+    let lua = Lua::new_with(StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::COROUTINE, LuaOptions::default())
         .map_err(|e| DecodeError::Message(e.to_string()))?;
     lua.set_memory_limit(64 * 1024 * 1024).map_err(|e| DecodeError::Message(e.to_string()))?;
     let ticks = std::sync::atomic::AtomicUsize::new(0);
@@ -162,7 +163,7 @@ mod tests {
             ("d", &zero[..]), ("e", &zero[..]), ("f", &zero[..]), ("g", &zero[..])];
         let req = DecodeRequest { protocol: "dsview_seven_segment", channels: &segments,
             options: &[], region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("seven_segment.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_seven_segment.lua")]).unwrap();
         assert_eq!(result.annotations.len(), 1);
         assert_eq!(result.annotations[0].text, "1");
         assert_eq!(result.annotations[0].end_sample, 8);
@@ -172,7 +173,7 @@ mod tests {
         let channels = [("step", &steps[..]), ("dir", &direction[..])];
         let req = DecodeRequest { protocol: "dsview_stepper_motor", channels: &channels,
             options: &[], region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("stepper_motor.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_stepper_motor.lua")]).unwrap();
         assert_eq!(result.annotations.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(), ["1 steps", "0 steps"]);
     }
 
@@ -183,12 +184,12 @@ mod tests {
         let channels = [("data", &data[..])];
         let req = DecodeRequest { protocol: "dsview_pwm", channels: &channels,
             options: &[], region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("pwm.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_pwm.lua")]).unwrap();
         assert_eq!(result.annotations.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(), ["50.000000%", "4 samples"]);
         let options = [("divider".into(), "2".into())];
         let req = DecodeRequest { protocol: "dsview_counter", channels: &channels,
             options: &options, region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("counter.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_counter.lua")]).unwrap();
         assert_eq!(result.annotations.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(), ["1", "2", "1", "3", "4", "2"]);
     }
 
@@ -200,7 +201,7 @@ mod tests {
         let lower = [Annotation::new(1, 5, "word", "", fields)];
         let req = DecodeRequest { protocol: "dsview_nes_gamepad", channels: &[], options: &[],
             region: 0..8, sample_len: 8, sample_rate_hz: Some(1_000_000), lower: &lower, lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("nes_gamepad.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_nes_gamepad.lua")]).unwrap();
         assert_eq!(result.annotations[0].text, "A");
         assert_eq!(result.annotations[0].start_sample, 1);
 
@@ -210,7 +211,7 @@ mod tests {
         }).collect();
         let req = DecodeRequest { protocol: "dsview_rgb_led_spi", channels: &[], options: &[],
             region: 0..8, sample_len: 8, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &rgb };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("rgb_led_spi.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_rgb_led_spi.lua")]).unwrap();
         assert_eq!(result.annotations[0].text, "#1234ab");
 
         let packet = |start, value| super::super::ProtocolPacket { start_sample: start, end_sample: start + 1,
@@ -218,7 +219,7 @@ mod tests {
         let packets = [packet(1, 0x83), packet(2, 0x52)];
         let req = DecodeRequest { protocol: "dsview_adns5020", channels: &[], options: &[],
             region: 0..8, sample_len: 8, sample_rate_hz: None, lower: &[], lower_packets: &packets };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("adns5020.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_adns5020.lua")]).unwrap();
         assert_eq!(result.annotations[0].text, "Delta_X: 0x52");
         assert_eq!(result.annotations[0].class, "write");
 
@@ -226,7 +227,7 @@ mod tests {
         let channels = [("data", &data[..])];
         let req = DecodeRequest { protocol: "dsview_pwm", channels: &channels, options: &[],
             region: 0..8, sample_len: 8, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &[] };
-        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("pwm.lua")]).unwrap();
+        let result = run_paths(&req, &AtomicBool::new(false), vec![dir.join("dsview_pwm.lua")]).unwrap();
         assert_eq!(result.annotations[1].text, "4e-06 s");
     }
 
@@ -258,7 +259,7 @@ mod tests {
 
     #[test]
     fn example_metadata_and_connected_inputs_support_options() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/seven_segment.lua");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/dsview_seven_segment.lua");
         let lua = lua().unwrap();
         let schema = metadata(&lua, &module(&lua, &path).unwrap()).unwrap();
         assert_eq!(schema.optional_channels, ["dp"]);
@@ -342,7 +343,7 @@ mod tests {
             sample_len: 8, sample_rate_hz: Some(1_000), lower: &[], lower_packets: &[] };
         let result = run_paths(&request, &AtomicBool::new(false), vec![path.clone()]).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(result.annotations[0].text, "false:nil");
+        assert_eq!(result.annotations[0].text, "0:nil");
         assert_eq!(result.annotations[1].text, "Rise");
         assert_eq!(result.annotations[1].texts, ["Rise", "R"]);
         assert_eq!(result.annotations[1].start_sample, 1);
@@ -399,6 +400,86 @@ mod tests {
         assert_eq!(result.packets.len(), 2);
         assert_eq!(result.binary.len(), 2);
         assert_eq!(result.meta.len(), 2);
+    }
+
+    #[test]
+    fn every_example_decoder_loads() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lua")).collect();
+        paths.sort();
+        let mut errors = Vec::new();
+        for path in &paths {
+            let lua = lua().unwrap();
+            if let Err(err) = module(&lua, path).and_then(|loaded| metadata(&lua, &loaded)) {
+                errors.push(format!("{}: {err}", path.file_name().unwrap().to_string_lossy()));
+            }
+        }
+        assert!(errors.is_empty(), "{} of {} scripts failed to load:\n{}", errors.len(), paths.len(), errors.join("\n"));
+        assert!(paths.len() >= 152, "expected the translated decoder set, found {}", paths.len());
+    }
+
+    fn pack_bits(bits: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.iter().enumerate() {
+            if *bit != 0 { bytes[index / 8] |= 1 << (index % 8); }
+        }
+        bytes
+    }
+
+    #[test]
+    fn translated_pwm_reports_duty_and_period() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/pwm.lua");
+        let mut level = vec![0u8; 16];
+        for sample in [2, 3, 4, 5, 10, 11, 12, 13] { level[sample] = 1; }
+        let data = pack_bits(&level);
+        let channels = [("data", data.as_slice())];
+        let request = DecodeRequest { protocol: "pwm", channels: &channels, options: &[], region: 0..16,
+            sample_len: 16, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &[] };
+        let result = run_paths(&request, &AtomicBool::new(false), vec![path]).unwrap();
+        let duty = result.annotations.iter().find(|row| row.class == "duty-cycle").expect("duty cycle");
+        let period = result.annotations.iter().find(|row| row.class == "period").expect("period");
+        assert_eq!(duty.text, "50.000000%");
+        assert!(period.text.contains("8.0"), "{}", period.text);
+    }
+
+    #[test]
+    fn translated_spi_feeds_a_stacked_gamepad() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
+        // Mode 0: sample on each rising clock. Eight bits, MSB first.
+        let mut clk = Vec::new();
+        let mut mosi = Vec::new();
+        let mut miso = Vec::new();
+        clk.push(0);
+        mosi.push(0);
+        miso.push(0);
+        let mosi_bits = [1u8, 0, 1, 0, 0, 1, 0, 1];
+        let miso_bits = [0u8, 0, 1, 1, 1, 1, 0, 0];
+        for bit in 0..8 {
+            clk.extend([0, 1]);
+            mosi.extend([mosi_bits[bit], mosi_bits[bit]]);
+            miso.extend([miso_bits[bit], miso_bits[bit]]);
+        }
+        // The decoder extends the last bit by one clock period past the edge.
+        for _ in 0..8 {
+            clk.push(0);
+            mosi.push(0);
+            miso.push(0);
+        }
+        let samples = clk.len() as u64;
+        let clk = pack_bits(&clk);
+        let mosi = pack_bits(&mosi);
+        let miso = pack_bits(&miso);
+        let channels = [("clk", clk.as_slice()), ("miso", miso.as_slice()), ("mosi", mosi.as_slice())];
+        let request = DecodeRequest { protocol: "1:spi", channels: &channels, options: &[], region: 0..samples,
+            sample_len: samples, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &[] };
+        let parent = run_paths(&request, &AtomicBool::new(false), vec![dir.join("1-spi.lua")]).unwrap();
+        let data = parent.packets.iter().find(|packet| packet.kind == "DATA").expect("SPI data word");
+        assert_eq!(data.data, serde_json::json!(["DATA", 0xA5, 0x3C]));
+        let request = DecodeRequest { protocol: "nes_gamepad", channels: &[], options: &[], region: 0..request.sample_len,
+            sample_len: request.sample_len, sample_rate_hz: Some(1_000_000), lower: &[], lower_packets: &parent.packets };
+        let child = run_paths(&request, &AtomicBool::new(false), vec![dir.join("nes_gamepad.lua")]).unwrap();
+        assert_eq!(child.annotations.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(), ["A + B + West + East"]);
     }
 
 }

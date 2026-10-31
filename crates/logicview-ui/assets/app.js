@@ -365,10 +365,14 @@ function probeForRow(row) {
   });
 }
 
+function maskBit(index) {
+  return 1n << BigInt(index);
+}
+
 function channelIsEnabled(index) {
   if (state.channelsAllDisabled) return false;
   if (!settings.channelEnable) return true;
-  return (settings.channelEnable & (1 << index)) !== 0;
+  return (BigInt(settings.channelEnable) & maskBit(index)) !== 0n;
 }
 
 function rowEnabled(row) {
@@ -2165,23 +2169,51 @@ function triggerPanel() {
     </details>`;
 }
 
+function channelPages(probes) {
+  const pages = [];
+  let index = 0;
+  while (index < probes.length) {
+    const device = probes[index].device_id || "";
+    const page = [];
+    while (index < probes.length && page.length < 8 && (probes[index].device_id || "") === device) {
+      page.push(probes[index]);
+      index += 1;
+    }
+    pages.push(page);
+  }
+  return pages;
+}
+
+function localProbeIndex(probes, probe) {
+  const first = probes.find((item) => (item.device_id || "") === (probe.device_id || ""));
+  return probe.index - (first ? first.index : 0);
+}
+
+function deviceTag(name) {
+  const text = String(name || "").replace(/^DSLogic\s+/, "");
+  if (/^U3/i.test(text)) return "U3";
+  return text || "Pod";
+}
+
 function channelChecks(probes) {
-  const groups = [];
-  for (let i = 0; i < probes.length; i += 8) groups.push(probes.slice(i, i + 8));
-  if (!groups.length) return "";
-  if (state.channelGroup >= groups.length) state.channelGroup = 0;
-  const tabs = groups.map((group, index) => {
-    const from = index * 8;
-    const to = from + group.length - 1;
-    return `<button type="button" class="ch-tab${index === state.channelGroup ? " active" : ""}" data-group="${index}">${from}–${to}</button>`;
+  const pages = channelPages(probes);
+  if (!pages.length) return "";
+  if (state.channelGroup >= pages.length) state.channelGroup = 0;
+  const several = new Set(probes.map((probe) => probe.device_id || "")).size > 1;
+  const tabs = pages.map((page, index) => {
+    const from = localProbeIndex(probes, page[0]);
+    const to = localProbeIndex(probes, page[page.length - 1]);
+    const prefix = several ? deviceTag(page[0].device_name) + " " : "";
+    return `<button type="button" class="ch-tab${index === state.channelGroup ? " active" : ""}" data-group="${index}">${prefix}${from}–${to}</button>`;
   }).join("");
-  const buttons = groups[state.channelGroup].map((probe) => {
+  const buttons = pages[state.channelGroup].map((probe) => {
     const on = channelIsEnabled(probe.index);
+    const local = localProbeIndex(probes, probe);
     const color = storedColor("logic:" + probe.index, probe.color || "#8eb6ff");
-    return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${probe.index}">${probe.index}</button>`;
+    return `<button type="button" class="ch-en${on ? " on" : ""}" data-bit="${probe.index}" style="--ch:${color}" aria-label="Channel ${local}" title="${escapeHtml(probe.name || "")}">${local}</button>`;
   }).join("");
   const allOn = probes.every((probe) => channelIsEnabled(probe.index));
-  const groupOn = groups[state.channelGroup].every((probe) => channelIsEnabled(probe.index));
+  const groupOn = pages[state.channelGroup].every((probe) => channelIsEnabled(probe.index));
   return `<div class="ch-tabs">${tabs}<button type="button" class="ch-all" data-scope="device" aria-pressed="${allOn}" title="Toggle all channels">All</button></div><div class="ch-enable-row"><div class="ch-enables">${buttons}</div><button type="button" class="ch-all" data-scope="group" aria-pressed="${groupOn}" title="Toggle this group">All</button></div>`;
 }
 
@@ -2227,9 +2259,9 @@ function bindPanel(name) {
         else selected.delete(index);
       }
       state.channelsAllDisabled = selected.size === 0;
-      let mask = 0;
-      for (const index of selected) mask = (mask | (1 << index)) >>> 0;
-      settings.channelEnable = selected.size === probes.length ? 0 : mask;
+      let mask = 0n;
+      for (const index of selected) mask |= maskBit(index);
+      settings.channelEnable = selected.size === probes.length || selected.size === 0 ? 0 : Number(mask);
       clampSampleRate();
       state.gutterSig = "";
       renderGutter();
@@ -2245,7 +2277,8 @@ function bindPanel(name) {
     }
     for (const button of document.querySelectorAll("#channel-enable .ch-all")) {
       button.addEventListener("click", () => {
-        const selected = button.dataset.scope === "device" ? probes : probes.slice(state.channelGroup * 8, state.channelGroup * 8 + 8);
+        const pages = channelPages(probes);
+        const selected = button.dataset.scope === "device" ? probes : (pages[state.channelGroup] || []);
         setEnabled(selected.map((probe) => probe.index), !selected.every((probe) => channelIsEnabled(probe.index)));
       });
     }
@@ -2481,9 +2514,38 @@ function maxSampleHz(bands, channels) {
   return band ? band.max_hz : 100_000_000;
 }
 
+function sessionRateMax() {
+  const devices = (state.devices || []).filter((device) => String(device.id).startsWith("usb:"));
+  const stream = settings.depth === "stream";
+  if (devices.length < 2) return maxSampleHz(activeRateBands(), enabledChannelCount());
+  let offset = 0;
+  let ceiling = Infinity;
+  for (const device of devices) {
+    const pid = Number.parseInt(String(device.id).split(":").pop(), 16);
+    const profile = (state.profiles || []).find((item) => item.product_id === pid);
+    const width = profile ? profile.channels : (pid === 0x002c ? 32 : 16);
+    let count = 0;
+    for (let index = 0; index < width; index += 1) {
+      if (channelIsEnabled(offset + index)) count += 1;
+    }
+    offset += width;
+    if (!count) continue;
+    const bands = profile
+      ? (stream
+        ? (device.super_speed && profile.super_stream_rates && profile.super_stream_rates.length
+          ? profile.super_stream_rates
+          : profile.stream_rates)
+        : profile.buffer_rates)
+      : null;
+    const max = maxSampleHz(bands && bands.length ? bands : (stream ? PLUS_STREAM_RATES : PLUS_BUFFER_RATES), count);
+    if (max < ceiling) ceiling = max;
+  }
+  return Number.isFinite(ceiling) ? ceiling : maxSampleHz(activeRateBands(), enabledChannelCount());
+}
+
 function legalSampleRates() {
   const channels = enabledChannelCount();
-  const max = maxSampleHz(activeRateBands(), channels);
+  const max = sessionRateMax();
   const rates = RATE_LADDER.filter((rate) => rate <= max);
   if (max > 0 && !rates.includes(max)) rates.push(max);
   rates.sort((a, b) => a - b);
@@ -2523,6 +2585,10 @@ function rateNote() {
   const choice = legalSampleRates();
   const mode = settings.depth === "stream" ? "stream" : "buffer";
   const noun = choice.channels === 1 ? "channel" : "channels";
+  const usb = (state.devices || []).filter((device) => String(device.id).startsWith("usb:"));
+  if (usb.length > 1) {
+    return `${choice.channels} ${noun} enabled. Combined ${mode} tops out at ${formatSampleRate(choice.max)}.`;
+  }
   return `${choice.channels} ${noun} enabled. ${rateProfileLabel()} ${mode} tops out at ${formatSampleRate(choice.max)}.`;
 }
 
@@ -2581,6 +2647,9 @@ function renderDeviceMenu() {
   const pods = state.deviceList.filter((device) => device.kind !== "demo");
   const demos = state.deviceList.filter((device) => device.kind === "demo");
   for (const pod of pods) menu.append(deviceMenuButton(pod.id, pod.name));
+  const plus = pods.find((pod) => pod.id === "usb:2a0e:0020");
+  const u3 = pods.find((pod) => pod.id === "usb:2a0e:002c");
+  if (plus && u3) menu.append(deviceMenuButton(plus.id + "+" + u3.id, "Plus + U3Pro32"));
   if (!demos.length) return;
   const row = document.createElement("div");
   row.className = "device-sub";
@@ -2709,11 +2778,18 @@ function protocolLabel(protocol) {
   return state.decoderCatalog.find((item) => item.id === protocol)?.name || PROTOCOL_LABEL[protocol] || protocol;
 }
 
+function emitsProtocol(protocol, expected) {
+  if (!expected) return false;
+  if (protocol === expected) return true;
+  const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
+  return Array.isArray(schema?.outputs) && schema.outputs.includes(expected);
+}
+
 async function addDecoder(protocol) {
   protocol = protocol || document.getElementById("decoder-kind").value;
   try {
     const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
-    const parent = schema?.stack_on && state.decoders.find((row) => row.protocol === schema.stack_on);
+    const parent = schema?.stack_on && state.decoders.find((row) => emitsProtocol(row.protocol, schema.stack_on));
     const created = await api({
       cmd: "add_decoder",
       session: state.active,
@@ -4571,7 +4647,7 @@ function openDecodeConfig(decoder) {
     }
   }
   if (schema?.stack_on) {
-    const parents = state.decoders.filter((row) => row.protocol === schema.stack_on && row.id !== decoder.id);
+    const parents = state.decoders.filter((row) => emitsProtocol(row.protocol, schema.stack_on) && row.id !== decoder.id);
     const choices = parents.map((row) => `<option value="${escapeHtml(row.id)}"${row.id === decoder.stack_on ? " selected" : ""}>${escapeHtml(protocolLabel(row.protocol) + " " + row.id)}</option>`).join("");
     parts.push(`<label class="field">Stacks on
       <select id="decode-stack">${choices}</select>

@@ -149,8 +149,9 @@ pub struct SessionConfig {
     pub clock_falling: bool,
     /// Requests dropping the device buffer when an acquisition is stopped early.
     pub discard_on_stop: bool,
-    /// Bit per channel. Zero means the first `channel_count` channels.
-    pub channel_enable: u32,
+    /// Bit per probe in catalog order. Zero means every probe.
+    /// A second USB pod occupies the bits above the first pod's width.
+    pub channel_enable: u64,
     /// Probe index used by the simple trigger when no ordered steps are provided.
     pub trigger_channel: u8,
     /// Edge or level condition for the simple trigger.
@@ -322,6 +323,34 @@ impl Session {
         self.arm = arm;
         self.trigger_sample = None;
         self.instant = instant;
+        self.error = None;
+        self.warnings.clear();
+        self.total_samples = total;
+        self.resolve_edges = false;
+        self.phase = Phase::Arming;
+        Ok(total)
+    }
+
+    /// Opens an empty multi-pod buffer capture.
+    ///
+    /// Each pod keeps its own arm record. `width` is the number of enabled
+    /// probes across those pods, in catalog order.
+    pub fn begin_combined(
+        &mut self,
+        config: SessionConfig,
+        width: usize,
+    ) -> Result<u64, CaptureError> {
+        if self.phase.is_active() {
+            return Err(CaptureError::Busy);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let total = planned_samples(&config)?;
+        self.config = config;
+        self.store = LogicStore::new(width);
+        self.analog = AnalogStore::default();
+        self.arm.clear();
+        self.trigger_sample = None;
+        self.instant = false;
         self.error = None;
         self.warnings.clear();
         self.total_samples = total;
@@ -550,15 +579,28 @@ fn apply_edge_stages(
 }
 
 /// Resolves the selected channel mask, using the requested width when no mask is supplied.
-fn enabled_mask(mask: u32, channels: usize) -> u32 {
-    if mask != 0 {
-        return mask;
-    }
-    if channels >= 32 {
+fn enabled_mask(mask: u64, channels: usize) -> u32 {
+    let channels = channels.min(32);
+    let all = if channels >= 32 {
         u32::MAX
     } else {
         (1u32 << channels) - 1
+    };
+    if mask == 0 {
+        all
+    } else {
+        (mask as u32) & all
     }
+}
+
+/// Arm bytes for one pod. `enable` is that pod's own channel mask.
+pub fn device_arm(
+    config: &SessionConfig,
+    total: u64,
+    enable: u32,
+    clock: &HostClock,
+) -> Result<Vec<u8>, CaptureError> {
+    build_arm(config, total, false, enable, clock)
 }
 
 /// Translates session options and device clock capabilities into capture arm records.

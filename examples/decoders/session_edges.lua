@@ -1,7 +1,7 @@
 -- Session API example: mark each rising edge.
 -- api_version 3 follows the same flow as a sigrok protocol decoder:
--- start registers outputs, reset clears state, metadata receives the sample
--- rate, and decode calls wait until the capture ends.
+-- __init__ and reset clear state, metadata receives the sample rate, start
+-- registers outputs, and decode calls wait until the capture ends.
 local lv = logicview
 
 return {

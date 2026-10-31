@@ -129,7 +129,11 @@ pub async fn serve_listener(
 }
 
 async fn get_preferences() -> Json<logicview_config::Preferences> {
-    Json(logicview_config::load())
+    let mut prefs = logicview_config::load();
+    if prefs.scripts_dir.is_empty() {
+        prefs.scripts_dir = logicview_config::effective_scripts_dir(&prefs);
+    }
+    Json(prefs)
 }
 
 async fn save_preferences(Json(mut prefs): Json<logicview_config::Preferences>) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
@@ -982,7 +986,7 @@ enum Command {
         #[serde(default)]
         discard_on_stop: bool,
         #[serde(default)]
-        channel_enable: u32,
+        channel_enable: u64,
         #[serde(default)]
         trigger_channel: u8,
         #[serde(default)]

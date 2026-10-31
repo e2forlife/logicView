@@ -1,7 +1,7 @@
 //! Facade over capture sessions.
 //!
-//! Commands come from the UI and from MCP. A session can stack more than one
-//! demo pod into a single channel list. Events go out on a broadcast bus.
+//! Commands come from the UI and from MCP. A session can stack demo pods, or
+//! two tested USB pods, into one channel list. Events go out on a broadcast bus.
 //!
 //! # Finding the right layer
 //!
@@ -149,7 +149,8 @@ pub struct Status {
     /// Every logic probe on the connected devices. `index` is the enable bit.
     pub probes: Vec<ChannelInfo>,
     /// Zero means every probe is sampled. Otherwise each set bit is one probe.
-    pub channel_enable: u32,
+    /// Bits follow catalog order, so a second pod uses the bits above the first.
+    pub channel_enable: u64,
     pub devices: Vec<DeviceInfo>,
     pub analog: Vec<AnalogInfo>,
     pub warnings: Vec<String>,
@@ -211,6 +212,7 @@ pub struct SavedMeasurement {
 }
 
 /// Device identity and link capabilities assigned to a session.
+#[derive(Clone)]
 pub(crate) struct BoundDevice {
     id: String,
     name: String,
@@ -233,6 +235,9 @@ pub(crate) struct DecoderInst {
     options: BTreeMap<String, String>,
     region: Option<(u64, u64)>,
     stack_on: Option<String>,
+    /// Protocol names this decoder produces. A child may stack on any of them,
+    /// which is how a DSView `1:spi` decoder satisfies an input of `spi`.
+    outputs: Vec<String>,
 }
 
 /// Client-facing settings and bindings of an installed decoder.
@@ -432,21 +437,17 @@ impl Engine {
         )))
     }
 
-    /// Adds another demo device to a stopped session; physical multi-device capture is not yet
-    /// verified.
+    /// Adds a demo pod, or a second tested USB pod, to a stopped session.
     pub async fn attach_device(
         &self,
         id: Option<&str>,
         device_id: &str,
     ) -> Result<Status, EngineError> {
+        if let Some(pid) = usb_product_id(device_id) {
+            return self.attach_usb(id, device_id, pid).await;
+        }
         let pod = demo_pod(device_id).ok_or_else(|| {
-            if usb_product_id(device_id).is_some() {
-                EngineError::UnknownDevice(format!(
-                    "attach {device_id} is refused: stacking USB pods in one capture is not verified. Use demo and demo:spi."
-                ))
-            } else {
-                EngineError::UnknownDevice(format!("unknown device {device_id}"))
-            }
+            EngineError::UnknownDevice(format!("unknown device {device_id}"))
         })?;
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
@@ -472,6 +473,50 @@ impl Engine {
         Ok(slot.status(true))
     }
 
+    /// Appends one tested USB pod to a stopped session that already has a different USB pod.
+    async fn attach_usb(
+        &self,
+        id: Option<&str>,
+        device_id: &str,
+        pid: u16,
+    ) -> Result<Status, EngineError> {
+        let Some(profile) = logicview_hal::logic_profile(pid) else {
+            return Err(EngineError::UnknownDevice(format!(
+                "{device_id} (unknown product, 0 channels) is not opened: no hardware test for this product id"
+            )));
+        };
+        let canonical = format!("usb:{:04x}:{:04x}", logicview_hal::VENDOR_ID, pid);
+        if !profile.hardware_tested || device_id != canonical {
+            return Err(EngineError::UnknownDevice(format!(
+                "{device_id} ({}, {} channels) is not opened: no hardware test for this product id",
+                profile.name, profile.channels
+            )));
+        }
+        {
+            let state = self.shared.state.lock().await;
+            let session = self.resolve(&state, id)?;
+            let slot = state.slot(&session)?;
+            refuse_usb_attach(slot, pid)?;
+        }
+        let pod = logicview_hal::Pod::open_product(Some(pid))
+            .map_err(|err| EngineError::Device(err.to_string()))?;
+        let super_speed = pod.link_is_super();
+        drop(pod);
+        let mut state = self.shared.state.lock().await;
+        let session = self.resolve(&state, id)?;
+        let slot = state.slot_mut(&session)?;
+        refuse_usb_attach(slot, pid)?;
+        let mut devices = slot.devices.clone();
+        devices.push(BoundDevice {
+            id: device_id.into(),
+            name: profile.name.clone(),
+            kind: "usb".into(),
+            super_speed,
+        });
+        install_usb_catalog(slot, &devices)?;
+        Ok(slot.status(true))
+    }
+
     /// Removes a device from a stopped demo session while keeping at least one source.
     pub async fn detach_device(
         &self,
@@ -488,6 +533,21 @@ impl Engine {
             return Err(EngineError::Device(
                 "a session keeps at least one device".into(),
             ));
+        }
+        if slot.devices.iter().any(|device| device.kind == "usb") {
+            let devices: Vec<BoundDevice> = slot
+                .devices
+                .iter()
+                .filter(|device| device.id != device_id)
+                .cloned()
+                .collect();
+            if devices.len() == slot.devices.len() {
+                return Err(EngineError::UnknownDevice(format!(
+                    "device {device_id} is not in this session"
+                )));
+            }
+            install_usb_catalog(slot, &devices)?;
+            return Ok(slot.status(true));
         }
         let ids: Vec<String> = slot
             .devices
@@ -813,6 +873,18 @@ impl Engine {
             let state = self.shared.state.lock().await;
             self.resolve(&state, id)?
         };
+        let dual = {
+            let state = self.shared.state.lock().await;
+            let slot = state.slot(&id)?;
+            slot.devices
+                .iter()
+                .filter(|device| device.kind == "usb")
+                .count()
+                > 1
+        };
+        if dual {
+            return self.start_usb_dual(&id).await;
+        }
         let (
             generation,
             stop,
@@ -845,49 +917,14 @@ impl Engine {
             let profile_channels = logicview_hal::logic_profile(pid)
                 .map(|profile| usize::from(profile.channels))
                 .unwrap_or(16);
-            let mask = if config.channel_enable == 0 {
-                if profile_channels >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << profile_channels) - 1
-                }
-            } else {
-                config.channel_enable
-            };
-            let clock = if pid == logicview_hal::U3PRO32_PID {
-                let planned = logicview_hal::plan_u3_link(
-                    config.sample_rate_hz,
-                    mask,
-                    config.depth == DepthMode::Stream,
-                    bound_link_is_super(&slot_ref.devices),
-                )
-                .map_err(|err| {
-                    EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
-                })?;
-                HostClock {
-                    hw_max_hz: planned.hw_max_hz,
-                    half_rate_hz: Some(planned.half_rate_hz),
-                    quarter_rate_hz: Some(planned.quarter_rate_hz),
-                    pre_divider: planned.pre_divider,
-                    ext_record: true,
-                }
-            } else {
-                logicview_hal::plan_clock(
-                    config.sample_rate_hz,
-                    mask,
-                    config.depth == DepthMode::Stream,
-                )
-                .map_err(|err| {
-                    EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
-                })?;
-                HostClock {
-                    hw_max_hz: logicview_hal::HW_CLOCK_HZ,
-                    half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
-                    quarter_rate_hz: Some(logicview_hal::QUARTER_RATE_HZ),
-                    pre_divider: 1,
-                    ext_record: false,
-                }
-            };
+            let mask = local_enable(config.channel_enable, 0, profile_channels);
+            let clock = clock_for(
+                pid,
+                config.sample_rate_hz,
+                mask,
+                config.depth == DepthMode::Stream,
+                bound_link_is_super(&slot_ref.devices),
+            )?;
             let slot = state.slot_mut(&id)?;
             let samples = slot
                 .session
@@ -964,6 +1001,74 @@ impl Engine {
             .await;
         });
         self.status(Some(&id)).await
+    }
+
+    /// Arms every USB pod in the session and merges their buffer samples into one store.
+    async fn start_usb_dual(&self, id: &str) -> Result<Status, EngineError> {
+        let (generation, stop, samples, jobs, header_wait, discard) = {
+            let mut state = self.shared.state.lock().await;
+            let (config, devices) = {
+                let slot = state.slot(id)?;
+                if slot.session.phase.is_active() {
+                    return Err(logicview_capture::CaptureError::Busy.into());
+                }
+                (slot.session.config.clone(), slot.devices.clone())
+            };
+            combined_usb_limits(&config)?;
+            let samples = planned_samples(&config)?;
+            let jobs = pod_captures(&devices, &config, samples)?;
+            let (generation, discard, rate, samples) = {
+                let slot = state.slot_mut(id)?;
+                apply_sampled_channels(slot, config.channel_enable)?;
+                let width = slot.channel_names.len();
+                let armed = jobs.iter().map(|job| job.enabled as usize).sum::<usize>();
+                if width != armed {
+                    return Err(EngineError::Device(
+                        "enabled probes do not match the pods being armed".into(),
+                    ));
+                }
+                let samples = slot.session.begin_combined(config, width)?;
+                (
+                    slot.session.generation(),
+                    slot.session.config.discard_on_stop,
+                    slot.session.config.sample_rate_hz.max(1),
+                    samples,
+                )
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            state.running.insert(
+                id.to_string(),
+                RunHandle {
+                    generation,
+                    stop: Arc::clone(&stop),
+                },
+            );
+            let secs = samples / rate + 3;
+            (
+                generation,
+                stop,
+                samples,
+                jobs,
+                Duration::from_secs(secs.min(120)),
+                discard,
+            )
+        };
+        let shared = Arc::clone(&self.shared);
+        let task_id = id.to_string();
+        tokio::spawn(async move {
+            usb::drive_dual(
+                shared,
+                task_id,
+                generation,
+                stop,
+                samples,
+                header_wait,
+                discard,
+                jobs,
+            )
+            .await;
+        });
+        self.status(Some(id)).await
     }
 
     /// Searches packed channel samples for a logic pattern, with unspecified levels acting as
@@ -1563,15 +1668,222 @@ fn probe_count(slot: &Slot) -> usize {
 }
 
 /// Counts selected probes within the available width for sample-rate planning.
-fn enabled_channel_count(mask: u32, probes: usize) -> u32 {
-    let width = probes.max(1).min(32);
-    let all = if width == 32 {
+fn enabled_channel_count(mask: u64, probes: usize) -> u32 {
+    let width = probes.max(1).min(64);
+    if mask == 0 {
+        return width as u32;
+    }
+    let mut count = 0u32;
+    for index in 0..width {
+        if mask & (1u64 << index) != 0 {
+            count += 1;
+        }
+    }
+    count.max(1)
+}
+
+/// The bits of one pod inside a session mask. A zero mask enables that pod's width.
+fn local_enable(mask: u64, offset: usize, width: usize) -> u32 {
+    let width = width.min(32);
+    let all = if width >= 32 {
         u32::MAX
     } else {
         (1u32 << width) - 1
     };
-    let bits = if mask == 0 { all } else { mask & all };
-    bits.count_ones().max(1)
+    if mask == 0 || width == 0 {
+        return all;
+    }
+    if offset >= 64 {
+        return 0;
+    }
+    ((mask >> offset) as u32) & all
+}
+
+/// Combined captures stay on one buffer record. The pods do not share a clock or trigger.
+fn combined_usb_limits(config: &SessionConfig) -> Result<(), EngineError> {
+    if config.depth != DepthMode::Buffer || config.run != RunPolicy::Single {
+        return Err(EngineError::Device(
+            "a combined USB capture is a single buffer run".into(),
+        ));
+    }
+    if config.trigger_enabled {
+        return Err(EngineError::Device(
+            "a combined USB capture does not use a hardware trigger".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a second pod unless the session is stopped, already on one USB pod, and the product differs.
+fn refuse_usb_attach(slot: &Slot, pid: u16) -> Result<(), EngineError> {
+    if slot.session.phase.is_active() {
+        return Err(logicview_capture::CaptureError::Busy.into());
+    }
+    if slot.devices.iter().any(|device| device.kind != "usb") {
+        return Err(EngineError::Device(
+            "this session needs one USB pod before another can be attached".into(),
+        ));
+    }
+    if slot
+        .devices
+        .iter()
+        .any(|device| usb_product_id(&device.id) == Some(pid))
+    {
+        return Err(EngineError::Device(
+            "two pods with the same product id cannot share one capture".into(),
+        ));
+    }
+    let usb = slot.devices.iter().filter(|device| device.kind == "usb").count();
+    if usb != 1 {
+        return Err(EngineError::Device(
+            "a capture stacks at most two USB pods".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Short gutter label for a tested pod.
+fn pod_short_name(pid: u16) -> String {
+    match pid {
+        logicview_hal::PLUS_PID => "Plus".into(),
+        logicview_hal::U3PRO32_PID => "U3".into(),
+        _ => logicview_hal::logic_profile(pid)
+            .map(|profile| profile.name.trim_start_matches("DSLogic ").to_string())
+            .unwrap_or_else(|| "Pod".into()),
+    }
+}
+
+/// Display color for probe `index` on its own pod.
+fn channel_color(index: usize) -> String {
+    const COLORS: [&str; 8] = [
+        "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2", "#7dcea0", "#f1948a",
+    ];
+    COLORS[index % COLORS.len()].to_string()
+}
+
+/// Installs one or two USB pods. Two pods get device-qualified probe names.
+fn install_usb_catalog(slot: &mut Slot, devices: &[BoundDevice]) -> Result<(), EngineError> {
+    if devices.is_empty() || devices.iter().any(|device| device.kind != "usb") {
+        return Err(EngineError::Device("a USB session needs USB pods".into()));
+    }
+    let qualify = devices.len() > 1;
+    let mut names = Vec::new();
+    let mut colors = Vec::new();
+    let mut origins = Vec::new();
+    for device in devices {
+        let pid = usb_product_id(&device.id).ok_or_else(|| {
+            EngineError::UnknownDevice(format!("{} is not a USB pod", device.id))
+        })?;
+        let width = logicview_hal::logic_profile(pid)
+            .map(|profile| usize::from(profile.channels))
+            .unwrap_or(16);
+        let tag = pod_short_name(pid);
+        for bit in 0..width {
+            names.push(if qualify {
+                format!("{tag} D{bit}")
+            } else {
+                format!("D{bit}")
+            });
+            colors.push(channel_color(bit));
+            origins.push(ChannelOrigin {
+                device_id: device.id.clone(),
+                device_name: device.name.clone(),
+            });
+        }
+    }
+    if names.is_empty() || names.len() > 64 {
+        return Err(EngineError::Device(
+            "a session needs between 1 and 64 probes".into(),
+        ));
+    }
+    slot.devices = devices.to_vec();
+    slot.channel_names = names;
+    slot.channel_colors = colors;
+    slot.origins = origins;
+    remember_catalog(slot);
+    slot.session.config.channel_enable = 0;
+    slot.decoders.clear();
+    slot.annotations.clear();
+    slot.session.store = LogicStore::new(slot.channel_names.len());
+    slot.session.analog = AnalogStore::default();
+    Ok(())
+}
+
+/// Arm record and store offset for each pod that has at least one enabled probe.
+fn pod_captures(
+    devices: &[BoundDevice],
+    config: &SessionConfig,
+    samples: u64,
+) -> Result<Vec<usb::PodJob>, EngineError> {
+    let mut catalog = 0usize;
+    let mut store_offset = 0usize;
+    let mut jobs = Vec::new();
+    let stream = config.depth == DepthMode::Stream;
+    for device in devices.iter().filter(|device| device.kind == "usb") {
+        let pid = usb_product_id(&device.id).ok_or_else(|| {
+            EngineError::Device(format!("{} is not a USB pod", device.id))
+        })?;
+        let width = logicview_hal::logic_profile(pid)
+            .map(|profile| usize::from(profile.channels))
+            .unwrap_or(16);
+        let local = local_enable(config.channel_enable, catalog, width);
+        catalog += width;
+        let count = local.count_ones();
+        if count == 0 {
+            continue;
+        }
+        let clock = clock_for(pid, config.sample_rate_hz, local, stream, device.super_speed)?;
+        let image = logicview_capture::device_arm(config, samples, local, &clock)?;
+        let threshold = if pid == logicview_hal::U3PRO32_PID {
+            Some(logicview_hal::u3_threshold_code(config.threshold_volts))
+        } else {
+            Some(logicview_hal::threshold_code(config.threshold_volts))
+        };
+        jobs.push(usb::PodJob {
+            image,
+            enabled: u64::from(count),
+            offset: store_offset,
+            product_id: pid,
+            threshold,
+        });
+        store_offset += count as usize;
+    }
+    if jobs.is_empty() {
+        return Err(EngineError::Device("no channels enabled".into()));
+    }
+    Ok(jobs)
+}
+
+/// Divider clock for one pod. The Plus and the U3Pro32 do not share a plan.
+fn clock_for(
+    pid: u16,
+    rate_hz: u64,
+    mask: u32,
+    stream: bool,
+    super_speed: bool,
+) -> Result<HostClock, EngineError> {
+    let map = |err: logicview_hal::HalError| {
+        EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
+    };
+    if pid == logicview_hal::U3PRO32_PID {
+        let planned = logicview_hal::plan_u3_link(rate_hz, mask, stream, super_speed).map_err(map)?;
+        Ok(HostClock {
+            hw_max_hz: planned.hw_max_hz,
+            half_rate_hz: Some(planned.half_rate_hz),
+            quarter_rate_hz: Some(planned.quarter_rate_hz),
+            pre_divider: planned.pre_divider,
+            ext_record: true,
+        })
+    } else {
+        logicview_hal::plan_clock(rate_hz, mask, stream).map_err(map)?;
+        Ok(HostClock {
+            hw_max_hz: logicview_hal::HW_CLOCK_HZ,
+            half_rate_hz: Some(logicview_hal::HALF_RATE_HZ),
+            quarter_rate_hz: Some(logicview_hal::QUARTER_RATE_HZ),
+            pre_divider: 1,
+            ext_record: false,
+        })
+    }
 }
 
 /// Checks whether the session's bound hardware advertises a SuperSpeed connection.
@@ -1588,22 +1900,63 @@ fn rate_product(devices: &[BoundDevice]) -> u16 {
 }
 
 /// Keeps requested capture rates within the selected channel, mode, and link limits.
+///
+/// Two USB pods are limited by the lower of their own ceilings. Each ceiling
+/// uses that pod's enabled count, not the combined probe count.
 fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     if config.sample_rate_hz == 0 {
         return;
     }
-    let channels = enabled_channel_count(config.channel_enable, probe_count(slot));
-    let stream = config.depth == DepthMode::Stream;
-    let max = logicview_hal::max_sample_hz(
-        logicview_hal::link_rate_limits(
-            rate_product(&slot.devices),
-            stream,
-            bound_link_is_super(&slot.devices),
-        ),
-        channels,
-    );
+    let max = session_rate_ceiling(slot, config);
     if config.sample_rate_hz > max {
         config.sample_rate_hz = max;
+    }
+}
+
+/// Highest sample rate the bound pods can share for this mask and mode.
+fn session_rate_ceiling(slot: &Slot, config: &SessionConfig) -> u64 {
+    let usb: Vec<&BoundDevice> = slot
+        .devices
+        .iter()
+        .filter(|device| device.kind == "usb")
+        .collect();
+    let stream = config.depth == DepthMode::Stream;
+    if usb.len() <= 1 {
+        let channels = enabled_channel_count(config.channel_enable, probe_count(slot));
+        return logicview_hal::max_sample_hz(
+            logicview_hal::link_rate_limits(
+                rate_product(&slot.devices),
+                stream,
+                bound_link_is_super(&slot.devices),
+            ),
+            channels,
+        );
+    }
+    let mut offset = 0usize;
+    let mut ceiling = u64::MAX;
+    for device in usb {
+        let Some(pid) = usb_product_id(&device.id) else {
+            continue;
+        };
+        let width = logicview_hal::logic_profile(pid)
+            .map(|profile| usize::from(profile.channels))
+            .unwrap_or(16);
+        let local = local_enable(config.channel_enable, offset, width);
+        offset += width;
+        let count = local.count_ones();
+        if count == 0 {
+            continue;
+        }
+        let max = logicview_hal::max_sample_hz(
+            logicview_hal::link_rate_limits(pid, stream, device.super_speed),
+            count,
+        );
+        ceiling = ceiling.min(max);
+    }
+    if ceiling == u64::MAX {
+        logicview_hal::HW_CLOCK_HZ
+    } else {
+        ceiling
     }
 }
 
@@ -1624,12 +1977,12 @@ fn session_uses_usb(devices: &[BoundDevice]) -> Result<bool, EngineError> {
     if usb == 0 && demo == devices.len() && !devices.is_empty() {
         return Ok(false);
     }
-    if usb == 1 && devices.len() == 1 {
+    if (usb == 1 || usb == 2) && usb == devices.len() {
         return Ok(true);
     }
-    if usb > 1 {
+    if usb > 2 {
         return Err(EngineError::Device(
-            "arming more than one USB pod in one capture is not verified on hardware".into(),
+            "a capture stacks at most two USB pods".into(),
         ));
     }
     Err(EngineError::Device(
@@ -1681,7 +2034,7 @@ fn install_demo_ids(slot: &mut Slot, ids: &[String]) -> Result<(), EngineError> 
 /// Selects the synthetic waveforms for enabled probes in capture channel order.
 fn demo_waves_masked(
     devices: &[BoundDevice],
-    mask: u32,
+    mask: u64,
 ) -> Result<Vec<fn(u64) -> bool>, EngineError> {
     let waves = demo_waves(devices)?;
     if mask == 0 {
@@ -1690,7 +2043,7 @@ fn demo_waves_masked(
     let kept: Vec<_> = waves
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| *index < 32 && mask & (1 << *index) != 0)
+        .filter(|(index, _)| *index < 64 && mask & (1u64 << *index) != 0)
         .map(|(_, wave)| wave)
         .collect();
     if kept.is_empty() {
@@ -1707,7 +2060,7 @@ fn remember_catalog(slot: &mut Slot) {
 }
 
 /// Rebuilds channel labels and origins to match the enabled capture streams.
-fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError> {
+fn apply_sampled_channels(slot: &mut Slot, mask: u64) -> Result<(), EngineError> {
     if slot.catalog_names.is_empty() {
         remember_catalog(slot);
     }
@@ -1721,7 +2074,7 @@ fn apply_sampled_channels(slot: &mut Slot, mask: u32) -> Result<(), EngineError>
     let mut colors = Vec::new();
     let mut origins = Vec::new();
     for (index, name) in slot.catalog_names.iter().enumerate() {
-        if index < 32 && mask & (1 << index) != 0 {
+        if index < 64 && mask & (1u64 << index) != 0 {
             names.push(name.clone());
             colors.push(
                 slot.catalog_colors
@@ -1785,15 +2138,12 @@ fn decode_capture_bytes(name: &str, bytes: &[u8]) -> Result<ArchiveData, EngineE
 
 /// Creates labels and display colors for enabled physical probes in channel order.
 fn pod_channel_style(mask: u32) -> (Vec<String>, Vec<String>) {
-    const COLORS: [&str; 8] = [
-        "#e2b340", "#3dcc8e", "#5aa2ff", "#c58bff", "#ff8a5b", "#f2f2f2", "#7dcea0", "#f1948a",
-    ];
     let mut names = Vec::new();
     let mut colors = Vec::new();
     for bit in 0..32 {
         if mask & (1u32 << bit) != 0 {
             names.push(format!("D{bit}"));
-            colors.push(COLORS[bit % COLORS.len()].to_string());
+            colors.push(channel_color(bit));
         }
     }
     (names, colors)

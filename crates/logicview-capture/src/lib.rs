@@ -29,8 +29,8 @@ pub use demo::{
 pub use error::CaptureError;
 pub use logicview_proto::DepthMode;
 pub use session::{
-    active_edge_steps, check_trigger, planned_samples, HostClock, Phase, RunPolicy, Session,
-    SessionConfig, StartMode, TriggerKind, TriggerStep, DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
+    active_edge_steps, check_trigger, device_arm, planned_samples, HostClock, Phase, RunPolicy,
+    Session, SessionConfig, StartMode, TriggerKind, TriggerStep, DEMO_CHUNK_SAMPLES, MAX_SAMPLES,
     MAX_TRIGGER_STEPS,
 };
 pub use store::{AnalogColumn, AnalogStore, Column, LogicStore};

@@ -22,9 +22,11 @@
 mod capture;
 mod catalog;
 mod device;
+mod lock;
 mod profile;
 
 pub use capture::{run_capture, CaptureEvent, CaptureJob, CaptureReport, OnStop};
+pub use lock::{acquire_test_pod_lock, PodGuard};
 pub use catalog::{logic_profile, logic_profiles, LogicProfile};
 pub use device::{list_plus, list_pods, matches_plus, supported_product, Pod};
 pub use profile::{

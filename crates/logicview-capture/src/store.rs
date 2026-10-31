@@ -262,6 +262,36 @@ impl LogicStore {
         self.channels.first().map(|ch| ch.len).unwrap_or(0)
     }
 
+    /// Shortest and longest channel lengths. Empty stores report zeros.
+    pub fn sample_span(&self) -> (u64, u64) {
+        let mut shortest = u64::MAX;
+        let mut longest = 0u64;
+        for channel in &self.channels {
+            shortest = shortest.min(channel.len);
+            longest = longest.max(channel.len);
+        }
+        if self.channels.is_empty() {
+            (0, 0)
+        } else {
+            (shortest, longest)
+        }
+    }
+
+    /// Cuts every channel to the shortest length, aligned to a whole byte.
+    pub fn trim_to_shortest(&mut self) -> u64 {
+        let (shortest, _) = self.sample_span();
+        let keep = shortest & !7;
+        let keep_bytes = (keep / 8) as usize;
+        for channel in &mut self.channels {
+            if channel.len > keep || channel.bytes.len() > keep_bytes {
+                channel.bytes.truncate(keep_bytes);
+                channel.len = keep;
+                channel.rebuild();
+            }
+        }
+        keep
+    }
+
     /// Reports whether the logic capture contains any samples.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

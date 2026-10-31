@@ -21,6 +21,7 @@
 
 mod eeprom;
 mod i2c;
+mod lua_helpers;
 mod lua_host;
 mod runtime;
 mod script;
