@@ -123,6 +123,6 @@ Contributions are welcome, including device research, hardware testing, document
 
 ## License
 
-Copyright (C) 2026 Chuck
+Copyright (C) 2026 E2ForLife
 
 LogicView is licensed under the GNU General Public License, version 3 or any later version (`GPL-3.0-or-later`). The full license text is in [LICENSE.md](LICENSE.md).
