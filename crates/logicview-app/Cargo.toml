@@ -15,7 +15,9 @@ logicview-config = { path = "../logicview-config" }
 logicview-engine = { path = "../logicview-engine" }
 logicview-mcp = { path = "../logicview-mcp" }
 logicview-ui = { path = "../logicview-ui" }
+serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 rfd = { version = "0.17.2", features = ["xdg-portal"] }
 tao = "0.37.2"
 tokio.workspace = true

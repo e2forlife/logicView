@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
@@ -155,9 +155,15 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             .map_err(|err| format!("could not open the LogicView window: {err}"))?
     };
 
+    let quote = splash_quote::pick();
+    let splash_height = if quote.is_some() {
+        splash_quote::SPLASH_HEIGHT
+    } else {
+        splash_quote::LOGO_HEIGHT
+    };
     let mut splash_builder = WindowBuilder::new()
         .with_title("LogicView")
-        .with_inner_size(LogicalSize::new(780.0, 260.0))
+        .with_inner_size(LogicalSize::new(splash_quote::LOGO_WIDTH, splash_height))
         .with_decorations(false)
         .with_transparent(!cfg!(windows))
         .with_always_on_top(true)
@@ -186,12 +192,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         splash.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
     }
     #[cfg(not(windows))]
-    let html = format!(
-        r#"<!doctype html><html><head><style>
-        html,body {{ margin:0; width:100%; height:100%; overflow:hidden; background:transparent; }}
-        img {{ width:100%; height:100%; object-fit:contain; }}
-        </style></head><body><img src="{origin}/assets/AppLogo.png" alt="LogicView"></body></html>"#
-    );
+    let html = splash_quote::webview_html(origin, quote.as_ref());
     #[cfg(not(windows))]
     let splash_builder = WebViewBuilder::new()
         .with_html(html)
@@ -213,10 +214,10 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             .map_err(|err| format!("could not display the startup splash: {err}"))?
     };
     #[cfg(windows)]
-    let splash_view = layered_splash::show(&splash)?;
+    let splash_view = layered_splash::show(&splash, quote)?;
     #[cfg(not(windows))]
     splash.set_visible(true);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + splash_quote::splash_duration();
     let mut splash = Some((splash_view, splash));
 
     event_loop.run(move |event, _, control_flow| {
@@ -362,8 +363,14 @@ mod tests {
 
     #[test]
     fn window_caption_follows_the_saved_theme() {
-        assert_eq!(preferred_window_theme("light"), Some(tao::window::Theme::Light));
-        assert_eq!(preferred_window_theme("dark"), Some(tao::window::Theme::Dark));
+        assert_eq!(
+            preferred_window_theme("light"),
+            Some(tao::window::Theme::Light)
+        );
+        assert_eq!(
+            preferred_window_theme("dark"),
+            Some(tao::window::Theme::Dark)
+        );
         assert_eq!(preferred_window_theme("system"), None);
         assert_eq!(preferred_window_theme("other"), None);
     }
@@ -390,6 +397,9 @@ mod tests {
         assert!(!allows_navigation(origin, "http://127.0.0.1:4173.example/"));
     }
 }
+
+#[path = "splash_quote.rs"]
+mod splash_quote;
 
 #[cfg(windows)]
 #[path = "splash_windows.rs"]
