@@ -527,27 +527,25 @@ function lv.pyformat(fmt, args, kwargs)
   args = args or {}
   kwargs = kwargs or {}
   local auto = 0
-  local function convert(spec, value)
-    spec = spec or ''
-    local conv = spec:match('([a-zA-Z])$') or 's'
-    if conv == 's' then return tostring(value) end
-    local ok, text = pcall(string.format, '%' .. spec, tonumber(value) or value)
-    if ok then return text end
-    return tostring(value)
-  end
-  return (fmt:gsub('{{', '\1'):gsub('}}', '\2'):gsub('{([^{}]*)}', function(body)
-    local field, spec = body:match('^([^:]*):(.*)$')
-    if not field then field, spec = body, nil end
-    local value
+  local function field_value(field)
     if field == '' then
       auto = auto + 1
-      value = args[auto]
+      return args[auto]
     elseif tonumber(field) then
-      value = args[tonumber(field) + 1]
-    else
-      value = kwargs[field]
+      return args[tonumber(field) + 1]
     end
-    return convert(spec, value)
+    return kwargs[field]
+  end
+  fmt = fmt:gsub('{{', '\1'):gsub('}}', '\2')
+  -- Python permits replacement fields inside a format specification, e.g.
+  -- "{1:0>{0}X}". Resolve those before formatting the enclosing field.
+  fmt = fmt:gsub('({[^{}]-:.-){([^{}]+)}([^{}]-})', function(prefix, field, suffix)
+    return prefix .. tostring(field_value(field)) .. suffix
+  end)
+  return (fmt:gsub('{([^{}]*)}', function(body)
+    local field, spec = body:match('^([^:]*):(.*)$')
+    if not field then field, spec = body, '' end
+    return lv.format(field_value(field), spec)
   end):gsub('\1', '{'):gsub('\2', '}'))
 end
 

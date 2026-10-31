@@ -8,7 +8,10 @@ use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 fn directory() -> Option<PathBuf> {
@@ -37,6 +40,9 @@ fn files() -> Vec<PathBuf> {
     paths
 }
 fn lua() -> Result<Lua, DecodeError> {
+    lua_with_ticks().map(|(lua, _)| lua)
+}
+fn lua_with_ticks() -> Result<(Lua, Arc<AtomicUsize>), DecodeError> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::COROUTINE,
         LuaOptions::default(),
@@ -44,11 +50,12 @@ fn lua() -> Result<Lua, DecodeError> {
     .map_err(|e| DecodeError::Message(e.to_string()))?;
     lua.set_memory_limit(64 * 1024 * 1024)
         .map_err(|e| DecodeError::Message(e.to_string()))?;
-    let ticks = std::sync::atomic::AtomicUsize::new(0);
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let hook_ticks = ticks.clone();
     lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(10_000),
         move |_, _| {
-            if ticks.fetch_add(1, Ordering::Relaxed) >= 10_000 {
+            if hook_ticks.fetch_add(1, Ordering::Relaxed) >= 10_000 {
                 Err(mlua::Error::RuntimeError(
                     "decoder instruction limit exceeded".into(),
                 ))
@@ -59,7 +66,7 @@ fn lua() -> Result<Lua, DecodeError> {
     )
     .map_err(|e| DecodeError::Message(e.to_string()))?;
     super::lua_host::install(&lua)?;
-    Ok(lua)
+    Ok((lua, ticks))
 }
 fn module(lua: &Lua, path: &PathBuf) -> Result<Table, DecodeError> {
     let source = std::fs::read_to_string(path).map_err(|e| DecodeError::Message(e.to_string()))?;
@@ -71,8 +78,42 @@ fn module(lua: &Lua, path: &PathBuf) -> Result<Table, DecodeError> {
 fn metadata(_lua: &Lua, module: &Table) -> Result<DecoderSchema, DecodeError> {
     super::lua_host::read_schema(module)
 }
-pub fn catalog() -> Vec<DecoderSchema> {
-    files()
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+#[derive(Default)]
+struct ScriptCatalog {
+    stamps: Vec<FileStamp>,
+    entries: Vec<(DecoderSchema, PathBuf)>,
+    initialized: bool,
+}
+
+fn entries() -> Vec<(DecoderSchema, PathBuf)> {
+    static CACHE: OnceLock<Mutex<ScriptCatalog>> = OnceLock::new();
+    let stamps: Vec<_> = files()
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(&path).ok()?;
+            Some(FileStamp {
+                path,
+                size: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        })
+        .collect();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(ScriptCatalog::default()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if cache.initialized && cache.stamps == stamps {
+        return cache.entries.clone();
+    }
+    let entries = stamps
+        .iter()
+        .map(|stamp| stamp.path.clone())
         .into_iter()
         .filter_map(|path| {
             let result = (|| {
@@ -81,20 +122,33 @@ pub fn catalog() -> Vec<DecoderSchema> {
                 metadata(&lua, &m)
             })();
             match result {
-                Ok(value) => Some(value),
+                Ok(value) => Some((value, path)),
                 Err(err) => {
                     eprintln!("decoder {}: {err}", path.display());
                     None
                 }
             }
         })
-        .collect()
+        .collect();
+    cache.stamps = stamps;
+    cache.entries = entries;
+    cache.initialized = true;
+    cache.entries.clone()
+}
+pub fn catalog() -> Vec<DecoderSchema> {
+    entries().into_iter().map(|(schema, _)| schema).collect()
 }
 pub fn run_script(
     request: &DecodeRequest<'_>,
     cancel: &AtomicBool,
 ) -> Result<DecodeOutput, DecodeError> {
-    run_paths(request, cancel, files())
+    let paths = entries()
+        .into_iter()
+        .filter(|(schema, _)| schema.id == request.protocol)
+        .map(|(_, path)| path)
+        .take(1)
+        .collect();
+    run_paths(request, cancel, paths)
 }
 fn run_paths(
     request: &DecodeRequest<'_>,
@@ -105,7 +159,7 @@ fn run_paths(
         return Ok(DecodeOutput::new(vec![], vec![], true));
     }
     for path in paths {
-        let lua = lua()?;
+        let (lua, ticks) = lua_with_ticks()?;
         let m = match module(&lua, &path) {
             Ok(m) => m,
             Err(_) => continue,
@@ -118,7 +172,7 @@ fn run_paths(
             continue;
         }
         if schema.api_version >= 3 {
-            return super::lua_host::run_session(&lua, &m, &schema, request, cancel);
+            return super::lua_host::run_session(&lua, &m, &schema, request, cancel, &ticks);
         }
         let decode: mlua::Function = m
             .get("decode")
@@ -131,30 +185,43 @@ fn run_paths(
         options.extend(request.options.iter().cloned());
         let start = request.region.start.min(request.sample_len);
         let end = request.region.end.min(request.sample_len);
-        let result = lua
-            .scope(|scope| {
-                let bit = scope.create_function(|_, (name, index): (String, u64)| {
-                    if index >= request.sample_len {
-                        return Ok(false);
+        let checkpoint = std::cell::Cell::new(start);
+        let result = lua.scope(|scope| {
+            let bit = scope.create_function(|_, (name, index): (String, u64)| {
+                if index >= checkpoint.get().saturating_add(4096) {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(mlua::Error::RuntimeError("decoder cancelled".into()));
                     }
-                    Ok(request
-                        .channels
-                        .iter()
-                        .find(|(n, _)| *n == name)
-                        .is_some_and(|(_, bytes)| logicview_analysis::bit_at(bytes, index)))
-                })?;
-                let context = lua.create_table()?;
-                context.set("sample_rate_hz", request.sample_rate_hz)?;
-                let connected = lua.create_table()?;
-                for (name, _) in request.channels {
-                    connected.set(*name, true)?;
+                    checkpoint.set(index);
+                    ticks.store(0, Ordering::Relaxed);
                 }
-                context.set("connected", connected)?;
-                context.set("lower", lua.to_value(request.lower)?)?;
-                context.set("packets", lua.to_value(request.lower_packets)?)?;
-                decode.call::<Value>((start, end, bit, lua.to_value(&options)?, context))
-            })
-            .map_err(|e| DecodeError::Message(e.to_string()))?;
+                if index >= request.sample_len {
+                    return Ok(false);
+                }
+                Ok(request
+                    .channels
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .is_some_and(|(_, bytes)| logicview_analysis::bit_at(bytes, index)))
+            })?;
+            let context = lua.create_table()?;
+            context.set("sample_rate_hz", request.sample_rate_hz)?;
+            let connected = lua.create_table()?;
+            for (name, _) in request.channels {
+                connected.set(*name, true)?;
+            }
+            context.set("connected", connected)?;
+            context.set("lower", lua.to_value(request.lower)?)?;
+            context.set("packets", lua.to_value(request.lower_packets)?)?;
+            decode.call::<Value>((start, end, bit, lua.to_value(&options)?, context))
+        });
+        let result = match result {
+            Ok(value) => value,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                return Ok(DecodeOutput::new(vec![], vec![], true))
+            }
+            Err(err) => return Err(DecodeError::Message(err.to_string())),
+        };
         return output_from_value(&lua, result, start, end);
     }
     Err(DecodeError::UnknownProtocol(request.protocol.into()))
@@ -305,6 +372,26 @@ mod tests {
             .join("../../examples/decoders/high_pulses.lua");
         let module = module(&lua, &path).unwrap();
         assert_eq!(metadata(&lua, &module).unwrap().id, "high_pulses");
+    }
+
+    #[test]
+    fn high_pulses_decodes_a_long_capture() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/decoders/high_pulses.lua");
+        let bytes = vec![0xff; 2_000_000];
+        let channels = [("signal", bytes.as_slice())];
+        let req = DecodeRequest {
+            protocol: "high_pulses",
+            channels: &channels,
+            options: &[],
+            region: 0..16_000_000,
+            sample_len: 16_000_000,
+            sample_rate_hz: None,
+            lower: &[],
+            lower_packets: &[],
+        };
+        let result = run_paths(&req, &AtomicBool::new(false), vec![path]).unwrap();
+        assert_eq!(result.annotations.len(), 1);
     }
 
     #[test]
@@ -615,6 +702,7 @@ mod tests {
               options = {{id = 'mode', desc = 'Edge mode', default = 'rising', values = {'rising', 'falling'}}},
               annotations = {{'edge', 'Edge'}},
               annotation_rows = {{'edges', 'Edges', {0}}},
+              lanes = {{id='rx', name='Receive', channel='data', channels={'data', 'gate'}, classes={'edge'}, value_field='value'}},
               binary = {{'raw', 'Raw markers'}},
               decode = function() end,
             }
@@ -629,8 +717,26 @@ mod tests {
         assert_eq!(schema.options[0].name, "Edge mode");
         assert_eq!(schema.annotation_classes[0].desc, "Edge");
         assert_eq!(schema.annotation_rows[0].classes, [0]);
+        assert_eq!(schema.lanes[0].channel, "data");
+        assert_eq!(schema.lanes[0].channels, ["data", "gate"]);
+        assert_eq!(schema.lanes[0].classes, ["edge"]);
+        assert_eq!(schema.lanes[0].value_field.as_deref(), Some("value"));
         assert_eq!(schema.binary[0].id, "raw");
         assert_eq!(schema.tags, ["Debug/trace"]);
+    }
+
+    #[test]
+    fn lane_metadata_rejects_unknown_channels_and_classes() {
+        let lua = lua().unwrap();
+        for lane in [
+            "{id='a', channel='missing', classes={'data'}}",
+            "{id='a', channel='signal', classes={'missing'}}",
+            "{id='a', channel='signal', channels={'other'}, classes={'data'}}",
+        ] {
+            let source = format!("return {{id='test', name='Test', channels={{'signal'}}, classes={{'data'}}, lanes={{{lane}}}, decode=function() end}}");
+            let module: Table = lua.load(&source).eval().unwrap();
+            assert!(metadata(&lua, &module).is_err());
+        }
     }
 
     #[test]
@@ -854,6 +960,58 @@ mod tests {
     }
 
     #[test]
+    fn edge_wait_tracks_other_pins_across_constant_blocks() {
+        let path = std::env::temp_dir().join(format!("logicview-edge-block-{}.lua", std::process::id()));
+        std::fs::write(&path, r#"return {
+            api_version=3, id='edge-block', name='Edge block', channels={'clock', 'data'},
+            annotations={{'hit','Hit'}},
+            start=function(self) self.out=self:register(logicview.OUTPUT_ANN) end,
+            decode=function(self)
+              self:wait({[0]='r', [1]='f'})
+              self:put(self.samplenum, self.samplenum, self.out, {0, {'hit'}})
+            end,
+        }"#).unwrap();
+        let clock = pack_bits(&(0..256).map(|n| u8::from((128..160).contains(&n) || n >= 192)).collect::<Vec<_>>());
+        let data = pack_bits(&(0..256).map(|n| u8::from(n < 80 || (128..192).contains(&n))).collect::<Vec<_>>());
+        let channels = [("clock", clock.as_slice()), ("data", data.as_slice())];
+        let request = DecodeRequest { protocol: "edge-block", channels: &channels, options: &[],
+            region: 0..256, sample_len: 256, sample_rate_hz: None, lower: &[], lower_packets: &[] };
+        let output = run_paths(&request, &AtomicBool::new(false), vec![path.clone()]).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(output.annotations.len(), 1);
+        assert_eq!(output.annotations[0].start_sample, 192);
+    }
+
+    #[test]
+    fn translated_i2c_decodes_on_sda_after_long_idle() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
+        let (scl, sda, len) = crate::i2c::fixture_eeprom_bits();
+        let idle = 8192u64;
+        let long_scl = [vec![0xff; (idle / 8) as usize], scl.clone()].concat();
+        let long_sda = [vec![0xff; (idle / 8) as usize], sda.clone()].concat();
+        for id in ["0:i2c", "1:i2c"] {
+            let path = dir.join(format!("{}.lua", id.replace(':', "-")));
+            let lua = lua().unwrap();
+            let schema = metadata(&lua, &module(&lua, &path).unwrap()).unwrap();
+            assert_eq!(schema.lanes[0].channel, "sda");
+            let run_bus = |clock: &[u8], data: &[u8], samples: u64| {
+                let channels = [("scl", clock), ("sda", data)];
+                run_paths(&DecodeRequest { protocol: id, channels: &channels, options: &[],
+                    region: 0..samples, sample_len: samples, sample_rate_hz: None,
+                    lower: &[], lower_packets: &[] }, &AtomicBool::new(false), vec![path.clone()]).unwrap()
+            };
+            let short = run_bus(&scl, &sda, len);
+            let long = run_bus(&long_scl, &long_sda, len + idle);
+            assert!(short.annotations.iter().any(|row| row.class == "address-write"));
+            assert_eq!(short.annotations.len(), long.annotations.len());
+            for (a, b) in short.annotations.iter().zip(&long.annotations) {
+                assert_eq!((&a.class, &a.text, a.start_sample + idle, a.end_sample + idle),
+                           (&b.class, &b.text, b.start_sample, b.end_sample));
+            }
+        }
+    }
+
+    #[test]
     fn translated_spi_feeds_a_stacked_gamepad() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
         // Mode 0: sample on each rising clock. Eight bits, MSB first.
@@ -901,6 +1059,19 @@ mod tests {
             vec![dir.join("1-spi.lua")],
         )
         .unwrap();
+        for (class, text) in [("mosi-data", "A5"), ("miso-data", "3C")] {
+            assert!(parent.annotations.iter().any(|row| row.class == class && row.text == text));
+        }
+        let basic_request = DecodeRequest { protocol: "0:spi", ..request };
+        let basic = run_paths(
+            &basic_request,
+            &AtomicBool::new(false),
+            vec![dir.join("0-spi.lua")],
+        )
+        .unwrap();
+        for (class, text) in [("mosi-data", "A5"), ("miso-data", "3C")] {
+            assert!(basic.annotations.iter().any(|row| row.class == class && row.text == text));
+        }
         let data = parent
             .packets
             .iter()

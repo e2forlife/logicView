@@ -181,6 +181,18 @@ pub struct AnnotationRowGroup {
     pub classes: Vec<u32>,
 }
 
+/// A decoded lane mapped to a data channel and its annotation classes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DecoderLane {
+    pub id: String,
+    pub name: String,
+    pub channel: String,
+    pub channels: Vec<String>,
+    pub classes: Vec<String>,
+    #[serde(default)]
+    pub value_field: Option<String>,
+}
+
 /// A named binary stream a script can emit with `put`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct BinaryFormat {
@@ -229,6 +241,8 @@ pub struct DecoderSchema {
     #[serde(default)]
     pub annotation_rows: Vec<AnnotationRowGroup>,
     #[serde(default)]
+    pub lanes: Vec<DecoderLane>,
+    #[serde(default)]
     pub binary: Vec<BinaryFormat>,
 }
 
@@ -271,6 +285,21 @@ pub fn catalog() -> Vec<DecoderSchema> {
             &["write", "read", "address"],
         ),
     ];
+    entries[2].lanes = [("mosi", "MOSI"), ("miso", "MISO")]
+        .into_iter()
+        .map(|(id, name)| DecoderLane {
+            id: id.into(),
+            name: name.into(),
+            channel: id.into(),
+            channels: if id == "mosi" {
+                vec!["mosi".into(), "sck".into(), "cs".into()]
+            } else {
+                vec!["sck".into(), "miso".into(), "cs".into()]
+            },
+            classes: vec!["word".into()],
+            value_field: Some(id.into()),
+        })
+        .collect();
     for entry in script::catalog() {
         if !entries.iter().any(|existing| existing.id == entry.id) {
             entries.push(entry);
@@ -321,6 +350,7 @@ fn schema(
         license: String::new(),
         tags: Vec::new(),
         annotation_rows: Vec::new(),
+        lanes: Vec::new(),
         binary: Vec::new(),
     }
 }

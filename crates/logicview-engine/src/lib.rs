@@ -230,6 +230,7 @@ pub(crate) struct ChannelOrigin {
 }
 
 /// Configured decoder instance, including channel bindings and any lower-level dependency.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DecoderInst {
     id: String,
     protocol: String,

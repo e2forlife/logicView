@@ -12,7 +12,7 @@ test('adding a decoder opens configuration with no assumed channel names', async
     api: async (request) => { calls.push(request); return { id: 'spi-1' }; },
     refreshDecoders: async () => { context.state.decoders = [{ id: 'spi-1', protocol: 'spi', channels: {} }]; },
     openDecodeConfig: (decoder) => calls.push(decoder),
-    loadAnnotations: async () => {}, statusEl: { textContent: '' },
+    loadAnnotations: async () => {}, paintStatus() {}, statusEl: { textContent: '' },
   };
   vm.createContext(context);
   vm.runInContext(add, context);

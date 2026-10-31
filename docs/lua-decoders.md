@@ -168,6 +168,25 @@ Set `api_version` to `3` when a decoder should follow the same shape as a [sigro
 | `annotation_rows` | `{ { "id", "Label", { 0, 1 } }, ... }`. The numbers are annotation-class indexes. |
 | `binary` | `{ { "id", "Description" }, ... }` for byte streams. |
 
+### Directional waveform lanes
+
+A decoder can optionally declare `lanes` to control waveform grouping and annotation placement. Each lane names a data input, the related inputs to show underneath it, and the annotation class IDs to display:
+
+```lua
+lanes = {
+  { id = "tx", name = "Transmit", channel = "tx",
+    channels = { "tx", "clock" }, classes = { "tx-data" },
+    value_field = "value" },
+  { id = "rx", name = "Receive", channel = "rx",
+    channels = { "rx", "clock" }, classes = { "rx-data" },
+    value_field = "value" },
+},
+```
+
+`id` must be unique and `channel` must name a declared input. `channels` controls the order of the input waveforms shown within the lane; it defaults to the data channel and must include it. Unconnected optional inputs are omitted, and a lane is hidden when its data input is unconnected. `classes` contains annotation class IDs, not indexes. Only those annotations appear on that lane and its data-channel overlay.
+
+`value_field` is optional. When present, only matching annotations containing that field appear on the lane; its hexadecimal value supports the numeric display formats and analog view. Without it, the lane displays annotation text. The host populates the `value` field for the `@` hexadecimal annotation convention used by the SPI examples. Functional decoders can also supply fields explicitly. Scripts without `lanes` retain the existing single-group behavior. Lane metadata affects display, not sampling or stacked decoder packets.
+
 The host calls `metadata`, then `start`, then `reset`, then `decode`. `metadata(self, key, value)` is called with `logicview.SRD_CONF_SAMPLERATE` when the capture has a sample rate. `start` is where the script calls `register`. `reset` clears protocol state and should leave registered output ids in place.
 
 ```lua

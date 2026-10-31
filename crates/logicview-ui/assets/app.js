@@ -341,13 +341,20 @@ function laneColor(channel, fallback) {
   return storedColor("logic:" + signal.index, signal.color || fallback);
 }
 
+function isSpiProtocol(protocol) {
+  return protocol === "spi";
+}
+
+function decoderLaneSpecs(decoder) {
+  return (state.decoderCatalog || []).find((item) => item.id === decoder.protocol)?.lanes || [];
+}
+
 function decodeLanes(decoder, fallbackChannel) {
   const channels = decoder.channels || {};
-  if (decoder.protocol === "spi") {
-    const lanes = [];
-    if (channels.mosi != null && Number.isFinite(Number(channels.mosi))) lanes.push({ id: "mosi", name: "MOSI", channel: Number(channels.mosi) });
-    if (channels.miso != null && Number.isFinite(Number(channels.miso))) lanes.push({ id: "miso", name: "MISO", channel: Number(channels.miso) });
-    return lanes;
+  const specs = decoderLaneSpecs(decoder);
+  if (specs.length) {
+    return specs.filter((lane) => channels[lane.channel] != null && channels[lane.channel] !== "" && Number.isFinite(Number(channels[lane.channel])))
+      .map((lane) => ({ ...lane, channel: Number(channels[lane.channel]) }));
   }
   return [{ id: "", name: protocolLabel(decoder.protocol), channel: fallbackChannel }];
 }
@@ -361,7 +368,7 @@ function decodeBusRow(decoder, lane, header) {
     kind: "decode",
     channel,
     name: lane.name,
-    color: laneColor(channel, analog ? "#7dcea0" : "#8eb6ff"),
+    color: storedColor(key, laneColor(channel, analog ? "#7dcea0" : "#8eb6ff")),
     device: "",
     decoderId: decoder.id,
     header: !!header,
@@ -389,9 +396,7 @@ function groupRows(decoder, source, depth = 0) {
     rows.push(header);
     if (decoderCondensed(decoder.id, lane.id)) continue;
     const channels = decoder.channels || {};
-    const laneIndexes = decoder.protocol === "spi" && lane.id
-      ? (lane.id === "miso" ? [channels.sck, channels.miso, channels.cs] : [channels.mosi, channels.sck, channels.cs])
-      : indexes;
+    const laneIndexes = lane.id ? lane.channels.map((name) => channels[name]) : indexes;
     const seen = new Set();
     for (const value of laneIndexes) {
       if (value == null || value === "") continue;
@@ -808,6 +813,10 @@ function paintStatus() {
     return;
   }
   statusEl.title = "";
+  if (state.decoderBusy) {
+    statusEl.textContent = "Applying decoder annotations...";
+    return;
+  }
   const count = state.total.toLocaleString();
   const trigger = state.triggerSample == null ? "" : ` · trigger @ ${state.triggerSample}`;
   const hover = state.hoverText ? ` · ${state.hoverText}` : "";
@@ -1960,7 +1969,7 @@ function valueAnnotations(decoder) {
 }
 
 function annotationLabel(row) {
-  if (row.protocol === "spi" && row.fields && (row.fields.mosi || row.fields.miso)) {
+  if (isSpiProtocol(row.protocol) && row.fields && (row.fields.mosi || row.fields.miso)) {
     return "0x" + (row.fields.mosi || "00") + "/0x" + (row.fields.miso || "00");
   }
   return row.text || row.class || "";
@@ -1980,12 +1989,12 @@ function logicRow(layout, channel, decoderId, lane) {
 function dataLineTargets(decoder) {
   const channels = decoder.channels || {};
   const text = annotationLabel;
-  if (decoder.protocol === "spi") {
-    return [
-      { channel: channels.mosi, lane: "mosi", label: (row) => (row.fields && row.fields.mosi ? "0x" + row.fields.mosi : text(row)) },
-      { channel: channels.miso, lane: "miso", label: (row) => (row.fields && row.fields.miso ? "0x" + row.fields.miso : text(row)) },
-    ];
-  }
+  const specs = decoderLaneSpecs(decoder);
+  if (specs.length) return specs.map((lane) => ({
+    channel: channels[lane.channel], lane: lane.id,
+    label: (row) => lane.value_field && row.fields?.[lane.value_field] != null
+      ? "0x" + row.fields[lane.value_field] : text(row),
+  }));
   if (decoder.protocol === "i2c") return [{ channel: channels.sda, label: text }];
   if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
   if (decoder.protocol === "eeprom24") {
@@ -1998,6 +2007,19 @@ function dataLineTargets(decoder) {
   if (first != null) return [{ channel: channels[first], label: text }];
   const parent = (state.decoders || []).find((row) => row.id === decoder.stack_on);
   return parent ? dataLineTargets(parent).map((target) => ({ ...target, decoderId: target.decoderId || parent.id, label: text })) : [];
+}
+
+function laneAnnotations(rows, lane, decoder) {
+  if (!lane) return rows;
+  const spec = decoderLaneSpecs(decoder).find((item) => item.id === lane);
+  if (!spec) return [];
+  return rows.filter((row) => spec.classes.includes(row.class) &&
+    (!spec.value_field || row.fields?.[spec.value_field] != null));
+}
+
+function laneValue(row, decoder, lane) {
+  const spec = decoderLaneSpecs(decoder).find((item) => item.id === lane);
+  return spec?.value_field ? row.fields?.[spec.value_field] : null;
 }
 
 function traceHexagon(ctx, x, y, w, h) {
@@ -2060,7 +2082,7 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
       const item = logicRow(layout, target.channel, target.decoderId || decoder.id, target.lane);
       if (!item) continue;
       const pad = Math.max(8, item.height * 0.22);
-      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, traceColor(item.row.color), canvasW, target.label);
+      drawHexagons(ctx, laneAnnotations(rows, target.decoderId ? "" : target.lane, decoder), item.top + pad, item.top + item.height - pad, traceColor(item.row.color), canvasW, target.label);
     }
   }
   ctx.restore();
@@ -2068,19 +2090,20 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
 
 function annotationNumbers(row) {
   const fields = row.fields || {};
-  if (row.protocol === "spi" && (fields.mosi || fields.miso)) {
+  if (isSpiProtocol(row.protocol) && (fields.mosi || fields.miso)) {
     const out = [];
     if (fields.mosi) out.push(parseInt(fields.mosi, 16));
     if (fields.miso) out.push(parseInt(fields.miso, 16));
     return out.filter((value) => Number.isFinite(value));
   }
+  if (fields.value && /^[0-9a-f]+$/i.test(fields.value)) return [parseInt(fields.value, 16)].filter((value) => Number.isFinite(value));
   if (fields.data) return [parseInt(fields.data, 16)].filter((value) => Number.isFinite(value));
   if (fields.address) return [parseInt(fields.address, 16)].filter((value) => Number.isFinite(value));
   return [];
 }
 
 function formatDecoded(value, format) {
-  const n = value & 0xff;
+  const n = value;
   if (format === "dec") return String(n);
   if (format === "bin") return n.toString(2).padStart(8, "0");
   if (format === "oct") return n.toString(8);
@@ -2092,10 +2115,10 @@ function condensedLabel(row, format) {
   return parts.length ? parts.join(" / ") : annotationLabel(row);
 }
 
-function laneLabel(row, format, lane) {
-  const raw = row.fields && row.fields[lane];
-  if (raw == null || raw === "") return "";
-  const value = parseInt(raw, 16);
+function laneLabel(row, format, lane, decoder) {
+  const raw = laneValue(row, decoder, lane);
+  if (raw == null || raw === "") return annotationLabel(row);
+  const value = /^[0-9a-f]+$/i.test(String(raw)) ? parseInt(raw, 16) : NaN;
   return Number.isFinite(value) ? formatDecoded(value, format) : String(raw);
 }
 
@@ -2126,7 +2149,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     if (state.hidden.has(item.row.key)) continue;
     const decoder = (state.decoders || []).find((row) => row.id === item.row.decoderId);
     if (!decoder) continue;
-    const rows = valueAnnotations(decoder);
+    const rows = laneAnnotations(valueAnnotations(decoder), item.row.lane, decoder);
     const format = item.row.bus && item.row.bus.analog ? "analog" : decodeFormat(decoder.id);
     const pad = Math.max(8, item.height * 0.22);
     const bandTop = item.top + pad;
@@ -2134,7 +2157,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     if (format === "analog") {
       const lane = item.row.lane;
       if (lane) {
-        drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color), (row) => parseInt((row.fields || {})[lane], 16));
+        drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color), (row) => parseInt(laneValue(row, decoder, lane), 16));
       } else {
         const fields = rows[0] && rows[0].fields;
         if (fields && (fields.mosi || fields.miso)) {
@@ -2157,7 +2180,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     }
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
-    const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane) : (row) => condensedLabel(row, format);
+    const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane, decoder) : (row) => condensedLabel(row, format);
     drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82);
   }
 }
@@ -4196,25 +4219,35 @@ function emitsProtocol(protocol, expected) {
 async function addDecoder(protocol, channelIndex) {
   protocol = protocol || protocolToAdd();
   if (!protocol) return;
+  state.decoderBusy = (state.decoderBusy || 0) + 1;
+  paintStatus();
+  let decodeError = null;
   try {
     const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
     const parent = schema?.stack_on && state.decoders.find((row) => emitsProtocol(row.protocol, schema.stack_on));
     const firstInput = [...(schema?.channels || []), ...(schema?.optional_channels || [])][0];
-    const channels = channelIndex != null && firstInput ? { [firstInput]: channelSpecByIndex(channelIndex) } : {};
     const created = await api({
       cmd: "add_decoder",
       session: state.active,
       protocol,
-      channels,
+      channels: {},
       stack_on: parent ? parent.id : null,
     });
     state.selectedDecoder = created.id;
     await refreshDecoders();
     const decoder = state.decoders.find((row) => row.id === created.id);
-    if (decoder) openDecodeConfig(decoder);
+    if (decoder) {
+      const pending = { ...decoder, channels: { ...decoder.channels } };
+      if (channelIndex != null && firstInput) pending.channels[firstInput] = channelIndex;
+      openDecodeConfig(pending);
+    }
     await loadAnnotations();
   } catch (err) {
-    statusEl.textContent = err.message;
+    decodeError = err;
+  } finally {
+    state.decoderBusy = Math.max(0, state.decoderBusy - 1);
+    paintStatus();
+    if (decodeError) statusEl.textContent = decodeError.message;
   }
 }
 
@@ -6582,7 +6615,7 @@ function closeBusDialog() {
 
 function closeBusMenu() {
   const menu = document.getElementById("bus-menu");
-  if (menu) { menu.classList.add("hidden"); menu.classList.remove("signal-decoder-menu"); }
+  if (menu) menu.classList.add("hidden");
 }
 
 function placeBusMenu(menu, x, y) {
@@ -6668,7 +6701,7 @@ function openSignalMenu(row, x, y) {
     const add = document.createElement("button");
     add.type = "button";
     add.textContent = "Add decoder…";
-    add.addEventListener("click", () => openSignalDecoderMenu(row, x, y));
+    add.addEventListener("click", () => { closeBusMenu(); openSignalDecoderDialog(row); });
     menu.append(add);
   }
   if (canUngroupSignal(row)) {
@@ -6695,28 +6728,29 @@ function openSignalMenu(row, x, y) {
   placeBusMenu(menu, x, y);
 }
 
-function openSignalDecoderMenu(row, x, y) {
-  const menu = document.getElementById("bus-menu");
-  menu.replaceChildren();
-  menu.classList.add("signal-decoder-menu");
-  const search = document.createElement("input");
-  search.type = "search";
-  search.placeholder = "Search decoders";
-  search.setAttribute("aria-label", "Search decoders");
-  menu.append(search);
+function openSignalDecoderDialog(row) {
+  const dialog = document.getElementById("signal-decoder-dialog");
+  const list = document.getElementById("signal-decoder-list");
+  const search = document.getElementById("signal-decoder-search");
+  list.replaceChildren();
+  search.value = "";
   const choices = (state.decoderCatalog || []).filter((item) => !item.stack_on && [...(item.channels || []), ...(item.optional_channels || [])].length);
   for (const schema of choices) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = schema.name || schema.id;
-    button.addEventListener("click", () => { closeBusMenu(); addDecoder(schema.id, row.channel); });
-    menu.append(button);
+    button.addEventListener("click", () => { closeSignalDecoderDialog(); addDecoder(schema.id, row.channel); });
+    list.append(button);
   }
-  search.addEventListener("input", () => {
-    [...menu.querySelectorAll("button")].forEach((button, index) => { button.hidden = !decoderMatches(choices[index], search.value); });
-  });
-  placeBusMenu(menu, x, y);
+  search.oninput = () => {
+    [...list.querySelectorAll("button")].forEach((button, index) => { button.hidden = !decoderMatches(choices[index], search.value); });
+  };
+  dialog.classList.remove("hidden");
   search.focus();
+}
+
+function closeSignalDecoderDialog() {
+  document.getElementById("signal-decoder-dialog").classList.add("hidden");
 }
 
 function openContainerMenu(bus, x, y) {
@@ -7261,6 +7295,10 @@ document.getElementById("setup-file").addEventListener("change", (ev) => {
   if (file) openSetupFile(file);
 });
 document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
+document.getElementById("signal-decoder-cancel").addEventListener("click", closeSignalDecoderDialog);
+document.getElementById("signal-decoder-dialog").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); closeSignalDecoderDialog(); }
+});
 for (const radio of document.querySelectorAll('input[name="group-type"]')) {
   radio.addEventListener("change", syncGroupDialog);
 }
@@ -7317,6 +7355,10 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
   if (condenseBox && pref.condensed !== condenseBox.checked) { pref.condensed = condenseBox.checked; pref.lanes = {}; }
   if (formatBox && DECODE_FORMATS[formatBox.value]) pref.format = formatBox.value;
   state.gutterSig = "";
+  closeDecodeConfig();
+  state.decoderBusy = (state.decoderBusy || 0) + 1;
+  paintStatus();
+  let decodeError = null;
   try {
     await api({
       cmd: "update_decoder",
@@ -7326,12 +7368,16 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
       options,
       stack_on: stack ? stack.value : null,
     });
-    closeDecodeConfig();
     await refreshDecoders();
     await loadAnnotations();
     scheduleTiles();
   } catch (err) {
-    statusEl.textContent = err.message;
+    decodeError = err;
+    document.getElementById("decode-config").classList.remove("hidden");
+  } finally {
+    state.decoderBusy = Math.max(0, state.decoderBusy - 1);
+    paintStatus();
+    if (decodeError) statusEl.textContent = decodeError.message;
   }
 });
 

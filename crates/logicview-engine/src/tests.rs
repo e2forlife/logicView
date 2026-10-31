@@ -272,6 +272,10 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
         .add_decoder(None, "i2c", &i2c_channels, &BTreeMap::new(), None, None)
         .await
         .unwrap();
+    let lua_i2c = engine
+        .add_decoder(None, "1:i2c", &i2c_channels, &BTreeMap::new(), None, None)
+        .await
+        .unwrap();
     let eeprom = engine
         .add_decoder(
             None,
@@ -316,6 +320,16 @@ async fn two_demo_pods_stack_decode_and_measure_the_clock() {
         .read_annotations(None, None, None, None, None, 0, 5_000)
         .await
         .unwrap();
+    let page = engine.read_annotations(None, Some(&lua_i2c.id), None, None, None, 1, 3).await.unwrap();
+    let expected: Vec<_> = rows.iter().filter(|row| row.decoder == lua_i2c.id).skip(1).take(3).collect();
+    assert_eq!(page.iter().map(|row| (&row.class, row.start_sample, &row.text)).collect::<Vec<_>>(),
+        expected.iter().map(|row| (&row.class, row.start_sample, &row.text)).collect::<Vec<_>>());
+    let numeric_i2c = rows
+        .iter()
+        .find(|row| row.decoder == lua_i2c.id && row.fields.contains_key("value"))
+        .expect("Lua I2C emits a numeric annotation");
+    assert!(!numeric_i2c.text.contains("{$}"));
+    assert!(numeric_i2c.text.contains(&numeric_i2c.fields["value"]));
     assert!(
         rows.iter().any(|row| row.decoder == lua_spi.id),
         "Lua SPI should emit annotations"

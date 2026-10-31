@@ -147,6 +147,14 @@
   <div id="device-acq-menu" class="device-menu hidden" role="menu"></div>
   <div id="run-menu" class="device-menu hidden" role="menu" aria-label="Run mode"></div>
   <div id="bus-menu" class="menu-pop hidden"></div>
+  <div id="signal-decoder-dialog" class="wait-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="signal-decoder-title">
+    <div class="wait-card bus-card signal-decoder-card">
+      <h2 id="signal-decoder-title">Add decoder</h2>
+      <input id="signal-decoder-search" type="search" placeholder="Search decoders" aria-label="Search decoders" autocomplete="off">
+      <div id="signal-decoder-list" class="signal-decoder-list"></div>
+      <div class="bus-actions"><button type="button" id="signal-decoder-cancel">Cancel</button></div>
+    </div>
+  </div>
   <div id="hover" class="hover hidden"></div>
   <div id="capture-wait" class="wait-dialog hidden" role="dialog" aria-live="polite" aria-label="Capture progress">
     <div class="wait-card">

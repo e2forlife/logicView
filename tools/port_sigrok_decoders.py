@@ -203,6 +203,15 @@ def metadata_table(cls) -> str:
         f"annotation_rows = {literal([_row(item) for item in (getattr(cls, 'annotation_rows', None) or [])])}",
         f"binary = {literal([_text_row(item) for item in (getattr(cls, 'binary', None) or [])])}",
     ]
+    if cls.id in ("0:spi", "1:spi"):
+        lanes = [
+            {"id": "mosi", "name": "MOSI", "channel": "mosi", "channels": ["mosi", "clk", "cs"], "classes": ["mosi-data"], "value_field": "value"},
+            {"id": "miso", "name": "MISO", "channel": "miso", "channels": ["clk", "miso", "cs"], "classes": ["miso-data"], "value_field": "value"},
+        ]
+        fields.append(f"lanes = {literal(lanes)}")
+    if cls.id in ("0:i2c", "1:i2c"):
+        lanes = [{"id": "i2c", "name": "I2C", "channel": "sda", "channels": ["sda", "scl"], "classes": ["start", "repeat-start", "stop", "ack", "nack", "address-read", "address-write", "data-read", "data-write", "warnings"]}]
+        fields.append(f"lanes = {literal(lanes)}")
     return "{\n  " + ",\n  ".join(fields) + "\n}"
 
 

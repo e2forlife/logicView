@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 
 use super::{
-    Annotation, AnnotationClass, AnnotationRowGroup, BinaryFormat, BinaryPayload, ChannelDesc,
+    Annotation, AnnotationClass, AnnotationRowGroup, BinaryFormat, BinaryPayload, ChannelDesc, DecoderLane,
     DecodeError, DecodeOutput, DecodeRequest, DecoderOption, DecoderSchema, MetaItem,
     ProtocolPacket,
 };
@@ -120,10 +120,11 @@ pub fn read_schema(module: &Table) -> Result<DecoderSchema, DecodeError> {
         inputs,
         outputs: string_list(module.get("outputs").map_err(lua_err)?)?,
         tags: string_list(module.get("tags").map_err(lua_err)?)?,
-        channel_details,
-        optional_channel_details,
-        annotation_classes,
+        channel_details: channel_details.clone(),
+        optional_channel_details: optional_channel_details.clone(),
+        annotation_classes: annotation_classes.clone(),
         annotation_rows: parse_rows(module.get("annotation_rows").map_err(lua_err)?)?,
+        lanes: parse_lanes(module.get("lanes").map_err(lua_err)?, &channel_details, &optional_channel_details, &annotation_classes)?,
         binary: parse_binary(module.get("binary").map_err(lua_err)?)?,
     })
 }
@@ -135,6 +136,7 @@ pub fn run_session(
     schema: &DecoderSchema,
     request: &DecodeRequest<'_>,
     cancel: &AtomicBool,
+    ticks: &std::sync::atomic::AtomicUsize,
 ) -> Result<DecodeOutput, DecodeError> {
     if cancel.load(Ordering::Relaxed) {
         return Ok(DecodeOutput::new(Vec::new(), Vec::new(), true));
@@ -146,10 +148,15 @@ pub fn run_session(
     }
     let session = std::cell::RefCell::new(Session::new(schema, request, start, end));
     let instance_ptr = module.to_pointer();
+    let checkpoint = std::cell::Cell::new(start as i64 - 1);
     let decoded = lua.scope(|scope| -> Result<Value, mlua::Error> {
         let wait = scope.create_function(|lua, args: mlua::MultiValue| {
             let spec = method_args(args, instance_ptr).into_iter().next();
             let hit = session.borrow_mut().wait(spec.as_ref(), cancel)?;
+            if hit.samplenum > checkpoint.get() {
+                checkpoint.set(hit.samplenum);
+                ticks.store(0, Ordering::Relaxed);
+            }
             let pins = lua.create_table()?;
             for (index, pin) in hit.pins.iter().enumerate() {
                 if let Some(level) = pin {
@@ -416,7 +423,7 @@ impl<'a> Session<'a> {
                 if !self.schema.classes.is_empty() && class_index >= self.schema.classes.len() {
                     return Err(runtime("annotation class is out of range"));
                 }
-                let texts = text_list(table.get(2)?)?;
+                let (texts, numeric) = annotation_texts(table.get(2)?)?;
                 if texts.is_empty() {
                     return Err(runtime("annotation text is empty"));
                 }
@@ -426,13 +433,12 @@ impl<'a> Session<'a> {
                     .get(class_index)
                     .cloned()
                     .unwrap_or_else(|| class_index.to_string());
-                let mut annotation = Annotation::new(
-                    start_sample,
-                    end_sample,
-                    class,
-                    texts[0].clone(),
-                    std::collections::BTreeMap::new(),
-                );
+                let mut fields = std::collections::BTreeMap::new();
+                if let Some(value) = numeric {
+                    fields.insert("value".into(), value);
+                }
+                let mut annotation =
+                    Annotation::new(start_sample, end_sample, class, texts[0].clone(), fields);
                 if texts.len() > 1 {
                     annotation.texts = texts;
                 }
@@ -534,23 +540,56 @@ impl<'a> Session<'a> {
         } else {
             self.prev.clone()
         };
-        let mut checked = 0u64;
+        let sources: Vec<_> = self
+            .pins
+            .iter()
+            .map(|name| {
+                self.request
+                    .channels
+                    .iter()
+                    .find(|(channel, _)| channel == name)
+                    .map(|(_, bytes)| *bytes)
+            })
+            .collect();
+        // If every alternative requires an edge, a constant packed block cannot
+        // match. Skip it without evaluating each individual sample.
+        let edge_pins: Option<Vec<usize>> = conditions.iter().map(|condition| {
+            condition.terms.iter().find_map(|term| match term {
+                Term::Pin { index, expect: Expect::Rise | Expect::Fall | Expect::Either } => Some(*index),
+                _ => None,
+            })
+        }).collect();
+        let mut pins = vec![None; self.pins.len()];
+        let mut checked = 65_536u64;
         while sample < region_end {
-            if checked % 65_536 == 0 && cancel.load(Ordering::Relaxed) {
-                return Err(runtime(CANCELLED));
+            if checked >= 65_536 {
+                if cancel.load(Ordering::Relaxed) { return Err(runtime(CANCELLED)); }
+                checked = 0;
+            }
+            if sample % 64 == 0 && sample + 64 <= region_end
+                && edge_pins.as_ref().is_some_and(|indices| indices.iter().all(|&index| {
+                    constant_block(sources[index], previous[index], sample as u64)
+                }))
+            {
+                for (pin, source) in previous.iter_mut().zip(&sources) {
+                    *pin = source.map(|bytes| logicview_analysis::bit_at(bytes, (sample + 63) as u64));
+                }
+                sample += 64;
+                checked += 64;
+                continue;
             }
             checked += 1;
-            let pins = sample_pins(self.request, &self.pins, sample as u64);
-            let matched: Vec<bool> = conditions
-                .iter()
-                .map(|condition| {
-                    condition
-                        .terms
-                        .iter()
-                        .all(|term| term_matches(term, sample, origin, &previous, &pins))
-                })
-                .collect();
-            if matched.iter().any(|hit| *hit) {
+            for (pin, source) in pins.iter_mut().zip(&sources) {
+                *pin = source.map(|bytes| logicview_analysis::bit_at(bytes, sample as u64));
+            }
+            let matches = |condition: &Cond| {
+                condition
+                    .terms
+                    .iter()
+                    .all(|term| term_matches(term, sample, origin, &previous, &pins))
+            };
+            if conditions.iter().any(matches) {
+                let matched = conditions.iter().map(matches).collect();
                 self.samplenum = sample;
                 self.prev = pins.clone();
                 return Ok(WaitHit {
@@ -559,7 +598,7 @@ impl<'a> Session<'a> {
                     pins,
                 });
             }
-            previous = pins;
+            std::mem::swap(&mut previous, &mut pins);
             sample += 1;
         }
         Err(runtime(END_OF_STREAM))
@@ -578,6 +617,14 @@ impl<'a> Session<'a> {
         }
         Ok((start, end))
     }
+}
+
+// `bit_at` treats missing bytes as low; an unconnected pin can never have an edge.
+fn constant_block(source: Option<&[u8]>, previous: Option<bool>, sample: u64) -> bool {
+    let Some(bytes) = source else { return true };
+    let expected = if previous == Some(true) { 0xff } else { 0x00 };
+    let start = (sample / 8) as usize;
+    (0..8).all(|offset| bytes.get(start + offset).copied().unwrap_or(0) == expected)
 }
 
 fn sample_pins(request: &DecodeRequest<'_>, names: &[String], sample: u64) -> Vec<Option<bool>> {
@@ -818,19 +865,72 @@ fn call_if_present<A: mlua::IntoLuaMulti>(
     }
 }
 
-fn text_list(value: Value) -> Result<Vec<String>, mlua::Error> {
-    match value {
-        Value::String(text) => Ok(vec![text.to_str()?.to_string()]),
+fn annotation_texts(value: Value) -> Result<(Vec<String>, Option<String>), mlua::Error> {
+    let mut numeric = None;
+    let texts = match value {
+        Value::String(text) => vec![text.to_str()?.to_string()],
         Value::Table(table) => {
             let mut texts = Vec::new();
             for item in table.sequence_values::<Value>() {
-                texts.push(
-                    lua_text(&item?).ok_or_else(|| runtime("annotation text must be a string"))?,
-                );
+                match item? {
+                    Value::String(text) => {
+                        let text = text.to_str()?.to_string();
+                        if let Some(hex) = text.strip_prefix('@').filter(|hex| !hex.is_empty()) {
+                            numeric = Some(hex.to_ascii_uppercase());
+                        } else {
+                            texts.push(text);
+                        }
+                    }
+                    Value::Integer(value) => numeric = Some(format!("{value:02X}")),
+                    Value::Number(value) if value.is_finite() && value.fract() == 0.0 => {
+                        numeric = Some(format!("{:02X}", value as i64));
+                    }
+                    _ => return Err(runtime("annotation text must be a string or integer")),
+                }
             }
-            Ok(texts)
+            texts
         }
-        _ => Err(runtime("annotation text must be a list of strings")),
+        _ => return Err(runtime("annotation text must be a list of strings")),
+    };
+    let texts = if let Some(value) = &numeric {
+        if texts.is_empty() {
+            vec![value.clone()]
+        } else {
+            texts
+                .into_iter()
+                .map(|text| text.replace("{$}", value))
+                .collect()
+        }
+    } else {
+        texts
+    };
+    Ok((texts, numeric))
+}
+
+#[cfg(test)]
+mod annotation_text_tests {
+    use super::*;
+
+    #[test]
+    fn substitutes_dsview_integer_and_hex_payloads() {
+        let lua = Lua::new();
+        for (source, expected, value) in [
+            (
+                r#"return {"Data: {$}", "{$}", 90}"#,
+                vec!["Data: 5A", "5A"],
+                "5A",
+            ),
+            (
+                r#"return {"Register {$}", "@01af"}"#,
+                vec!["Register 01AF"],
+                "01AF",
+            ),
+            (r#"return {"@0012"}"#, vec!["0012"], "0012"),
+        ] {
+            let (texts, numeric) = annotation_texts(lua.load(source).eval().unwrap()).unwrap();
+            assert_eq!(texts, expected);
+            assert_eq!(numeric.as_deref(), Some(value));
+        }
     }
 }
 
@@ -968,6 +1068,30 @@ fn parse_class(value: Value) -> Result<AnnotationClass, DecodeError> {
             "annotation class must be a name or {id, description}".into(),
         )),
     }
+}
+
+fn parse_lanes(value: Value, required: &[ChannelDesc], optional: &[ChannelDesc], classes: &[AnnotationClass]) -> Result<Vec<DecoderLane>, DecodeError> {
+    let Value::Table(table) = value else {
+        return if value.is_nil() { Ok(Vec::new()) } else { Err(DecodeError::Message("lanes must be a list".into())) };
+    };
+    let mut lanes: Vec<DecoderLane> = Vec::new();
+    for item in table.sequence_values::<Table>() {
+        let item = item.map_err(lua_err)?;
+        let id: String = item.get("id").map_err(lua_err)?;
+        let name: String = item.get::<Option<String>>("name").map_err(lua_err)?.unwrap_or_else(|| id.clone());
+        let channel: String = item.get("channel").map_err(lua_err)?;
+        let mut channels = string_list(item.get("channels").map_err(lua_err)?)?;
+        if channels.is_empty() { channels.push(channel.clone()); }
+        let lane_classes = string_list(item.get("classes").map_err(lua_err)?)?;
+        let known_channel = |id: &str| required.iter().chain(optional).any(|entry| entry.id == id);
+        if id.is_empty() || lanes.iter().any(|lane| lane.id == id) || !known_channel(&channel)
+            || !channels.contains(&channel) || channels.iter().any(|id| !known_channel(id))
+            || lane_classes.is_empty() || lane_classes.iter().any(|id| !classes.iter().any(|entry| entry.id == *id)) {
+            return Err(DecodeError::Message(format!("invalid lane {id}: check unique id, channels and annotation classes")));
+        }
+        lanes.push(DecoderLane { id, name, channel, channels, classes: lane_classes, value_field: item.get("value_field").map_err(lua_err)? });
+    }
+    Ok(lanes)
 }
 
 fn parse_rows(value: Value) -> Result<Vec<AnnotationRowGroup>, DecodeError> {

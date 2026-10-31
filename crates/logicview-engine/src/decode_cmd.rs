@@ -64,14 +64,19 @@ impl Engine {
             stack_on: stack.clone(),
             outputs,
         });
-        rerun(slot);
-        Ok(DecoderInfo {
+        let needs_decode = !resolved.is_empty() || stack.is_some();
+        let info = DecoderInfo {
             id: instance_id,
             protocol: protocol.to_string(),
             channels: resolved,
             options: options.clone(),
             stack_on: stack,
-        })
+        };
+        drop(state);
+        if needs_decode {
+            self.rerun_async(&id).await?;
+        }
+        Ok(info)
     }
 
     /// Removes an analyzer and its direct dependents, then refreshes the remaining results.
@@ -108,7 +113,8 @@ impl Engine {
         if slot.decoders.len() == before {
             return Err(EngineError::Decode(format!("unknown decoder {decoder_id}")));
         }
-        rerun(slot);
+        drop(state);
+        self.rerun_async(&id).await?;
         Ok(())
     }
 
@@ -168,13 +174,54 @@ impl Engine {
         } else {
             return Err(EngineError::Decode(format!("unknown decoder {decoder_id}")));
         }
-        rerun(slot);
-        Ok(slot
+        let info = slot
             .decoders
             .iter()
             .find(|decoder| decoder.id == decoder_id)
             .map(info_of)
-            .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?)
+            .ok_or_else(|| EngineError::Decode(format!("unknown decoder {decoder_id}")))?;
+        drop(state);
+        self.rerun_async(&id).await?;
+        Ok(info)
+    }
+
+    /// Decodes a snapshot on a blocking worker, leaving session commands responsive.
+    async fn rerun_async(&self, id: &str) -> Result<(), EngineError> {
+        let (decoders, packed, len, rate, generation) = {
+            let state = self.shared.state.lock().await;
+            let slot = state.slot(id)?;
+            let packed = (0..slot.session.store.channel_count())
+                .map(|index| {
+                    slot.session
+                        .store
+                        .channel_bytes(index)
+                        .map(|bytes| bytes.to_vec())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            (
+                slot.decoders.clone(),
+                packed,
+                slot.session.store.len(),
+                slot.session.config.sample_rate_hz,
+                slot.session.generation(),
+            )
+        };
+        let snapshot = decoders.clone();
+        let rows = tokio::task::spawn_blocking(move || decode_all(&decoders, &packed, len, rate))
+            .await
+            .map_err(|err| EngineError::Decode(format!("decoder worker failed: {err}")))?;
+        let mut state = self.shared.state.lock().await;
+        if let Ok(slot) = state.slot_mut(id) {
+            if slot.decoders == snapshot
+                && slot.session.generation() == generation
+                && slot.session.store.len() == len
+                && slot.session.config.sample_rate_hz == rate
+            {
+                slot.annotations = rows;
+            }
+        }
+        Ok(())
     }
 
     /// Lists configured analyzer instances for the requested or selected session.
@@ -200,9 +247,16 @@ impl Engine {
     ) -> Result<Vec<AnnotationRow>, EngineError> {
         let state = self.shared.state.lock().await;
         let id = self.resolve(&state, session)?;
-        let rows = filtered(state.slot(&id)?, decoder, query, start, end);
+        let slot = state.slot(&id)?;
         let limit = limit.clamp(1, 5_000);
-        Ok(rows.into_iter().skip(offset).take(limit).collect())
+        if query.is_none_or(|query| query.trim().is_empty()) {
+            return Ok(slot.annotations.iter()
+                .filter(|row| decoder.is_none_or(|id| row.decoder == id))
+                .filter(|row| start.is_none_or(|sample| row.end_sample > sample))
+                .filter(|row| end.is_none_or(|sample| row.start_sample < sample))
+                .skip(offset).take(limit).cloned().collect());
+        }
+        Ok(filtered(slot, decoder, query, start, end).into_iter().skip(offset).take(limit).collect())
     }
 
     /// Returns the first page of annotation matches across the session's analyzers.
@@ -308,6 +362,9 @@ fn decode_all(
     }
     for index in order {
         let inst = &decoders[index];
+        if inst.stack_on.is_none() && inst.channels.is_empty() {
+            continue;
+        }
         let ready = match inst.protocol.as_str() {
             "spi" => {
                 inst.channels.contains_key("sck")

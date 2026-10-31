@@ -34,6 +34,7 @@ _decoder = {
   optional_channels = {  },
   options = { logicview.dict({ id = "address_format", desc = "Displayed slave address format", default = "unshifted", values = { "shifted", "unshifted" } }) },
   annotations = { { "7", "start", "Start condition" }, { "6", "repeat-start", "Repeat start condition" }, { "1", "stop", "Stop condition" }, { "5", "ack", "ACK" }, { "0", "nack", "NACK" }, { "208", "bit", "Data/address bit" }, { "112", "address-read", "Address read" }, { "111", "address-write", "Address write" }, { "110", "data-read", "Data read" }, { "109", "data-write", "Data write" }, { "1000", "warnings", "Human-readable warnings" } },
+  lanes = { { id = "i2c", name = "I2C", channel = "sda", channels = { "sda", "scl" }, classes = { "start", "repeat-start", "stop", "ack", "nack", "address-read", "address-write", "data-read", "data-write", "warnings" } } },
   annotation_rows = { { "bits", "Bits", { 5 } }, { "addr-data", "Address/Data", { 0, 1, 2, 3, 4, 6, 7, 8, 9 } }, { "warnings", "Warnings", { 10 } } },
   binary = { { "address-read", "Address read" }, { "address-write", "Address write" }, { "data-read", "Data read" }, { "data-write", "Data write" } }
 }
