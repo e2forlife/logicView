@@ -5409,18 +5409,68 @@ wave.addEventListener("pointerleave", () => {
   drawWave();
 });
 
-overview.addEventListener("pointerdown", (ev) => {
-  if (state.total <= 0) return;
+function overviewMetrics() {
   const rect = overview.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
+  const width = Math.max(1, rect.width);
   const v = view();
-  const span = wave.clientWidth * v.spp;
-  v.start = (x / rect.width) * state.total - span / 2;
+  const span = Math.max(1, wave.clientWidth * v.spp);
+  const x0 = (v.start / state.total) * width;
+  const x1 = Math.min(width, ((v.start + span) / state.total) * width);
+  return { rect, width, span, x0, x1: Math.max(x0 + 2, x1) };
+}
+
+function scrollOverviewTo(start) {
+  const v = view();
+  v.start = start;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
+  drawWave();
+  drawRuler();
   drawOverview();
+}
+
+let overviewDrag = null;
+
+overview.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0 || state.total <= 0) return;
+  const metrics = overviewMetrics();
+  const x = ev.clientX - metrics.rect.left;
+  if (x >= metrics.x0 && x <= metrics.x1) {
+    overviewDrag = {
+      pointer: ev.pointerId,
+      grab: x - metrics.x0,
+      thumb: metrics.x1 - metrics.x0,
+    };
+    overview.setPointerCapture(ev.pointerId);
+    overview.classList.add("dragging");
+    return;
+  }
+  const page = wave.clientWidth * view().spp;
+  scrollOverviewTo(view().start + (x < metrics.x0 ? -page : page));
 });
+
+overview.addEventListener("pointermove", (ev) => {
+  if (!overviewDrag || ev.pointerId !== overviewDrag.pointer) return;
+  const rect = overview.getBoundingClientRect();
+  const width = Math.max(1, rect.width);
+  const x = ev.clientX - rect.left;
+  let left = x - overviewDrag.grab;
+  const maxLeft = Math.max(0, width - overviewDrag.thumb);
+  if (left < 0) left = 0;
+  if (left > maxLeft) left = maxLeft;
+  scrollOverviewTo((left / width) * state.total);
+});
+
+function endOverviewDrag(ev) {
+  if (!overviewDrag || ev.pointerId !== overviewDrag.pointer) return;
+  overviewDrag = null;
+  overview.classList.remove("dragging");
+  if (overview.hasPointerCapture(ev.pointerId)) overview.releasePointerCapture(ev.pointerId);
+}
+
+overview.addEventListener("pointerup", endOverviewDrag);
+overview.addEventListener("pointercancel", endOverviewDrag);
 
 function queueHover(ev) {
   state.hoverSequence += 1;
