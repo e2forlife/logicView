@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use logicview_capture::{DepthMode, RunPolicy, SessionConfig, TriggerStep};
+use logicview_capture::{CaptureError, DepthMode, RunPolicy, SessionConfig, TriggerStep};
 use logicview_proto::{decode_arm, ModeFlags};
 
 use super::{
     hardware_before_demo, install_usb_catalog, local_enable, BoundDevice, DeviceInfo, Engine,
-    StartMode,
+    EngineError, StartMode,
 };
 
 /// Checks that native persistence preserves captured logic, analog values, and subsequent edge
@@ -667,26 +667,50 @@ async fn imported_capture_bytes_replace_the_open_session() {
 async fn plus_ten_ms_capture_pipeline() {
     let engine = Engine::new();
     engine.connect("usb:2a0e:0020").await.unwrap();
-    engine.configure(None, SessionConfig {
-        sample_rate_hz: 100_000_000,
-        duration_ms: 10,
-        channel_enable: 0x0f,
-        ..SessionConfig::default()
-    }).await.unwrap();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 100_000_000,
+                duration_ms: 10,
+                channel_enable: 0x0f,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
     let started = std::time::Instant::now();
     engine.start(None, StartMode::Normal).await.unwrap();
-    let status = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
-    eprintln!("engine capture: {:?}, {} samples, phase {}, error {:?}", started.elapsed(), status.sample_count, status.phase, status.error);
+    let status = engine
+        .wait_until_settled("ses-1", Duration::from_secs(15))
+        .await
+        .unwrap();
+    eprintln!(
+        "engine capture: {:?}, {} samples, phase {}, error {:?}",
+        started.elapsed(),
+        status.sample_count,
+        status.phase,
+        status.error
+    );
     assert_eq!(status.phase, "stopped");
     assert_eq!(status.sample_count, 1_000_000);
-    engine.configure(None, SessionConfig {
-        sample_rate_hz: 100_000_000,
-        duration_ms: 50,
-        channel_enable: 0x0f,
-        ..SessionConfig::default()
-    }).await.unwrap();
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 100_000_000,
+                duration_ms: 50,
+                channel_enable: 0x0f,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
     engine.start(None, StartMode::Normal).await.unwrap();
-    let long = engine.wait_until_settled("ses-1", Duration::from_secs(15)).await.unwrap();
+    let long = engine
+        .wait_until_settled("ses-1", Duration::from_secs(15))
+        .await
+        .unwrap();
     assert_eq!(long.phase, "stopped", "{:?}", long.error);
     assert_eq!(long.sample_count, 5_000_000);
 }
@@ -718,7 +742,11 @@ async fn combined_usb_catalog_rates_and_refusals() {
     let engine = Engine::new();
     {
         let mut state = engine.shared.state.lock().await;
-        let slot = state.slots.iter_mut().find(|slot| slot.id == "ses-1").unwrap();
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
         install_usb_catalog(
             slot,
             &[
@@ -742,10 +770,7 @@ async fn combined_usb_catalog_rates_and_refusals() {
         .attach_device(None, "usb:2a0e:0020")
         .await
         .unwrap_err();
-    assert!(
-        same.to_string().contains("same product"),
-        "{same}"
-    );
+    assert!(same.to_string().contains("same product"), "{same}");
 
     engine
         .configure(
@@ -809,7 +834,10 @@ async fn combined_usb_catalog_rates_and_refusals() {
         .await
         .unwrap();
     let trigger = engine.start(None, StartMode::Normal).await.unwrap_err();
-    assert!(trigger.to_string().contains("hardware trigger"), "{trigger}");
+    assert!(
+        trigger.to_string().contains("hardware trigger"),
+        "{trigger}"
+    );
 
     engine
         .configure(
@@ -837,8 +865,14 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
     engine.attach_device(None, "usb:2a0e:002c").await.unwrap();
     let attached = engine.status(None).await.unwrap();
     assert_eq!(attached.probes.len(), 48);
-    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:0020"));
-    assert!(attached.devices.iter().any(|device| device.id == "usb:2a0e:002c"));
+    assert!(attached
+        .devices
+        .iter()
+        .any(|device| device.id == "usb:2a0e:0020"));
+    assert!(attached
+        .devices
+        .iter()
+        .any(|device| device.id == "usb:2a0e:002c"));
     engine
         .configure(
             None,
@@ -861,7 +895,11 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
         .unwrap();
     assert_eq!(status.phase, "stopped", "{:?}", status.error);
     assert!(status.error.is_none());
-    assert!(status.sample_count > 0, "sample_count {}", status.sample_count);
+    assert!(
+        status.sample_count > 0,
+        "sample_count {}",
+        status.sample_count
+    );
     assert_eq!(status.channels.len(), 48);
     assert_eq!(status.channels[0].device_id, "usb:2a0e:0020");
     assert_eq!(status.channels[16].device_id, "usb:2a0e:002c");
@@ -877,8 +915,126 @@ async fn plus_and_u3_ten_ms_combined_buffer() {
     );
     eprintln!(
         "combined buffer: {} samples, plus {}, u3 {}",
-        status.sample_count,
-        status.channels[0].name,
-        status.channels[16].name
+        status.sample_count, status.channels[0].name, status.channels[16].name
     );
+}
+
+/// Demo and stream stay at the host sample cap. A buffered pod can use its memory,
+/// split across the channels enabled on that pod.
+#[tokio::test]
+async fn buffer_length_stops_at_the_pod_memory_share() {
+    let engine = Engine::new();
+    let demo = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match demo {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_capture::MAX_SAMPLES);
+        }
+        other => panic!("demo buffer should stop at the host cap, got {other}"),
+    }
+
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
+        install_usb_catalog(slot, &[bound_usb("usb:2a0e:0020", "DSLogic Plus")]).unwrap();
+    }
+    engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                channel_enable: 1,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let wide = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 20_000,
+                channel_enable: 0,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match wide {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_hal::MEMORY_BITS / 16);
+        }
+        other => panic!("16 channels should split the pod memory, got {other}"),
+    }
+
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == "ses-1")
+            .unwrap();
+        install_usb_catalog(
+            slot,
+            &[
+                bound_usb("usb:2a0e:0020", "DSLogic Plus"),
+                bound_usb("usb:2a0e:002c", "DSLogic U3Pro32"),
+            ],
+        )
+        .unwrap();
+    }
+    let stacked = engine
+        .configure(
+            None,
+            SessionConfig {
+                sample_rate_hz: 1_000_000,
+                duration_ms: 9_000,
+                channel_enable: 0,
+                depth: DepthMode::Buffer,
+                run: RunPolicy::Single,
+                trigger_enabled: false,
+                ..SessionConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match stacked {
+        EngineError::Capture(CaptureError::TooLarge { ceiling, .. }) => {
+            assert_eq!(ceiling, logicview_hal::MEMORY_BITS / 32);
+        }
+        other => panic!("two pods should use the smaller memory share, got {other}"),
+    }
+}
+
+/// Checks that a capture tab name is trimmed, stored, and refused when blank or unknown.
+#[tokio::test]
+async fn rename_session_trims_and_rejects_blank() {
+    let engine = Engine::new();
+    let renamed = engine.rename_session("ses-1", "  Logic  ").await.unwrap();
+    assert_eq!(renamed.name, "Logic");
+    assert!(renamed.active);
+    let (sessions, _) = engine.list_sessions().await;
+    assert_eq!(sessions[0].name, "Logic");
+    assert!(engine.rename_session("ses-1", "   ").await.is_err());
+    match engine.rename_session("missing", "Name").await {
+        Err(EngineError::UnknownSession(id)) => assert_eq!(id, "missing"),
+        other => panic!("unknown session should fail, got {other:?}"),
+    }
+    let (sessions, _) = engine.list_sessions().await;
+    assert_eq!(sessions[0].name, "Logic");
 }

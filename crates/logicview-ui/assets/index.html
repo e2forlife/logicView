@@ -13,7 +13,6 @@
         <path d="M3 14h3l2-6 3 10 2-7 2 3h6"></path>
       </svg>
       <strong>LogicView</strong>
-      <button id="preferences-open" class="preferences-open" type="button" title="Preferences" aria-label="Preferences"><span class="settings-icon" aria-hidden="true"></span></button>
       <nav class="menubar" aria-label="Menu">
         <button type="button" data-menu="file">File</button>
         <button type="button" data-menu="edit">Edit</button>
@@ -24,26 +23,42 @@
         <button type="button" data-menu="tools">Tools</button>
         <button type="button" data-menu="help">Help</button>
       </nav>
+      <button id="preferences-open" class="preferences-open" type="button" title="Preferences" aria-label="Preferences"><span class="settings-icon" aria-hidden="true"></span></button>
     </header>
     <div class="toolbar">
       <div class="device-chip" title="Device">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="16" height="10" rx="2"></rect><path d="M8 7V5M12 7V5M16 7V5M8 19v-2M12 19v-2M16 19v-2"></path></svg>
+        <span class="pod-stack" data-count="1"><img class="pod" src="/assets/logicDevice.png" alt="" style="--stack:0"></span>
         <span class="device-meta">
           <strong id="device-name">Demo</strong>
           <span class="connected"><i class="dot"></i> Connected</span>
         </span>
-        <span class="chev" aria-hidden="true">▾</span>
+        <span class="chev" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"></path></svg></span>
         <button id="device-select" type="button" aria-haspopup="menu" aria-label="Device"></button>
       </div>
       <button id="run" class="run" type="button" title="Run capture">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l12 7-12 7z"></path></svg>
+        <span class="run-icon" data-mode="single" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5l12 7-12 7z"></path></svg></span>
         Run
       </button>
       <button id="stop" class="stop" type="button" title="Stop capture">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"></rect></svg>
         Stop
       </button>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
+      <div class="toolbar-section" role="group" aria-label="Trigger">
+        <button id="trig-arm" class="trig-arm" type="button" title="Trigger off" aria-label="Enable trigger" aria-pressed="false"></button>
+        <select id="trig-channel" aria-label="Trigger channel" title="Trigger channel"></select>
+        <button id="trig-kind" class="trig-kind" type="button" title="Rising edge" aria-label="Trigger type, rising edge">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path id="trig-kind-path" d="M4 16h7V8h9"></path></svg>
+          <span id="trig-kind-label">Rising edge</span>
+        </button>
+      </div>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
+      <div class="toolbar-section" role="group" aria-label="Pre-trigger">
+        <span class="tiny" id="trig-pre-label">Pre-trigger</span>
+        <select id="trig-pre" aria-labelledby="trig-pre-label" title="Pre-trigger"></select>
+      </div>
       <div class="spacer"></div>
+      <div class="tool-divider" role="separator" aria-orientation="vertical"></div>
       <button id="zoom-out" class="icon-btn" type="button" title="Zoom out" aria-label="Zoom out">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6M14.5 14.5L20 20"></path></svg>
       </button>
@@ -127,6 +142,8 @@
   </div>
   <div id="menu-pop" class="menu-pop hidden"></div>
   <div id="device-menu" class="device-menu hidden" role="menu"></div>
+  <div id="device-acq-menu" class="device-menu hidden" role="menu"></div>
+  <div id="run-menu" class="device-menu hidden" role="menu" aria-label="Run mode"></div>
   <div id="bus-menu" class="menu-pop hidden"></div>
   <div id="hover" class="hover hidden"></div>
   <div id="capture-wait" class="wait-dialog hidden" role="dialog" aria-live="polite" aria-label="Capture progress">
@@ -166,14 +183,31 @@
     </form>
   </div>
   <input id="setup-file" type="file" accept=".json,.lvsetup,application/json" hidden>
-  <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Group a bus">
+  <input id="load-file" type="file" accept=".lvcap,application/zip" hidden>
+  <input id="import-file" type="file" accept=".lvcap,.dsl,application/zip" hidden>
+  <div id="bus-dialog" class="wait-dialog hidden" role="dialog" aria-label="Create a group">
     <form class="wait-card bus-card" id="bus-form">
-      <h2>Group a bus</h2>
+      <h2 id="bus-dialog-title">Create group</h2>
       <label class="field">Name <input id="bus-name" type="text" value="Bus 1"></label>
+      <fieldset class="theme-choices">
+        <legend>Type</legend>
+        <label><input type="radio" name="group-type" value="bus" checked><span>Bus</span></label>
+        <label><input type="radio" name="group-type" value="group"><span>Group</span></label>
+      </fieldset>
+      <fieldset id="bus-radix" class="theme-choices">
+        <legend>Display</legend>
+        <label><input type="radio" name="bus-radix" value="hex" checked><span>Hex</span></label>
+        <label><input type="radio" name="bus-radix" value="dec"><span>Decimal</span></label>
+        <label><input type="radio" name="bus-radix" value="bin"><span>Binary</span></label>
+        <label><input type="radio" name="bus-radix" value="oct"><span>Octal</span></label>
+      </fieldset>
+      <label id="bus-msb" class="mcp-switch"><input id="bus-msb-first" type="checkbox" role="switch" checked><span>MSB first</span></label>
+      <p id="group-label-note" class="hint hidden">Display <b>Label</b></p>
       <div id="bus-channels"></div>
+      <p id="bus-hint" class="hint"></p>
       <div class="bus-actions">
         <button type="button" id="bus-cancel">Cancel</button>
-        <button type="submit">Create</button>
+        <button type="submit" id="bus-submit">Create</button>
       </div>
     </form>
   </div>
@@ -184,9 +218,20 @@
     <p class="mcp-note">Port changes apply after disabling and re-enabling the server.</p>
     <p id="mcp-error" class="mcp-error" role="alert"></p>
   </section>
+  <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-dialog-title">
+    <form id="export-dialog-form">
+      <img class="export-logo" src="/assets/ExportFileLogo.png" alt="">
+      <h2 id="export-dialog-title" class="sr-only">Export capture</h2>
+      <div id="export-dialog-fields" class="export-form"></div>
+      <div class="export-actions">
+        <button type="button" id="export-dialog-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="preferences-dialog" class="preferences-dialog" aria-labelledby="preferences-title">
     <form id="preferences-form">
-      <h2 id="preferences-title">Preferences</h2>
+      <img class="preferences-logo" src="/assets/PrefsLogo.png" alt="">
+      <h2 id="preferences-title" class="sr-only">Preferences</h2>
       <label for="preferences-firmware">Firmware directory</label>
       <div class="path-row"><input id="preferences-firmware" type="text" placeholder="Use default search locations"><button type="button" class="path-browse" data-path-target="preferences-firmware" aria-label="Choose firmware directory">...</button></div>
       <label for="preferences-scripts">Decoder scripts directory</label>
@@ -202,15 +247,25 @@
   </dialog>
   <dialog id="about-dialog" class="about-dialog" aria-labelledby="about-title">
     <div class="about-card">
-      <div class="about-logo" aria-label="E2 and LogicView logos">
-        <img class="about-logo-e2" src="/assets/E2logo.png" alt="">
-        <img class="about-logo-app" src="/assets/AppLogo.png" alt="">
+      <div class="about-logo">
+        <img class="about-logo-app" src="/assets/AppLogo.png" alt="LogicView">
+        <img class="about-logo-e2" src="/assets/E2logo.png" alt="E2ForLife">
       </div>
-      <h2 id="about-title">About LogicView</h2>
-      <p>LogicView is an open-source workspace for capturing and exploring signals. It brings logic analysis, waveform measurements, and protocol decoding together, with demo devices for exploring without hardware.</p>
+      <div class="about-copy">
+        <div class="about-copy-app">
+          <h2 id="about-title">About LogicView</h2>
+          <p>LogicView is an open-source workspace for capturing and exploring signals. It brings logic analysis, waveform measurements, and protocol decoding together, with demo devices for exploring without hardware.</p>
+        </div>
+        <div class="about-copy-e2">
+          <h2>E2ForLife</h2>
+          <p>E2ForLife is a small organization passionate about engineering, embedded systems, firmware, and education.</p>
+          <p>We build tools like LogicView to make working with technology more approachable, useful, and enjoyable. Our goal is to help people learn, experiment, solve problems, and turn ideas into working projects.</p>
+          <p>We believe in the maker lifestyle: stay curious, keep building, share what you learn, and never stop exploring how things work.</p>
+        </div>
+      </div>
       <h3 id="about-contributors-title">Contributors</h3>
       <div class="about-credits" aria-labelledby="about-contributors-title">
-        <ul><li>Chuck</li></ul>
+        <ul id="about-contributors"></ul>
       </div>
       <button type="button" id="about-close">Close</button>
     </div>

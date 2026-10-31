@@ -698,46 +698,69 @@ end
 "#;
 
 pub fn install(lua: &Lua) -> Result<(), DecodeError> {
-    lua.load(PRELUDE).set_name("logicview prelude").exec().map_err(lua_err)?;
+    lua.load(PRELUDE)
+        .set_name("logicview prelude")
+        .exec()
+        .map_err(lua_err)?;
     install_rust(lua)?;
     Ok(())
 }
 
 fn install_rust(lua: &Lua) -> Result<(), DecodeError> {
     let lv: Table = lua.globals().get("logicview").map_err(lua_err)?;
-    let crc32 = lua.create_function(|_, data: Value| Ok(crc32_ieee(&bytes_of(&data)?))).map_err(lua_err)?;
+    let crc32 = lua
+        .create_function(|_, data: Value| Ok(crc32_ieee(&bytes_of(&data)?)))
+        .map_err(lua_err)?;
     lv.set("crc32", crc32).map_err(lua_err)?;
-    let crc_hqx = lua.create_function(|_, (data, init): (Value, Option<i64>)| {
-        Ok(crc_hqx(&bytes_of(&data)?, init.unwrap_or(0) as u16) as i64)
-    }).map_err(lua_err)?;
+    let crc_hqx = lua
+        .create_function(|_, (data, init): (Value, Option<i64>)| {
+            Ok(crc_hqx(&bytes_of(&data)?, init.unwrap_or(0) as u16) as i64)
+        })
+        .map_err(lua_err)?;
     lv.set("crc_hqx", crc_hqx).map_err(lua_err)?;
 
-    let json_decode = lua.create_function(|lua, text: String| {
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| mlua::Error::runtime(err.to_string()))?;
-        lua.to_value(&value)
-    }).map_err(lua_err)?;
+    let json_decode = lua
+        .create_function(|lua, text: String| {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|err| mlua::Error::runtime(err.to_string()))?;
+            lua.to_value(&value)
+        })
+        .map_err(lua_err)?;
     let json = lua.create_table().map_err(lua_err)?;
     json.set("loads", json_decode).map_err(lua_err)?;
-    json.set("decode", json.get::<mlua::Function>("loads").map_err(lua_err)?).map_err(lua_err)?;
+    json.set(
+        "decode",
+        json.get::<mlua::Function>("loads").map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
     lv.set("json", json).map_err(lua_err)?;
 
-    let pack = lua.create_function(|lua, args: mlua::MultiValue| {
-        let mut args = args.into_iter();
-        let fmt = args.next().and_then(|value| lua_text(&value)).ok_or_else(|| mlua::Error::runtime("struct.pack expects a format"))?;
-        let values: Vec<Value> = args.collect();
-        let bytes = struct_pack(&fmt, &values).map_err(mlua::Error::runtime)?;
-        lua.create_string(bytes)
-    }).map_err(lua_err)?;
-    let unpack = lua.create_function(|lua, (fmt, data): (String, Value)| {
-        let bytes = bytes_of(&data)?;
-        let values = struct_unpack(&fmt, &bytes).map_err(mlua::Error::runtime)?;
-        let table = lua.create_table()?;
-        for (index, value) in values.into_iter().enumerate() {
-            table.set(index + 1, rust_to_lua(lua, value)?)?;
-        }
-        Ok(table)
-    }).map_err(lua_err)?;
-    let calcsize = lua.create_function(|_, fmt: String| struct_calcsize(&fmt).map_err(mlua::Error::runtime)).map_err(lua_err)?;
+    let pack = lua
+        .create_function(|lua, args: mlua::MultiValue| {
+            let mut args = args.into_iter();
+            let fmt = args
+                .next()
+                .and_then(|value| lua_text(&value))
+                .ok_or_else(|| mlua::Error::runtime("struct.pack expects a format"))?;
+            let values: Vec<Value> = args.collect();
+            let bytes = struct_pack(&fmt, &values).map_err(mlua::Error::runtime)?;
+            lua.create_string(bytes)
+        })
+        .map_err(lua_err)?;
+    let unpack = lua
+        .create_function(|lua, (fmt, data): (String, Value)| {
+            let bytes = bytes_of(&data)?;
+            let values = struct_unpack(&fmt, &bytes).map_err(mlua::Error::runtime)?;
+            let table = lua.create_table()?;
+            for (index, value) in values.into_iter().enumerate() {
+                table.set(index + 1, rust_to_lua(lua, value)?)?;
+            }
+            Ok(table)
+        })
+        .map_err(lua_err)?;
+    let calcsize = lua
+        .create_function(|_, fmt: String| struct_calcsize(&fmt).map_err(mlua::Error::runtime))
+        .map_err(lua_err)?;
     let strukt = lua.create_table().map_err(lua_err)?;
     strukt.set("pack", pack).map_err(lua_err)?;
     strukt.set("unpack", unpack).map_err(lua_err)?;
@@ -756,45 +779,86 @@ fn install_re(lua: &Lua, lv: &Table) -> Result<(), DecodeError> {
     re.set("MULTILINE", 8).map_err(lua_err)?;
     re.set("S", 16).map_err(lua_err)?;
     re.set("DOTALL", 16).map_err(lua_err)?;
-    let search = lua.create_function(|lua, (pattern, text, flags): (String, String, Option<i64>)| {
-        regex_search(lua, &pattern, &text, flags.unwrap_or(0), false)
-    }).map_err(lua_err)?;
-    let match_fn = lua.create_function(|lua, (pattern, text, flags): (String, String, Option<i64>)| {
-        regex_search(lua, &pattern, &text, flags.unwrap_or(0), true)
-    }).map_err(lua_err)?;
-    let findall = lua.create_function(|lua, (pattern, text, flags): (String, String, Option<i64>)| {
-        regex_findall(lua, &pattern, &text, flags.unwrap_or(0))
-    }).map_err(lua_err)?;
-    let sub = lua.create_function(|lua, args: mlua::MultiValue| regex_sub(lua, args)).map_err(lua_err)?;
-    let split = lua.create_function(|lua, (pattern, text, maxsplit): (String, String, Option<i64>)| {
-        regex_split(lua, &pattern, &text, maxsplit.unwrap_or(0))
-    }).map_err(lua_err)?;
+    let search = lua
+        .create_function(
+            |lua, (pattern, text, flags): (String, String, Option<i64>)| {
+                regex_search(lua, &pattern, &text, flags.unwrap_or(0), false)
+            },
+        )
+        .map_err(lua_err)?;
+    let match_fn = lua
+        .create_function(
+            |lua, (pattern, text, flags): (String, String, Option<i64>)| {
+                regex_search(lua, &pattern, &text, flags.unwrap_or(0), true)
+            },
+        )
+        .map_err(lua_err)?;
+    let findall = lua
+        .create_function(
+            |lua, (pattern, text, flags): (String, String, Option<i64>)| {
+                regex_findall(lua, &pattern, &text, flags.unwrap_or(0))
+            },
+        )
+        .map_err(lua_err)?;
+    let sub = lua
+        .create_function(|lua, args: mlua::MultiValue| regex_sub(lua, args))
+        .map_err(lua_err)?;
+    let split = lua
+        .create_function(
+            |lua, (pattern, text, maxsplit): (String, String, Option<i64>)| {
+                regex_split(lua, &pattern, &text, maxsplit.unwrap_or(0))
+            },
+        )
+        .map_err(lua_err)?;
     re.set("search", search).map_err(lua_err)?;
     re.set("match", match_fn).map_err(lua_err)?;
     re.set("findall", findall).map_err(lua_err)?;
     re.set("sub", sub).map_err(lua_err)?;
     re.set("split", split).map_err(lua_err)?;
-    let compile = lua.create_function(move |lua, (pattern, flags): (String, Option<i64>)| {
-        let flags = flags.unwrap_or(0);
-        let compiled = lua.create_table()?;
-        let pattern_search = pattern.clone();
-        let pattern_match = pattern.clone();
-        let pattern_all = pattern.clone();
-        let pattern_sub = pattern.clone();
-        let pattern_split = pattern.clone();
-        compiled.set("search", lua.create_function(move |lua, text: String| regex_search(lua, &pattern_search, &text, flags, false))?)?;
-        compiled.set("match", lua.create_function(move |lua, text: String| regex_search(lua, &pattern_match, &text, flags, true))?)?;
-        compiled.set("findall", lua.create_function(move |lua, text: String| regex_findall(lua, &pattern_all, &text, flags))?)?;
-        compiled.set("sub", lua.create_function(move |lua, args: mlua::MultiValue| {
-            let mut full = vec![Value::String(lua.create_string(&pattern_sub)?)];
-            full.extend(args);
-            regex_sub(lua, mlua::MultiValue::from_vec(full))
-        })?)?;
-        compiled.set("split", lua.create_function(move |lua, (text, maxsplit): (String, Option<i64>)| {
-            regex_split(lua, &pattern_split, &text, maxsplit.unwrap_or(0))
-        })?)?;
-        Ok(compiled)
-    }).map_err(lua_err)?;
+    let compile = lua
+        .create_function(move |lua, (pattern, flags): (String, Option<i64>)| {
+            let flags = flags.unwrap_or(0);
+            let compiled = lua.create_table()?;
+            let pattern_search = pattern.clone();
+            let pattern_match = pattern.clone();
+            let pattern_all = pattern.clone();
+            let pattern_sub = pattern.clone();
+            let pattern_split = pattern.clone();
+            compiled.set(
+                "search",
+                lua.create_function(move |lua, text: String| {
+                    regex_search(lua, &pattern_search, &text, flags, false)
+                })?,
+            )?;
+            compiled.set(
+                "match",
+                lua.create_function(move |lua, text: String| {
+                    regex_search(lua, &pattern_match, &text, flags, true)
+                })?,
+            )?;
+            compiled.set(
+                "findall",
+                lua.create_function(move |lua, text: String| {
+                    regex_findall(lua, &pattern_all, &text, flags)
+                })?,
+            )?;
+            compiled.set(
+                "sub",
+                lua.create_function(move |lua, args: mlua::MultiValue| {
+                    let mut full = vec![Value::String(lua.create_string(&pattern_sub)?)];
+                    full.extend(args);
+                    regex_sub(lua, mlua::MultiValue::from_vec(full))
+                })?,
+            )?;
+            compiled.set(
+                "split",
+                lua.create_function(move |lua, (text, maxsplit): (String, Option<i64>)| {
+                    regex_split(lua, &pattern_split, &text, maxsplit.unwrap_or(0))
+                })?,
+            )?;
+            Ok(compiled)
+        })
+        .map_err(lua_err)?;
     re.set("compile", compile).map_err(lua_err)?;
     lv.set("re", re).map_err(lua_err)?;
     Ok(())
@@ -802,18 +866,43 @@ fn install_re(lua: &Lua, lv: &Table) -> Result<(), DecodeError> {
 
 fn regex_build(pattern: &str, flags: i64) -> Result<regex::Regex, mlua::Error> {
     let mut wrapped = String::new();
-    if flags & 2 != 0 { wrapped.push_str("(?i)"); }
-    if flags & 8 != 0 { wrapped.push_str("(?m)"); }
-    if flags & 16 != 0 { wrapped.push_str("(?s)"); }
+    if flags & 2 != 0 {
+        wrapped.push_str("(?i)");
+    }
+    if flags & 8 != 0 {
+        wrapped.push_str("(?m)");
+    }
+    if flags & 16 != 0 {
+        wrapped.push_str("(?s)");
+    }
     wrapped.push_str(pattern);
     regex::Regex::new(&wrapped).map_err(|err| mlua::Error::runtime(err.to_string()))
 }
 
-fn regex_search(lua: &Lua, pattern: &str, text: &str, flags: i64, anchored: bool) -> Result<Value, mlua::Error> {
+fn regex_search(
+    lua: &Lua,
+    pattern: &str,
+    text: &str,
+    flags: i64,
+    anchored: bool,
+) -> Result<Value, mlua::Error> {
     let re = regex_build(pattern, flags)?;
-    let found = if anchored { re.find(text).filter(|item| item.start() == 0).map(|item| (item.start(), item.end())) } else { re.find(text).map(|item| (item.start(), item.end())) };
-    let Some((start, end)) = found else { return Ok(Value::Nil) };
-    let caps = if anchored { re.captures(text).filter(|caps| caps.get(0).is_some_and(|item| item.start() == 0)) } else { re.captures(text) };
+    let found = if anchored {
+        re.find(text)
+            .filter(|item| item.start() == 0)
+            .map(|item| (item.start(), item.end()))
+    } else {
+        re.find(text).map(|item| (item.start(), item.end()))
+    };
+    let Some((start, end)) = found else {
+        return Ok(Value::Nil);
+    };
+    let caps = if anchored {
+        re.captures(text)
+            .filter(|caps| caps.get(0).is_some_and(|item| item.start() == 0))
+    } else {
+        re.captures(text)
+    };
     match_object(lua, text, start, end, caps.as_ref())
 }
 
@@ -823,13 +912,28 @@ fn regex_findall(lua: &Lua, pattern: &str, text: &str, flags: i64) -> Result<Tab
     let mut slot = 1;
     for caps in re.captures_iter(text) {
         if caps.len() <= 1 {
-            table.set(slot, caps.get(0).map(|item| item.as_str().to_string()).unwrap_or_default())?;
+            table.set(
+                slot,
+                caps.get(0)
+                    .map(|item| item.as_str().to_string())
+                    .unwrap_or_default(),
+            )?;
         } else if caps.len() == 2 {
-            table.set(slot, caps.get(1).map(|item| item.as_str().to_string()).unwrap_or_default())?;
+            table.set(
+                slot,
+                caps.get(1)
+                    .map(|item| item.as_str().to_string())
+                    .unwrap_or_default(),
+            )?;
         } else {
             let group = lua.create_table()?;
             for index in 1..caps.len() {
-                group.set(index, caps.get(index).map(|item| item.as_str().to_string()).unwrap_or_default())?;
+                group.set(
+                    index,
+                    caps.get(index)
+                        .map(|item| item.as_str().to_string())
+                        .unwrap_or_default(),
+                )?;
             }
             table.set(slot, group)?;
         }
@@ -845,7 +949,9 @@ fn regex_split(lua: &Lua, pattern: &str, text: &str, maxsplit: i64) -> Result<Ta
     let mut slot = 1;
     let mut splits = 0i64;
     for item in re.find_iter(text) {
-        if maxsplit > 0 && splits >= maxsplit { break; }
+        if maxsplit > 0 && splits >= maxsplit {
+            break;
+        }
         table.set(slot, text[last..item.start()].to_string())?;
         slot += 1;
         last = item.end();
@@ -857,17 +963,27 @@ fn regex_split(lua: &Lua, pattern: &str, text: &str, maxsplit: i64) -> Result<Ta
 
 fn regex_sub(lua: &Lua, args: mlua::MultiValue) -> Result<String, mlua::Error> {
     let args: Vec<Value> = args.into_iter().collect();
-    if args.len() < 3 { return Err(mlua::Error::runtime("re.sub expects pattern, replacement, and text")); }
-    let pattern = lua_text(&args[0]).ok_or_else(|| mlua::Error::runtime("re.sub pattern must be a string"))?;
-    let text = lua_text(&args[2]).ok_or_else(|| mlua::Error::runtime("re.sub text must be a string"))?;
+    if args.len() < 3 {
+        return Err(mlua::Error::runtime(
+            "re.sub expects pattern, replacement, and text",
+        ));
+    }
+    let pattern = lua_text(&args[0])
+        .ok_or_else(|| mlua::Error::runtime("re.sub pattern must be a string"))?;
+    let text =
+        lua_text(&args[2]).ok_or_else(|| mlua::Error::runtime("re.sub text must be a string"))?;
     let count = args.get(3).and_then(as_i64).unwrap_or(0);
     let re = regex_build(&pattern, 0)?;
     let mut out = String::new();
     let mut last = 0;
     let mut done = 0i64;
     for caps in re.captures_iter(&text) {
-        if count > 0 && done >= count { break; }
-        let whole = caps.get(0).ok_or_else(|| mlua::Error::runtime("empty match"))?;
+        if count > 0 && done >= count {
+            break;
+        }
+        let whole = caps
+            .get(0)
+            .ok_or_else(|| mlua::Error::runtime("empty match"))?;
         out.push_str(&text[last..whole.start()]);
         let replacement = match &args[1] {
             Value::Function(function) => {
@@ -890,12 +1006,20 @@ fn regex_sub(lua: &Lua, args: mlua::MultiValue) -> Result<String, mlua::Error> {
     Ok(out)
 }
 
-fn match_object(lua: &Lua, text: &str, start: usize, end: usize, caps: Option<&regex::Captures<'_>>) -> Result<Value, mlua::Error> {
+fn match_object(
+    lua: &Lua,
+    text: &str,
+    start: usize,
+    end: usize,
+    caps: Option<&regex::Captures<'_>>,
+) -> Result<Value, mlua::Error> {
     let groups = lua.create_table()?;
     groups.set(0, text[start..end].to_string())?;
     if let Some(caps) = caps {
         for index in 1..caps.len() {
-            if let Some(item) = caps.get(index) { groups.set(index, item.as_str().to_string())?; }
+            if let Some(item) = caps.get(index) {
+                groups.set(index, item.as_str().to_string())?;
+            }
         }
     }
     let object = lua.create_table()?;
@@ -907,7 +1031,9 @@ fn match_object(lua: &Lua, text: &str, start: usize, end: usize, caps: Option<&r
             Some(Value::Table(table)) => table.clone(),
             _ => return Err(mlua::Error::runtime("match.group requires the match")),
         };
-        if args.len() > 0 { args.remove(0); }
+        if args.len() > 0 {
+            args.remove(0);
+        }
         let groups: Table = this.get("_g")?;
         let index = args.first().and_then(as_i64).unwrap_or(0);
         Ok(groups.get::<Value>(index)?)
@@ -929,32 +1055,55 @@ fn match_object(lua: &Lua, text: &str, start: usize, end: usize, caps: Option<&r
     Ok(Value::Table(object))
 }
 
-enum Packed { Int(i64), Float(f64), Text(String) }
+enum Packed {
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
 
 fn struct_calcsize(fmt: &str) -> Result<i64, String> {
-    Ok(struct_fields(fmt)?.into_iter().map(|(_, width)| width as i64).sum())
+    Ok(struct_fields(fmt)?
+        .into_iter()
+        .map(|(_, width)| width as i64)
+        .sum())
 }
 
 fn struct_fields(fmt: &str) -> Result<Vec<(char, usize)>, String> {
     let mut chars = fmt.chars().peekable();
-    if matches!(chars.peek(), Some('@' | '=' | '<' | '>' | '!')) { chars.next(); }
+    if matches!(chars.peek(), Some('@' | '=' | '<' | '>' | '!')) {
+        chars.next();
+    }
     let mut fields = Vec::new();
     while let Some(ch) = chars.next() {
-        if ch.is_whitespace() { continue; }
+        if ch.is_whitespace() {
+            continue;
+        }
         let mut count_text = String::new();
         let kind = if ch.is_ascii_digit() {
             count_text.push(ch);
-            while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) { count_text.push(chars.next().unwrap()); }
-            chars.next().ok_or_else(|| "struct format ends with a repeat count".to_string())?
+            while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+                count_text.push(chars.next().unwrap());
+            }
+            chars
+                .next()
+                .ok_or_else(|| "struct format ends with a repeat count".to_string())?
         } else {
             ch
         };
-        let count: usize = if count_text.is_empty() { 1 } else { count_text.parse().map_err(|_| "struct repeat count is invalid".to_string())? };
+        let count: usize = if count_text.is_empty() {
+            1
+        } else {
+            count_text
+                .parse()
+                .map_err(|_| "struct repeat count is invalid".to_string())?
+        };
         if kind == 's' || kind == 'p' {
             fields.push((kind, count));
         } else {
             let width = field_width(kind)?;
-            for _ in 0..count { fields.push((kind, width)); }
+            for _ in 0..count {
+                fields.push((kind, width));
+            }
         }
     }
     Ok(fields)
@@ -977,7 +1126,10 @@ fn struct_pack(fmt: &str, values: &[Value]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut cursor = 0;
     for (kind, width) in fields {
-        if kind == 'x' { out.push(0); continue; }
+        if kind == 'x' {
+            out.push(0);
+            continue;
+        }
         let value = values.get(cursor).ok_or("struct.pack is missing a value")?;
         cursor += 1;
         match kind {
@@ -985,10 +1137,20 @@ fn struct_pack(fmt: &str, values: &[Value]) -> Result<Vec<u8>, String> {
             'b' | 'B' => out.push(as_i64(value).unwrap_or(0) as u8),
             '?' => out.push(if truthy(value) { 1 } else { 0 }),
             'h' | 'H' => out.extend(pack_int(as_i64(value).unwrap_or(0) as u64, 2, endian)),
-            'i' | 'I' | 'l' | 'L' => out.extend(pack_int(as_i64(value).unwrap_or(0) as u64, 4, endian)),
+            'i' | 'I' | 'l' | 'L' => {
+                out.extend(pack_int(as_i64(value).unwrap_or(0) as u64, 4, endian))
+            }
             'q' | 'Q' => out.extend(pack_int(as_i64(value).unwrap_or(0) as u64, 8, endian)),
-            'e' => out.extend(pack_int(f32_to_f16(as_f64(value).unwrap_or(0.0) as f32) as u64, 2, endian)),
-            'f' => out.extend(pack_int((as_f64(value).unwrap_or(0.0) as f32).to_bits() as u64, 4, endian)),
+            'e' => out.extend(pack_int(
+                f32_to_f16(as_f64(value).unwrap_or(0.0) as f32) as u64,
+                2,
+                endian,
+            )),
+            'f' => out.extend(pack_int(
+                (as_f64(value).unwrap_or(0.0) as f32).to_bits() as u64,
+                4,
+                endian,
+            )),
             'd' => out.extend(pack_int(as_f64(value).unwrap_or(0.0).to_bits(), 8, endian)),
             'p' => {
                 let text = lua_text(value).unwrap_or_default();
@@ -1010,12 +1172,21 @@ fn struct_unpack(fmt: &str, data: &[u8]) -> Result<Vec<Packed>, String> {
     let mut out = Vec::new();
     let mut cursor = 0;
     for (kind, width) in fields {
-        if kind == 'x' { cursor += 1; continue; }
-        if cursor + width > data.len() { return Err("struct.unpack buffer is too small".into()); }
+        if kind == 'x' {
+            cursor += 1;
+            continue;
+        }
+        if cursor + width > data.len() {
+            return Err("struct.unpack buffer is too small".into());
+        }
         let chunk = &data[cursor..cursor + width];
         cursor += width;
         let packed = match kind {
-            'c' | 's' => Packed::Text(String::from_utf8_lossy(chunk).trim_end_matches('\0').to_string()),
+            'c' | 's' => Packed::Text(
+                String::from_utf8_lossy(chunk)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            ),
             'b' => Packed::Int(chunk[0] as i8 as i64),
             'B' | '?' => Packed::Int(chunk[0] as i64),
             'h' => Packed::Int(unpack_int(chunk, endian) as u16 as i16 as i64),
@@ -1028,7 +1199,10 @@ fn struct_unpack(fmt: &str, data: &[u8]) -> Result<Vec<Packed>, String> {
             'd' => Packed::Float(f64::from_bits(unpack_int(chunk, endian))),
             'p' => {
                 let len = chunk.first().copied().unwrap_or(0) as usize;
-                Packed::Text(String::from_utf8_lossy(&chunk[1..1 + len.min(chunk.len().saturating_sub(1))]).to_string())
+                Packed::Text(
+                    String::from_utf8_lossy(&chunk[1..1 + len.min(chunk.len().saturating_sub(1))])
+                        .to_string(),
+                )
             }
             _ => return Err(format!("unsupported struct format '{kind}'")),
         };
@@ -1043,7 +1217,9 @@ fn endian_of(fmt: &str) -> bool {
 
 fn pack_int(value: u64, width: usize, little: bool) -> Vec<u8> {
     let mut bytes = value.to_le_bytes()[..width].to_vec();
-    if !little { bytes.reverse(); }
+    if !little {
+        bytes.reverse();
+    }
     bytes
 }
 
@@ -1100,9 +1276,13 @@ fn f32_to_f16(value: f32) -> u16 {
         return sign | 0x7c00 | if frac == 0 { 0 } else { 0x200 };
     }
     let exp = exp - 127 + 15;
-    if exp >= 31 { return sign | 0x7c00; }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
     if exp <= 0 {
-        if exp < -10 { return sign; }
+        if exp < -10 {
+            return sign;
+        }
         let mut frac = frac | 0x800000;
         let shift = 1 - exp;
         frac >>= shift;
@@ -1116,10 +1296,15 @@ fn f16_to_f32(value: u16) -> f32 {
     let exp = ((value >> 10) & 0x1f) as i32;
     let frac = (value & 0x3ff) as u32;
     let bits = if exp == 0 {
-        if frac == 0 { sign } else {
+        if frac == 0 {
+            sign
+        } else {
             let mut exp = 127 - 15 + 1;
             let mut frac = frac;
-            while frac & 0x400 == 0 { frac <<= 1; exp -= 1; }
+            while frac & 0x400 == 0 {
+                frac <<= 1;
+                exp -= 1;
+            }
             sign | ((exp as u32) << 23) | ((frac & 0x3ff) << 13)
         }
     } else if exp == 31 {
@@ -1146,7 +1331,11 @@ fn crc_hqx(data: &[u8], mut crc: u16) -> u16 {
     for byte in data {
         crc ^= (*byte as u16) << 8;
         for _ in 0..8 {
-            if crc & 0x8000 != 0 { crc = (crc << 1) ^ 0x1021; } else { crc <<= 1; }
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
         }
     }
     crc
@@ -1158,7 +1347,8 @@ fn bytes_of(value: &Value) -> Result<Vec<u8>, mlua::Error> {
         Value::Table(table) => {
             let mut bytes = Vec::new();
             for item in table.sequence_values::<Value>() {
-                let byte = as_i64(&item?).ok_or_else(|| mlua::Error::runtime("byte must be an integer"))?;
+                let byte = as_i64(&item?)
+                    .ok_or_else(|| mlua::Error::runtime("byte must be an integer"))?;
                 bytes.push(byte as u8);
             }
             Ok(bytes)
@@ -1172,7 +1362,9 @@ fn lua_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => text.to_str().ok().map(|text| text.to_string()),
         Value::Integer(number) => Some(number.to_string()),
-        Value::Number(number) if number.fract() == 0.0 && number.is_finite() => Some((*number as i64).to_string()),
+        Value::Number(number) if number.fract() == 0.0 && number.is_finite() => {
+            Some((*number as i64).to_string())
+        }
         Value::Number(number) if number.is_finite() => Some(number.to_string()),
         _ => None,
     }
@@ -1181,7 +1373,9 @@ fn lua_text(value: &Value) -> Option<String> {
 fn as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Integer(number) => Some(*number),
-        Value::Number(number) if number.fract() == 0.0 && number.is_finite() => Some(*number as i64),
+        Value::Number(number) if number.fract() == 0.0 && number.is_finite() => {
+            Some(*number as i64)
+        }
         Value::String(text) => text.to_str().ok().and_then(|text| text.parse().ok()),
         _ => None,
     }

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Annotation, Decoder, DecodeError, SampleSlice};
+use super::{Annotation, DecodeError, Decoder, SampleSlice};
 
 /// Stateful SPI interpreter that preserves partially collected words across capture slices.
 #[derive(Clone, Debug)]
@@ -113,7 +113,8 @@ impl Decoder for SpiDecoder {
                 return out;
             }
             self.prev_sck = slice.bit("sck", index);
-            self.prev_selected = (!slice.has_channel("cs")) || self.selected(slice.bit("cs", index));
+            self.prev_selected =
+                (!slice.has_channel("cs")) || self.selected(slice.bit("cs", index));
             self.primed = true;
             index += 1;
         }
@@ -131,7 +132,8 @@ impl Decoder for SpiDecoder {
             }
             let rising = !self.prev_sck && sck;
             let falling = self.prev_sck && !sck;
-            let take = selected && ((self.sample_on_rising() && rising) || (!self.sample_on_rising() && falling));
+            let take = selected
+                && ((self.sample_on_rising() && rising) || (!self.sample_on_rising() && falling));
             if take {
                 if self.got == 0 {
                     self.word_start = index;
@@ -147,7 +149,14 @@ impl Decoder for SpiDecoder {
                 }
                 self.got += 1;
                 if self.got == width {
-                    out.push(word(self.word_start, index + 1, self.mosi_acc, self.miso_acc, slice.has_channel("mosi"), slice.has_channel("miso")));
+                    out.push(word(
+                        self.word_start,
+                        index + 1,
+                        self.mosi_acc,
+                        self.miso_acc,
+                        slice.has_channel("mosi"),
+                        slice.has_channel("miso"),
+                    ));
                     self.words_in_select += 1;
                     self.got = 0;
                     self.mosi_acc = 0;
@@ -161,7 +170,11 @@ impl Decoder for SpiDecoder {
                     self.select_start,
                     index + 1,
                     "select",
-                    format!("SPI {} word{}", self.words_in_select, if self.words_in_select == 1 { "" } else { "s" }),
+                    format!(
+                        "SPI {} word{}",
+                        self.words_in_select,
+                        if self.words_in_select == 1 { "" } else { "s" }
+                    ),
                     fields,
                 ));
                 self.got = 0;
@@ -187,11 +200,7 @@ impl Decoder for SpiDecoder {
                 self.msb = match value {
                     "msb" => true,
                     "lsb" => false,
-                    _ => {
-                        return Err(DecodeError::Message(
-                            "order must be msb or lsb".into(),
-                        ))
-                    }
+                    _ => return Err(DecodeError::Message("order must be msb or lsb".into())),
                 }
             }
             "bits" => {
@@ -313,8 +322,10 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
         )
@@ -329,10 +340,17 @@ mod tests {
         assert_eq!(words[0].fields.get("miso").map(String::as_str), Some("3C"));
         assert_eq!(words[0].text, "MOSI 0xA5 MISO 0x3C");
         assert!(output.annotations.iter().any(|row| row.class == "select"));
-        let packet = output.packets.iter().find(|packet| packet.kind == "DATA").unwrap();
+        let packet = output
+            .packets
+            .iter()
+            .find(|packet| packet.kind == "DATA")
+            .unwrap();
         assert_eq!(packet.data["mosi"], 0xa5);
         assert_eq!(packet.data["miso"], 0x3c);
-        assert!(output.packets.iter().any(|packet| packet.kind == "CS-CHANGE"));
+        assert!(output
+            .packets
+            .iter()
+            .any(|packet| packet.kind == "CS-CHANGE"));
     }
     #[test]
     fn spi_decodes_one_data_line_without_chip_select() {
@@ -344,14 +362,34 @@ mod tests {
         let miso = pack(&rows, 2);
         let channels = [("sck", sck.as_slice()), ("miso", miso.as_slice())];
         let len = rows.len() as u64;
-        let result = run(&DecodeRequest { protocol: "spi", channels: &channels, options: &[], region: 0..len, sample_len: len, sample_rate_hz: None, lower: &[], lower_packets: &[] }, &AtomicBool::new(false)).unwrap();
-        let word = result.annotations.iter().find(|row| row.class == "word").unwrap();
+        let result = run(
+            &DecodeRequest {
+                protocol: "spi",
+                channels: &channels,
+                options: &[],
+                region: 0..len,
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let word = result
+            .annotations
+            .iter()
+            .find(|row| row.class == "word")
+            .unwrap();
         assert_eq!(word.fields.get("miso").map(String::as_str), Some("3C"));
         assert!(!word.fields.contains_key("mosi"));
         assert_eq!(word.text, "MISO 0x3C");
-        let packet = result.packets.iter().find(|packet| packet.kind == "DATA").unwrap();
+        let packet = result
+            .packets
+            .iter()
+            .find(|packet| packet.kind == "DATA")
+            .unwrap();
         assert_eq!(packet.data["miso"], 0x3c);
         assert!(packet.data["mosi"].is_null());
     }
-
 }

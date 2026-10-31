@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Annotation, Decoder, DecodeError, SampleSlice};
+use super::{Annotation, DecodeError, Decoder, SampleSlice};
 
 /// Stateful I2C bus interpreter with an optional address filter.
 #[derive(Clone, Debug)]
@@ -120,7 +120,8 @@ impl Decoder for I2cDecoder {
                         if self.shown {
                             let mut fields = BTreeMap::new();
                             fields.insert("address".into(), format!("{addr:02X}"));
-                            fields.insert("read".into(), if read { "true" } else { "false" }.into());
+                            fields
+                                .insert("read".into(), if read { "true" } else { "false" }.into());
                             fields.insert("raw".into(), format!("{data:02X}"));
                             let text = if read {
                                 format!("Read 0x{addr:02X}")
@@ -143,7 +144,8 @@ impl Decoder for I2cDecoder {
                     }
                     if self.shown {
                         let mut ack_fields = BTreeMap::new();
-                        ack_fields.insert("ack".into(), if acked { "true" } else { "false" }.into());
+                        ack_fields
+                            .insert("ack".into(), if acked { "true" } else { "false" }.into());
                         if acked {
                             out.push(note(index, index + 1, "ack", "ACK", ack_fields));
                         } else {
@@ -180,9 +182,8 @@ impl Decoder for I2cDecoder {
             .strip_prefix("0x")
             .or_else(|| trimmed.strip_prefix("0X"))
             .unwrap_or(trimmed);
-        let addr = u8::from_str_radix(hex, 16).map_err(|_| {
-            DecodeError::Message("address must be a 7-bit hex value".into())
-        })?;
+        let addr = u8::from_str_radix(hex, 16)
+            .map_err(|_| DecodeError::Message("address must be a 7-bit hex value".into()))?;
         if addr > 0x7f {
             return Err(DecodeError::Message("address must be 7 bits".into()));
         }
@@ -206,7 +207,13 @@ fn note(
 #[cfg(test)]
 pub(crate) fn fixture_eeprom_bits() -> (Vec<u8>, Vec<u8>, u64) {
     /// Adds a stable bus interval to the independently generated I2C test fixture.
-    fn push_level(scl: &mut Vec<bool>, sda: &mut Vec<bool>, n: usize, sda_level: bool, scl_level: bool) {
+    fn push_level(
+        scl: &mut Vec<bool>,
+        sda: &mut Vec<bool>,
+        n: usize,
+        sda_level: bool,
+        scl_level: bool,
+    ) {
         for _ in 0..n {
             scl.push(scl_level);
             sda.push(sda_level);
@@ -281,8 +288,10 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
         )
@@ -332,8 +341,10 @@ mod tests {
                 channels: &channels,
                 options: &[("address".into(), "50".into())],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
         )
@@ -345,8 +356,10 @@ mod tests {
                 channels: &channels,
                 options: &[("address".into(), "51".into())],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
         )

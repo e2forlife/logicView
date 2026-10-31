@@ -1,0 +1,8 @@
+# About-dialog credits packaged with LogicView.
+# A contrib.toml beside the executable, in the working directory, or named by
+# LOGICVIEW_CONTRIB replaces this copy after a restart.
+# Each person is shown as "name -- contribution".
+
+[[contributors]]
+name = "Chuck"
+contribution = "LogicView"

@@ -57,6 +57,7 @@ const state = {
   decoderCatalog: [],
   selectedDecoder: null,
   decodeQuery: "",
+  decoderProtocol: "",
   spiView: {},
   decodeView: {},
   gutterSig: "",
@@ -74,7 +75,7 @@ const state = {
 
 const settings = {
   rate: 1_000_000,
-  duration: 2000,
+  durationNs: 2_000_000_000,
   trigger: false,
   percent: 10,
   depth: "buffer",
@@ -102,6 +103,8 @@ let tileAgain = false;
 let commandBusy = false;
 let hoverTimer = null;
 let pointer = null;
+let zoomAnchor = null;
+let zoomAnchorTimer = null;
 
 function view() {
   const id = state.active || "pending";
@@ -123,6 +126,8 @@ function view() {
       measures: [],
       buses: [],
       nextBus: 1,
+      selection: [],
+      anchor: null,
       selected: null,
       names: {},
       colors,
@@ -179,6 +184,107 @@ function persistColors() {
   } catch (_) { /* the in-memory color still lasts for this session */ }
 }
 
+function sessionContainers() {
+  const list = view().buses;
+  if (!Array.isArray(list)) {
+    view().buses = [];
+    return view().buses;
+  }
+  for (const bus of list) normalizeContainerInPlace(bus);
+  return list;
+}
+
+function normalizeContainerInPlace(raw) {
+  if (!raw || typeof raw !== "object") return raw;
+  raw.type = raw.type === "group" ? "group" : "bus";
+  if (!Array.isArray(raw.members)) {
+    const channels = Array.isArray(raw.channels) ? raw.channels : [];
+    raw.members = channels.map((index) => ({ kind: "channel", index: Number(index) })).filter((member) => Number.isFinite(member.index));
+  } else {
+    raw.members = raw.members.map((member) => {
+      if (!member || typeof member !== "object") return null;
+      if (member.kind === "group") return { kind: "group", id: Number(member.id) };
+      return { kind: "channel", index: Number(member.index) };
+    }).filter((member) => member && (member.kind === "group" ? Number.isFinite(member.id) : Number.isFinite(member.index)));
+  }
+  if (!raw.radix) raw.radix = raw.analog ? "analog" : "hex";
+  if (typeof raw.msbFirst !== "boolean") raw.msbFirst = false;
+  if (typeof raw.folded !== "boolean") raw.folded = false;
+  raw.channels = raw.members.filter((member) => member.kind === "channel").map((member) => member.index);
+  return raw;
+}
+
+function nestedContainerIds() {
+  const ids = new Set();
+  for (const container of sessionContainers()) {
+    for (const member of container.members || []) {
+      if (member.kind === "group") ids.add(Number(member.id));
+    }
+  }
+  return ids;
+}
+
+function parentContainer(id) {
+  const wanted = Number(id);
+  for (const container of sessionContainers()) {
+    if ((container.members || []).some((member) => member.kind === "group" && Number(member.id) === wanted)) return container;
+  }
+  return null;
+}
+
+function descendantChannels(container, guard = 0) {
+  if (!container || guard > 32) return [];
+  const out = [];
+  for (const member of container.members || []) {
+    if (member.kind === "channel") out.push(Number(member.index));
+    else if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (child) out.push(...descendantChannels(child, guard + 1));
+    }
+  }
+  return out;
+}
+
+function containerDepth(container, guard = 0) {
+  if (!container || guard > 32) return 0;
+  const parent = parentContainer(container.id);
+  return parent ? containerDepth(parent, guard + 1) + 1 : 0;
+}
+
+function directParentOfChannel(index) {
+  const wanted = Number(index);
+  for (const container of sessionContainers()) {
+    if ((container.members || []).some((member) => member.kind === "channel" && Number(member.index) === wanted)) return container;
+  }
+  return null;
+}
+
+function ownedChannelSet() {
+  const owned = new Set();
+  for (const container of sessionContainers()) {
+    for (const member of container.members || []) {
+      if (member.kind === "channel") owned.add(Number(member.index));
+    }
+  }
+  return owned;
+}
+
+function containerHeaderRow(container, depth) {
+  const type = container.type === "group" ? "group" : "bus";
+  return {
+    key: "bus:" + container.id,
+    kind: type,
+    channel: (container.channels || [])[0] ?? 0,
+    name: container.name,
+    color: storedColor("bus:" + container.id, "#d5deea"),
+    device: "",
+    bus: container,
+    containerId: container.id,
+    depth: depth || 0,
+    header: true,
+  };
+}
+
 function sourceRows() {
   const rows = [];
   for (const channel of state.channels) rows.push(logicRowModel(channel, ""));
@@ -193,16 +299,10 @@ function sourceRows() {
       device: "",
     });
   }
-  for (const bus of view().buses || []) {
-    rows.push({
-      key: "bus:" + bus.id,
-      kind: "bus",
-      channel: bus.channels[0] ?? 0,
-      name: bus.name,
-      color: storedColor("bus:" + bus.id, "#d5deea"),
-      device: "",
-      bus,
-    });
+  const nested = nestedContainerIds();
+  for (const bus of sessionContainers()) {
+    if (nested.has(Number(bus.id))) continue;
+    rows.push(containerHeaderRow(bus, 0));
   }
   return rows;
 }
@@ -276,14 +376,17 @@ function decodeBusRow(decoder, lane, header) {
   };
 }
 
-function groupRows(decoder, source) {
+function groupRows(decoder, source, depth = 0) {
   const indexes = indexesInOrder(decoderIndexes(decoder), source);
   const channel = indexes.length ? indexes[0] : 0;
   const lanes = decodeLanes(decoder, channel);
   const byIndex = new Map(state.channels.map((item) => [item.index, item]));
   const rows = [];
   for (const [position, lane] of lanes.entries()) {
-    rows.push(decodeBusRow(decoder, lane, position === 0));
+    const header = decodeBusRow(decoder, lane, position === 0);
+    header.depth = depth;
+    header.child = depth > 0;
+    rows.push(header);
     if (decoderCondensed(decoder.id, lane.id)) continue;
     const channels = decoder.channels || {};
     const laneIndexes = decoder.protocol === "spi" && lane.id
@@ -299,58 +402,202 @@ function groupRows(decoder, source) {
       if (!signal) continue;
       const row = logicRowModel(signal, decoder.id, lane.id);
       row.child = true;
+      row.depth = depth + 1;
       rows.push(row);
     }
   }
   return rows;
 }
 
-function displayRows() {
+function isStackChild(decoder) {
+  return !!(decoder.stack_on && (state.decoders || []).some((item) => item.id === decoder.stack_on));
+}
+
+function clusterDecoders(root) {
+  const out = [root];
+  const walk = (id) => {
+    for (const decoder of state.decoders || []) {
+      if (decoder.stack_on === id && !out.includes(decoder)) {
+        out.push(decoder);
+        walk(decoder.id);
+      }
+    }
+  };
+  walk(root.id);
+  return out;
+}
+
+function clusterChannels(root) {
+  const indexes = new Set();
+  for (const decoder of clusterDecoders(root)) {
+    for (const index of decoderIndexes(decoder)) indexes.add(index);
+  }
+  return indexes;
+}
+
+function deepestContainerFor(indexes) {
+  if (!indexes.length) return null;
+  let best = null;
+  let bestDepth = -1;
+  for (const container of sessionContainers()) {
+    const owned = new Set(descendantChannels(container));
+    if (!indexes.every((index) => owned.has(index))) continue;
+    const depth = containerDepth(container);
+    if (depth >= bestDepth) {
+      best = container;
+      bestDepth = depth;
+    }
+  }
+  return best;
+}
+
+function topLevelSource() {
+  const nested = nestedContainerIds();
+  const owned = ownedChannelSet();
+  const out = [];
+  for (const row of orderedSourceRows()) {
+    if (row.kind === "logic" && owned.has(row.channel)) continue;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus && nested.has(Number(row.bus.id))) continue;
+    out.push(row);
+  }
+  return out;
+}
+
+function renderCluster(root, source, depth, containerId) {
+  const cluster = clusterDecoders(root);
+  const groups = cluster.map((decoder) => ({
+    id: decoder.id,
+    stackOn: decoder.stack_on && cluster.some((item) => item.id === decoder.stack_on) ? decoder.stack_on : "",
+    rows: groupRows(decoder, source, depth),
+  }));
+  const out = [];
+  const placed = new Set();
+  const waiting = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
+  const place = (group) => {
+    if (placed.has(group.id)) return;
+    for (const row of group.rows) {
+      const copy = Object.assign({}, row);
+      if (containerId != null) copy.containerId = containerId;
+      out.push(copy);
+    }
+    placed.add(group.id);
+    for (const child of groups) {
+      if (!placed.has(child.id) && child.stackOn === group.id) place(child);
+    }
+  };
+  const rootGroup = groups.find((group) => group.id === root.id);
+  if (rootGroup) place(rootGroup);
+  for (const group of groups) {
+    if (!placed.has(group.id) && !waiting(group)) place(group);
+  }
+  return out;
+}
+
+function renderContainer(container, depth, blocked, seen) {
+  const visiting = seen || new Set();
+  if (!container || visiting.has(Number(container.id))) return [];
+  visiting.add(Number(container.id));
+  const rows = [];
+  const header = containerHeaderRow(container, depth);
+  header.child = depth > 0;
+  rows.push(header);
+  if (container.folded) return rows;
+  const blockedChannels = blocked || new Set();
+  const roots = (state.decoders || []).filter((decoder) => {
+    if (isStackChild(decoder)) return false;
+    const owner = deepestContainerFor(decoderIndexes(decoder));
+    return owner && Number(owner.id) === Number(container.id);
+  });
+  const localClaimed = new Set(blockedChannels);
+  for (const root of roots) {
+    for (const index of clusterChannels(root)) localClaimed.add(index);
+  }
+  const emitted = new Set();
   const source = orderedSourceRows();
+  const emitRoot = (root) => {
+    if (!root || emitted.has(root.id)) return;
+    emitted.add(root.id);
+    rows.push(...renderCluster(root, source, depth + 1, container.id));
+  };
+  for (const member of container.members || []) {
+    if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (!child) continue;
+      const childChannels = new Set(descendantChannels(child));
+      const root = roots.find((decoder) => !emitted.has(decoder.id) && [...clusterChannels(decoder)].some((index) => childChannels.has(index)));
+      if (root) emitRoot(root);
+      rows.push(...renderContainer(child, depth + 1, localClaimed, visiting));
+      continue;
+    }
+    const index = Number(member.index);
+    if (blockedChannels.has(index)) continue;
+    const root = roots.find((decoder) => !emitted.has(decoder.id) && clusterChannels(decoder).has(index));
+    if (root) {
+      emitRoot(root);
+      continue;
+    }
+    if (localClaimed.has(index)) continue;
+    const signal = state.channels.find((item) => item.index === index);
+    if (!signal) continue;
+    const row = logicRowModel(signal, "");
+    row.child = true;
+    row.depth = depth + 1;
+    row.containerId = container.id;
+    rows.push(row);
+  }
+  for (const root of roots) emitRoot(root);
+  return rows;
+}
+
+function displayRows() {
+  const source = topLevelSource();
   const decoders = state.decoders || [];
-  const groups = decoders.map((decoder) => {
-    const indexes = decoderIndexes(decoder);
+  const topDecoders = decoders.filter((decoder) => {
+    if (isStackChild(decoder)) return false;
+    return !deepestContainerFor(decoderIndexes(decoder));
+  });
+  const groups = topDecoders.map((decoder) => {
+    const indexes = clusterChannels(decoder);
     let anchor = -1;
     source.forEach((row, index) => {
       if (anchor >= 0) return;
-      if (row.kind === "logic" && indexes.includes(row.channel)) anchor = index;
+      if (row.kind === "logic" && indexes.has(row.channel)) anchor = index;
     });
     return {
       id: decoder.id,
       anchor,
-      stackOn: decoder.stack_on || "",
-      rows: groupRows(decoder, source),
+      rows: renderCluster(decoder, orderedSourceRows(), 0, null),
     };
   });
   const claimed = new Set();
+  for (const decoder of topDecoders) {
+    for (const index of clusterChannels(decoder)) claimed.add(index);
+  }
+  const nestedClaims = new Set();
   for (const decoder of decoders) {
-    for (const index of decoderIndexes(decoder)) claimed.add(index);
+    if (isStackChild(decoder)) continue;
+    if (!deepestContainerFor(decoderIndexes(decoder))) continue;
+    for (const index of clusterChannels(decoder)) nestedClaims.add(index);
   }
   const out = [];
   const placed = new Set();
-  const waitingOnParent = (group) => group.stackOn && groups.some((item) => item.id === group.stackOn && !placed.has(item.id));
   const placeGroup = (group) => {
     if (placed.has(group.id)) return;
     out.push(...group.rows);
     placed.add(group.id);
-    for (const child of groups) {
-      if (!placed.has(child.id) && child.stackOn === group.id) placeGroup(child);
-    }
   };
   source.forEach((row, index) => {
     for (const group of groups) {
-      if (group.anchor !== index || placed.has(group.id) || waitingOnParent(group)) continue;
+      if (group.anchor !== index || placed.has(group.id)) continue;
       placeGroup(group);
     }
-    if (row.kind === "logic" && claimed.has(row.channel)) return;
+    if (row.kind === "logic" && (claimed.has(row.channel) || nestedClaims.has(row.channel))) return;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus) {
+      out.push(...renderContainer(row.bus, 0, claimed));
+      return;
+    }
     out.push(row);
   });
-  let guard = groups.length + 1;
-  while (placed.size < groups.length && guard-- > 0) {
-    const next = groups.find((group) => !placed.has(group.id) && !waitingOnParent(group));
-    if (!next) break;
-    placeGroup(next);
-  }
   for (const group of groups) {
     if (!placed.has(group.id)) placeGroup(group);
   }
@@ -377,9 +624,11 @@ function channelIsEnabled(index) {
 
 function rowEnabled(row) {
   if (row.kind === "lane" || row.kind === "condense" || row.kind === "decode") return true;
-  if (row.kind === "bus") {
+  if (row.kind === "bus" || row.kind === "group") {
     if (row.bus && row.bus.decode) return true;
-    return row.bus.channels.some((index) => channelIsEnabled(index));
+    const indexes = row.bus ? descendantChannels(row.bus) : [];
+    if (!indexes.length) return true;
+    return indexes.some((index) => channelIsEnabled(index));
   }
   if (row.kind === "analog") return state.analog.length > 0;
   const probe = probeForRow(row);
@@ -472,29 +721,36 @@ function applyStatus(status, fromLive) {
   paintWait();
 }
 
+function fitSpp() {
+  const width = Math.max(1, wave.clientWidth || 1);
+  if (state.total <= 0) return 1;
+  return state.total / width;
+}
+
 function fitView() {
   const v = view();
-  const width = Math.max(1, wave.clientWidth || 1);
   if (state.total <= 0) {
     v.start = 0;
     v.spp = 1;
     return;
   }
-  const fit = state.total / width;
   v.start = 0;
-  v.spp = fit;
+  v.spp = fitSpp();
 }
 
 function clampView() {
   const v = view();
   const width = Math.max(1, wave.clientWidth || 1);
-  const span = width * v.spp;
   if (state.total <= 0) {
     v.start = 0;
     return;
   }
+  const fit = fitSpp();
+  if (!(v.spp > 0) || v.spp > fit) v.spp = fit;
+  const span = width * v.spp;
   if (span >= state.total) {
     v.start = 0;
+    v.spp = fit;
     return;
   }
   if (v.start < 0) v.start = 0;
@@ -520,12 +776,30 @@ function renderChrome() {
   renderMeasureList();
   drawRuler();
   syncTimebaseLabel();
+  syncTriggerToolbar();
+}
+
+function paintRunIcon() {
+  const icon = runBtn.querySelector(".run-icon");
+  if (!icon) return;
+  const mode = settings.run === "repeat" || settings.run === "loop"
+    ? settings.run
+    : (settings.depth === "stream" ? "stream" : "single");
+  icon.dataset.mode = mode;
+  const titles = {
+    single: "Run capture. Right-click to choose repeat or loop.",
+    stream: "Run capture. Right-click to choose repeat or loop.",
+    repeat: "Repeat capture. Right-click to change run mode.",
+    loop: "Loop capture. Right-click to change run mode.",
+  };
+  runBtn.title = titles[mode] || titles.single;
 }
 
 function paintStatus() {
   const live = isLive(state.phase);
   runBtn.disabled = live || commandBusy;
   stopBtn.disabled = !live || commandBusy;
+  paintRunIcon();
   const name = document.getElementById("device-name");
   if (name) name.textContent = settings.deviceName;
   if (state.error) {
@@ -541,16 +815,165 @@ function paintStatus() {
   statusEl.textContent = `${state.phase} | ${count} samples | ${formatHz(state.rate)}${captured}${trigger}${hover}`;
 }
 
+let sessionRename = null;
+
 function renderTabs() {
+  if (sessionRename) return;
   tabsEl.replaceChildren();
   for (const session of state.sessions) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "tab" + (session.id === state.active ? " active" : "");
     button.textContent = session.name;
-    button.addEventListener("click", () => selectSession(session.id));
+    button.title = "Double-click to rename";
+    button.addEventListener("click", (ev) => {
+      if (ev.detail > 1) return;
+      selectSession(session.id);
+    });
+    button.addEventListener("dblclick", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      startSessionRename(session, button);
+    });
     tabsEl.appendChild(button);
   }
+}
+
+function startSessionRename(session, button) {
+  const input = document.createElement("input");
+  input.className = "rename";
+  input.value = session.name;
+  input.setAttribute("aria-label", "Capture name");
+  sessionRename = session.id;
+  button.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    if (commit && next && next !== session.name) {
+      try {
+        await api({ cmd: "rename_session", id: session.id, name: next });
+      } catch (err) {
+        statusEl.textContent = err.message;
+      }
+    }
+    sessionRename = null;
+    await refreshSessions();
+  };
+  input.addEventListener("keydown", (ev) => {
+    ev.stopPropagation();
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      finish(true);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("mousedown", (ev) => ev.stopPropagation());
+  input.addEventListener("click", (ev) => ev.stopPropagation());
+}
+
+function ensureSelection() {
+  const v = view();
+  if (!Array.isArray(v.selection)) {
+    v.selection = v.selected ? [v.selected] : [];
+    if (v.anchor == null) v.anchor = v.selected || null;
+  }
+  return v;
+}
+
+function applySelection(key, ev) {
+  const v = ensureSelection();
+  const keys = layoutRows().map((row) => row.key);
+  if (ev.shiftKey && v.anchor && keys.includes(v.anchor) && keys.includes(key)) {
+    const start = keys.indexOf(v.anchor);
+    const end = keys.indexOf(key);
+    const [lo, hi] = start < end ? [start, end] : [end, start];
+    v.selection = keys.slice(lo, hi + 1);
+  } else if (ev.ctrlKey || ev.metaKey) {
+    const next = new Set(v.selection);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    v.selection = [...next];
+    v.anchor = key;
+  } else {
+    v.selection = [key];
+    v.anchor = key;
+  }
+  v.selected = v.anchor || v.selection[0] || null;
+  state.gutterSig = "";
+  renderGutter();
+}
+
+function selectOnly(key) {
+  applySelection(key, { shiftKey: false, ctrlKey: false, metaKey: false });
+}
+
+function selectedAncestorCovers(row, selected) {
+  let container = null;
+  if (row.kind === "logic" && row.containerId != null) {
+    container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId)) || null;
+  } else if (containerHeader(row)) {
+    container = parentContainer(row.bus.id);
+  }
+  let guard = 0;
+  while (container && guard++ < 32) {
+    if (selected.has("bus:" + container.id)) return true;
+    container = parentContainer(container.id);
+  }
+  return false;
+}
+
+function selectedGroupMembers() {
+  const selected = new Set(ensureSelection().selection);
+  const members = [];
+  const seenChannels = new Set();
+  const seenGroups = new Set();
+  for (const row of layoutRows()) {
+    if (!selected.has(row.key) || selectedAncestorCovers(row, selected)) continue;
+    if (row.kind === "logic") {
+      const index = Number(row.channel);
+      if (!Number.isFinite(index) || seenChannels.has(index)) continue;
+      seenChannels.add(index);
+      members.push({ kind: "channel", index });
+      continue;
+    }
+    if (!containerHeader(row)) continue;
+    const id = Number(row.bus.id);
+    if (!Number.isFinite(id) || seenGroups.has(id)) continue;
+    seenGroups.add(id);
+    members.push({ kind: "group", id });
+  }
+  return members;
+}
+
+function memberLeafChannels(members) {
+  const out = [];
+  for (const member of members || []) {
+    if (member.kind === "channel") out.push(Number(member.index));
+    else if (member.kind === "group") {
+      const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+      if (child) out.push(...descendantChannels(child));
+    }
+  }
+  return out;
+}
+
+function memberCurrentParent(member) {
+  if (!member) return null;
+  if (member.kind === "channel") return directParentOfChannel(member.index);
+  return parentContainer(member.id);
+}
+
+function memberMatches(member, item) {
+  if (!member || !item) return false;
+  if (item.kind === "channel") return member.kind === "channel" && Number(member.index) === Number(item.index);
+  return member.kind === "group" && Number(member.id) === Number(item.id);
 }
 
 let channelDrag = null;
@@ -582,11 +1005,7 @@ function finishChannelDrag() {
   const drag = channelDrag;
   channelDrag = null;
   highlightChannel(null);
-  if (!drag.moved) {
-    view().selected = drag.key;
-    state.gutterSig = "";
-    renderGutter();
-  }
+  if (!drag.moved) selectOnly(drag.key);
 }
 
 function startChannelDrag(key, startY) {
@@ -678,7 +1097,9 @@ function startRowResize(key, startY) {
 let foldAnim = null;
 
 function rowFolded(row) {
-  return row.kind === "decode" && decoderCondensed(row.decoderId, row.lane);
+  if (row.kind === "decode") return decoderCondensed(row.decoderId, row.lane);
+  if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) return !!row.bus.folded;
+  return false;
 }
 
 function foldButton(row, folded) {
@@ -701,6 +1122,14 @@ function foldButton(row, folded) {
   button.addEventListener("click", (ev) => {
     ev.stopPropagation();
     foldAnim = row.key;
+    if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) {
+      row.bus.folded = !row.bus.folded;
+      state.gutterSig = "";
+      renderGutter();
+      drawWave();
+      scheduleTiles();
+      return;
+    }
     const pref = decodePref(row.decoderId);
     if (row.lane) {
       if (!pref.lanes) pref.lanes = {};
@@ -730,8 +1159,8 @@ function foldSpacer() {
 
 function renderGutter() {
   const metrics = rowMetrics();
-  const selected = view().selected;
-  const sig = metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.key === selected ? "s" : "")).join("|");
+  const selected = new Set(ensureSelection().selection);
+  const sig = [...selected].join(",") + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.depth || 0) + (selected.has(item.row.key) ? "s" : "") + ((item.row.bus && item.row.bus.radix) || "") + ((item.row.bus && item.row.bus.msbFirst) ? "m" : "")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
@@ -740,15 +1169,17 @@ function renderGutter() {
     const folded = rowFolded(row);
     const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
-    el.className = "ch" + (row.child ? " child" : "") + (row.key === selected ? " selected" : "") + (dim ? " dim" : "");
+    el.className = "ch" + (row.child ? " child" : "") + (selected.has(row.key) ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
+    if ((row.depth || 0) > 1) el.style.setProperty("--nest", ((row.depth - 1) * 14) + "px");
     el.style.height = item.height + "px";
     el.style.flex = "none";
     el.title = row.device ? `${signalName(row)} · ${row.device}` : signalName(row);
     const bar = document.createElement("span");
     bar.className = "bar";
-    el.style.setProperty("--channel-color", row.color);
-    bar.style.background = row.color;
+    const shown = traceColor(row.color);
+    el.style.setProperty("--channel-color", shown);
+    bar.style.background = shown;
     bar.title = "Channel color";
     bar.addEventListener("mousedown", (ev) => {
       ev.preventDefault();
@@ -800,18 +1231,31 @@ function renderGutter() {
       ev.stopPropagation();
       startRowResize(row.key, ev.clientY);
     });
-    if (row.kind === "decode") el.append(bar, foldButton(row, folded), name, kind, eye, handle);
+    const foldable = row.kind === "decode" || ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode);
+    if (foldable) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
       if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
+      if (ev.shiftKey || ev.ctrlKey || ev.metaKey) {
+        ev.preventDefault();
+        applySelection(row.key, ev);
+        return;
+      }
       startChannelDrag(row.key, ev.clientY);
     });
-    if ((row.kind === "bus" || row.kind === "decode") && row.bus) {
-      el.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
+    el.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      if ((row.kind === "bus" || row.kind === "decode") && row.bus && row.bus.decode) {
         openBusMenu(row.bus, ev.clientX, ev.clientY);
-      });
-    }
+        return;
+      }
+      if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) {
+        openContainerMenu(row.bus, ev.clientX, ev.clientY);
+        return;
+      }
+      if (!ensureSelection().selection.includes(row.key)) selectOnly(row.key);
+      openSignalMenu(row, ev.clientX, ev.clientY);
+    });
     gutter.appendChild(el);
   }
 }
@@ -862,13 +1306,177 @@ function eyeIcon(hidden) {
 
 function moveChannel(fromKey, toKey) {
   if (!fromKey || fromKey === toKey) return;
-  const keys = orderedRows().map((row) => row.key);
+  const rows = orderedRows();
+  const from = rows.find((row) => row.key === fromKey);
+  const to = rows.find((row) => row.key === toKey);
+  if (!from || !to) return;
+  const parent = sharedMemberParent(from, to);
+  if (parent) {
+    reorderMembers(parent, from, to);
+    state.gutterSig = "";
+    renderGutter();
+    drawWave();
+    return;
+  }
+  const container = dropContainer(to);
+  if (container && plainLogic(from)) {
+    insertChannelInContainer(from, container, to);
+    return;
+  }
+  if (container && containerHeader(from) && Number(container.id) !== Number(from.bus.id)) {
+    insertGroupInContainer(from, container, to);
+    return;
+  }
+  if (isTopLevelRow(from) && isTopLevelRow(to)) reorderTopLevel(fromKey, toKey);
+}
+
+function plainLogic(row) {
+  return !!row && row.kind === "logic" && !row.decoderId;
+}
+
+function containerHeader(row) {
+  return !!(row && row.header && row.bus && !row.bus.decode && (row.kind === "group" || row.kind === "bus"));
+}
+
+function dropContainer(row) {
+  if (!row) return null;
+  if ((row.kind === "group" || row.kind === "bus") && row.bus && !row.bus.decode) return row.bus;
+  if (row.containerId == null) return null;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  return container && !container.decode ? container : null;
+}
+
+function detachChannel(index) {
+  const wanted = Number(index);
+  for (const container of sessionContainers()) {
+    container.members = (container.members || []).filter((member) => !(member.kind === "channel" && Number(member.index) === wanted));
+    container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  }
+}
+
+function insertChannelInContainer(fromRow, container, toRow) {
+  const index = Number(fromRow.channel);
+  let at = 0;
+  if (!(toRow.header && toRow.bus && Number(toRow.bus.id) === Number(container.id))) {
+    const target = memberPosition(container, toRow);
+    at = target >= 0 ? target : (container.members || []).length;
+  }
+  const fromAt = memberPosition(container, fromRow);
+  if (fromAt >= 0 && fromAt < at) at -= 1;
+  detachChannel(index);
+  const members = container.members || (container.members = []);
+  members.splice(Math.max(0, Math.min(at, members.length)), 0, { kind: "channel", index });
+  container.channels = members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function groupContains(container, id, guard = 0) {
+  if (!container || guard > 32) return false;
+  const wanted = Number(id);
+  if (Number(container.id) === wanted) return true;
+  for (const member of container.members || []) {
+    if (member.kind !== "group") continue;
+    if (Number(member.id) === wanted) return true;
+    const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+    if (child && groupContains(child, wanted, guard + 1)) return true;
+  }
+  return false;
+}
+
+function detachGroupMember(id) {
+  const wanted = Number(id);
+  for (const container of sessionContainers()) {
+    const members = container.members || [];
+    if (!members.some((member) => member.kind === "group" && Number(member.id) === wanted)) continue;
+    container.members = members.filter((member) => !(member.kind === "group" && Number(member.id) === wanted));
+    container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  }
+}
+
+function forgetTopLevelKey(key) {
+  const order = view().order;
+  if (!order || !order.includes(key)) return;
+  persistOrder(order.filter((item) => item !== key));
+}
+
+function insertGroupInContainer(fromRow, container, toRow) {
+  const id = Number(fromRow.bus.id);
+  if (!Number.isFinite(id) || !container || Number(container.id) === id) return;
+  if (groupContains(fromRow.bus, container.id)) return;
+  let at = 0;
+  if (!(toRow.header && toRow.bus && Number(toRow.bus.id) === Number(container.id))) {
+    const target = memberPosition(container, toRow);
+    at = target >= 0 ? target : (container.members || []).length;
+  }
+  const fromAt = memberPosition(container, fromRow);
+  if (fromAt >= 0 && fromAt < at) at -= 1;
+  detachGroupMember(id);
+  forgetTopLevelKey("bus:" + id);
+  const members = container.members || (container.members = []);
+  members.splice(Math.max(0, Math.min(at, members.length)), 0, { kind: "group", id });
+  container.channels = members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function isTopLevelRow(row) {
+  if (!row || row.decoderId) return false;
+  if (row.child && !row.header) return false;
+  return (row.depth || 0) === 0;
+}
+
+function rowMemberParent(row) {
+  if (!row) return null;
+  if (row.kind === "logic" && !row.decoderId && row.containerId != null && !row.header) {
+    return sessionContainers().find((item) => Number(item.id) === Number(row.containerId)) || null;
+  }
+  if (row.header && row.bus && (row.depth || 0) > 0) return parentContainer(row.bus.id);
+  return null;
+}
+
+function sharedMemberParent(from, to) {
+  const parent = rowMemberParent(from);
+  if (!parent || parent !== rowMemberParent(to)) return null;
+  if (memberPosition(parent, from) < 0 || memberPosition(parent, to) < 0) return null;
+  return parent;
+}
+
+function memberPosition(container, row) {
+  if (!container || !row) return -1;
+  if (row.kind === "logic" && !row.decoderId && Number(row.containerId) === Number(container.id)) {
+    return container.members.findIndex((member) => member.kind === "channel" && Number(member.index) === Number(row.channel));
+  }
+  if (row.header && row.bus && parentContainer(row.bus.id) && Number(parentContainer(row.bus.id).id) === Number(container.id)) {
+    return container.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(row.bus.id));
+  }
+  return -1;
+}
+
+function reorderMembers(container, fromRow, toRow) {
+  const from = memberPosition(container, fromRow);
+  const to = memberPosition(container, toRow);
+  if (from < 0 || to < 0 || from === to) return;
+  const [moved] = container.members.splice(from, 1);
+  container.members.splice(to, 0, moved);
+  container.channels = container.members.filter((member) => member.kind === "channel").map((member) => member.index);
+}
+
+function reorderTopLevel(fromKey, toKey) {
+  const keys = topLevelSource().map((row) => row.key);
   const from = keys.indexOf(fromKey);
   const to = keys.indexOf(toKey);
   if (from < 0 || to < 0) return;
   const [moved] = keys.splice(from, 1);
   keys.splice(to, 0, moved);
-  persistOrder(keys);
+  const keep = (view().order || []).filter((key) => !keys.includes(key));
+  persistOrder([...keys, ...keep]);
   state.gutterSig = "";
   renderGutter();
   drawWave();
@@ -946,22 +1554,113 @@ function drawDiamond(ctx, x, y, color) {
   ctx.fill();
 }
 
+function lightTheme() {
+  return document.documentElement.dataset.theme === "light";
+}
+
+function wavePalette() {
+  if (lightTheme()) {
+    return {
+      bg: "#f4efe4",
+      bgAlt: "#e6dcc8",
+      ink: "#243140",
+      grid: "rgba(36, 49, 64, 0.12)",
+      timeGrid: "rgba(36, 72, 110, 0.18)",
+      logicGuide: "rgba(36, 49, 64, 0.16)",
+      analogGuide: "rgba(36, 49, 64, 0.22)",
+      label: "#3d4e62",
+      hover: "rgba(23, 37, 52, 0.35)",
+      empty: "#5c6b7e",
+      halo: "rgba(244, 239, 228, 0.92)",
+      measure: "#16345c",
+    };
+  }
+  return {
+    bg: "#0b0f14",
+    bgAlt: "#141b24",
+    ink: "#d5deea",
+    grid: "rgba(255,255,255,0.045)",
+    timeGrid: "rgba(86, 140, 190, 0.16)",
+    logicGuide: "rgba(140, 170, 200, 0.14)",
+    analogGuide: "rgba(140, 170, 200, 0.18)",
+    label: "rgba(176, 188, 204, 0.55)",
+    hover: "rgba(255,255,255,0.28)",
+    empty: "#8b95a6",
+    halo: "rgba(8, 12, 18, 0.9)",
+    measure: "#d5e2ff",
+  };
+}
+
+function hslToHex(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = ((h % 360) + 360) % 360 / 60;
+  const x = c * (1 - Math.abs(hp % 2 - 1));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hp < 1) [r, g, b] = [c, x, 0];
+  else if (hp < 2) [r, g, b] = [x, c, 0];
+  else if (hp < 3) [r, g, b] = [0, c, x];
+  else if (hp < 4) [r, g, b] = [0, x, c];
+  else if (hp < 5) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  const m = l - c / 2;
+  const byte = (value) => Math.max(0, Math.min(255, Math.round((value + m) * 255))).toString(16).padStart(2, "0");
+  return "#" + byte(r) + byte(g) + byte(b);
+}
+
+// Display-only. Stored channel colors stay unchanged so dark theme and the picker keep the chosen hex.
+function traceColor(color) {
+  if (!lightTheme()) return color;
+  const text = String(color || "").trim();
+  const match = /^#([0-9a-fA-F]{6})$/.exec(text);
+  if (!match) return color;
+  const n = parseInt(match[1], 16);
+  const r = ((n >> 16) & 255) / 255;
+  const g = ((n >> 8) & 255) / 255;
+  const b = (n & 255) / 255;
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  if (lum < 0.55) return "#" + match[1].toLowerCase();
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const lightness = (max + min) / 2;
+  const delta = max - min;
+  const saturation = delta < 1e-6 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+  if (saturation < 0.18) return "#2c3a4a";
+  let hue = 0;
+  if (max === r) hue = ((g - b) / delta) % 6;
+  else if (max === g) hue = (b - r) / delta + 2;
+  else hue = (r - g) / delta + 4;
+  hue *= 60;
+  if (hue < 0) hue += 360;
+  return hslToHex(hue, saturation, 0.38);
+}
+
+function drawLaneBackgrounds(ctx, width, layout, palette) {
+  layout.forEach((item, index) => {
+    ctx.fillStyle = index % 2 ? palette.bgAlt : palette.bg;
+    ctx.fillRect(0, item.top, width, item.height);
+  });
+}
+
 function drawWave() {
   const metrics = rowMetrics();
   const { ctx, w, h } = prep(wave, metrics.total);
+  const palette = wavePalette();
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = "#0b0f14";
+  ctx.fillStyle = palette.bg;
   ctx.fillRect(0, 0, w, h);
   const layout = metrics.layout;
+  drawLaneBackgrounds(ctx, w, layout, palette);
   if (state.total <= 0 || layout.length === 0) {
-    ctx.fillStyle = "#8b95a6";
+    ctx.fillStyle = palette.empty;
     ctx.font = "14px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("Click Run to capture data", w / 2, h / 2);
     return;
   }
-  drawGrid(ctx, w, h, layout);
+  drawGrid(ctx, w, h, layout, palette);
   const endX = traceEndX(w);
   ctx.save();
   ctx.beginPath();
@@ -972,8 +1671,8 @@ function drawWave() {
     if (state.hidden.has(row.key)) continue;
     const cols = state.tiles[row.tileKey || row.key];
     if (!cols) continue;
-    if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, row.color);
-    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, row.color);
+    if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, traceColor(row.color));
+    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, traceColor(row.color));
   }
   drawBuses(ctx, layout);
   drawCondensedRows(ctx, w, layout);
@@ -988,10 +1687,10 @@ function drawWave() {
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.lineWidth = 3;
-    ctx.strokeStyle = "rgba(8, 12, 18, 0.9)";
+    ctx.strokeStyle = palette.halo;
     ctx.strokeText("H", 8, top + pad);
     ctx.strokeText("L", 8, top + item.height - pad);
-    ctx.fillStyle = "#d5deea";
+    ctx.fillStyle = palette.ink;
     ctx.fillText("H", 8, top + pad);
     ctx.fillText("L", 8, top + item.height - pad);
   }
@@ -1013,7 +1712,7 @@ function drawWave() {
     ctx.restore();
   }
   if (state.hoverX != null) {
-    ctx.strokeStyle = "rgba(255,255,255,0.28)";
+    ctx.strokeStyle = palette.hover;
     ctx.beginPath();
     ctx.moveTo(state.hoverX + 0.5, 0);
     ctx.lineTo(state.hoverX + 0.5, h);
@@ -1074,7 +1773,7 @@ function drawHoverBoundaries(ctx, width, layout) {
   ctx.restore();
 }
 
-function drawGrid(ctx, w, h, layout) {
+function drawGrid(ctx, w, h, layout, palette = wavePalette()) {
   const v = view();
   ctx.save();
   ctx.lineWidth = 1;
@@ -1084,7 +1783,7 @@ function drawGrid(ctx, w, h, layout) {
     if (step && isFinite(step)) {
       const startSec = sampleSeconds(v.start);
       const first = Math.ceil(startSec / step) * step;
-      ctx.strokeStyle = "rgba(86, 140, 190, 0.16)";
+      ctx.strokeStyle = palette.timeGrid;
       for (let t = first; t < startSec + span + step * 0.01; t += step) {
         const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
         ctx.beginPath();
@@ -1098,14 +1797,14 @@ function drawGrid(ctx, w, h, layout) {
     const row = item.row;
     const top = item.top;
     const rowH = item.height;
-    ctx.strokeStyle = "rgba(255,255,255,0.045)";
+    ctx.strokeStyle = palette.grid;
     ctx.beginPath();
     ctx.moveTo(0, top + 0.5);
     ctx.lineTo(w, top + 0.5);
     ctx.stroke();
     if (row.kind === "logic") {
       const pad = Math.max(8, rowH * 0.22);
-      ctx.strokeStyle = "rgba(140, 170, 200, 0.14)";
+      ctx.strokeStyle = palette.logicGuide;
       ctx.beginPath();
       ctx.moveTo(0, top + pad + 0.5);
       ctx.lineTo(w, top + pad + 0.5);
@@ -1114,21 +1813,22 @@ function drawGrid(ctx, w, h, layout) {
       ctx.stroke();
     } else if (row.kind === "analog") {
       const mid = top + rowH / 2;
-      ctx.strokeStyle = "rgba(140, 170, 200, 0.18)";
+      ctx.strokeStyle = palette.analogGuide;
       ctx.beginPath();
       ctx.moveTo(0, mid + 0.5);
       ctx.lineTo(w, mid + 0.5);
       ctx.stroke();
-      ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
+      ctx.fillStyle = palette.label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
       ctx.fillText("1 V", 6, top + 12);
       ctx.fillText("0 V", 6, mid);
       ctx.fillText("−1 V", 6, top + rowH - 12);
-    } else if (row.kind === "bus" && row.bus && row.bus.analog) {
-      const max = row.bus.decode ? 255 : Math.max(1, (1 << row.bus.channels.length) - 1);
-      ctx.fillStyle = "rgba(176, 188, 204, 0.55)";
+    } else if (row.kind === "bus" && row.bus && (row.bus.analog || row.bus.radix === "analog")) {
+      const bits = descendantChannels(row.bus).length;
+      const max = bits ? (1n << BigInt(bits)) - 1n : 1n;
+      ctx.fillStyle = palette.label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
@@ -1186,7 +1886,7 @@ function drawMeasureSpan(ctx, w, h) {
     ctx.lineTo(x1 + 0.5, h);
     ctx.stroke();
     const seconds = Math.abs(span.b - span.a) / Math.max(1, state.rate);
-    ctx.fillStyle = "#d5e2ff";
+    ctx.fillStyle = wavePalette().measure;
     ctx.font = "11px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
@@ -1234,13 +1934,22 @@ function rowHiddenByDecoder(row) {
   return row.kind === "logic" && !!row.decoderId && decoderCondensed(row.decoderId, row.lane);
 }
 
+function busRadixLabel(bus) {
+  if (!bus || bus.analog || bus.radix === "analog") return "Analog";
+  if (bus.radix === "dec") return "Decimal";
+  if (bus.radix === "bin") return "Binary";
+  if (bus.radix === "oct") return "Octal";
+  return "Hex";
+}
+
 function rowKindLabel(row) {
+  if (row.kind === "group") return "Label";
   if (row.kind === "condense" || row.kind === "decode") {
     if (row.bus && row.bus.analog) return "Analog";
     return DECODE_FORMATS[decodeFormat(row.decoderId)] || "Hex";
   }
   if (row.kind === "analog") return "Analog";
-  if (row.kind === "bus") return row.bus && row.bus.analog ? "Analog" : "Bus";
+  if (row.kind === "bus") return busRadixLabel(row.bus);
   return "Digital";
 }
 
@@ -1309,12 +2018,13 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     if (x1 < 0 || x0 > canvasW) continue;
     const width = x1 - x0;
     traceHexagon(ctx, x0, top, width, height);
+    const shown = traceColor(color || "#3d8dfd");
     ctx.save();
-    ctx.fillStyle = color || "#3d8dfd";
+    ctx.fillStyle = shown;
     ctx.globalAlpha = alpha == null ? 0.36 : alpha;
     ctx.fill();
     ctx.globalAlpha = 0.92;
-    ctx.strokeStyle = color || "#c6dcff";
+    ctx.strokeStyle = shown;
     ctx.stroke();
     ctx.restore();
     const label = labelOf(row);
@@ -1324,7 +2034,7 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     ctx.beginPath();
     ctx.rect(x0 + point, top, Math.max(0, width - point * 2), height);
     ctx.clip();
-    ctx.fillStyle = "#f7fafc";
+    ctx.fillStyle = lightTheme() && (alpha == null || alpha < 0.7) ? wavePalette().ink : "#f7fafc";
     ctx.fillText(label, x0 + point + 4, top + height / 2);
     ctx.restore();
     lastLabel = x0 + Math.min(width, ctx.measureText(label).width + point + 10);
@@ -1346,7 +2056,7 @@ function drawDecodeOverlay(ctx, canvasW, metrics) {
       const item = logicRow(layout, target.channel, target.decoderId || decoder.id, target.lane);
       if (!item) continue;
       const pad = Math.max(8, item.height * 0.22);
-      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, item.row.color, canvasW, target.label);
+      drawHexagons(ctx, rows, item.top + pad, item.top + item.height - pad, traceColor(item.row.color), canvasW, target.label);
     }
   }
   ctx.restore();
@@ -1420,20 +2130,20 @@ function drawCondensedRows(ctx, canvasW, layout) {
     if (format === "analog") {
       const lane = item.row.lane;
       if (lane) {
-        drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color, (row) => parseInt((row.fields || {})[lane], 16));
+        drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color), (row) => parseInt((row.fields || {})[lane], 16));
       } else {
         const fields = rows[0] && rows[0].fields;
         if (fields && (fields.mosi || fields.miso)) {
-          drawStepSeries(ctx, rows, bandTop, bandBot, "#ff6b8a", (row) => parseInt((row.fields || {}).mosi, 16));
-          drawStepSeries(ctx, rows, bandTop, bandBot, "#7dcea0", (row) => parseInt((row.fields || {}).miso, 16));
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor("#ff6b8a"), (row) => parseInt((row.fields || {}).mosi, 16));
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor("#7dcea0"), (row) => parseInt((row.fields || {}).miso, 16));
         } else {
-          drawStepSeries(ctx, rows, bandTop, bandBot, item.row.color || "#8eb6ff", (row) => {
+          drawStepSeries(ctx, rows, bandTop, bandBot, traceColor(item.row.color || "#8eb6ff"), (row) => {
             const values = annotationNumbers(row);
             return values.length ? values[0] : NaN;
           });
         }
       }
-      ctx.fillStyle = "rgba(176, 188, 204, 0.7)";
+      ctx.fillStyle = wavePalette().label;
       ctx.font = "10px sans-serif";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
@@ -1444,7 +2154,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
     const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane) : (row) => condensedLabel(row, format);
-    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, item.row.color, canvasW, labelOf, 0.82);
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82);
   }
 }
 
@@ -1569,14 +2279,25 @@ function drawAnalog(ctx, cols, top, height, color) {
   ctx.stroke();
 }
 
-function busValueAt(bus, index) {
-  let value = 0;
-  for (let bit = 0; bit < bus.channels.length; bit++) {
-    const cols = state.tiles["logic:" + bus.channels[bit]];
+function busValueAt(bus, index, channels) {
+  const bitsSource = channels || descendantChannels(bus);
+  let value = 0n;
+  const bits = bitsSource.length;
+  for (let bit = 0; bit < bits; bit++) {
+    const cols = state.tiles["logic:" + bitsSource[bit]];
     const column = cols && cols[index];
-    if (column && column.valid !== false && column.last) value |= 1 << bit;
+    if (!(column && column.valid !== false && column.last)) continue;
+    const shift = bus.msbFirst ? BigInt(bits - 1 - bit) : BigInt(bit);
+    value |= 1n << shift;
   }
   return value;
+}
+
+function formatBusValue(value, radix, bits) {
+  if (radix === "dec") return value.toString(10);
+  if (radix === "bin") return value.toString(2).padStart(Math.max(1, bits), "0");
+  if (radix === "oct") return value.toString(8);
+  return "0x" + value.toString(16).toUpperCase();
 }
 
 function drawDecodeBus(ctx, item, bus) {
@@ -1603,13 +2324,13 @@ function drawDecodeBus(ctx, item, bus) {
       }
       ctx.stroke();
     };
-    stroke("mosi", "#ff6b8a");
-    stroke("miso", "#7dcea0");
+    stroke("mosi", traceColor("#ff6b8a"));
+    stroke("miso", traceColor("#7dcea0"));
     return;
   }
   ctx.font = "12px sans-serif";
   ctx.textBaseline = "middle";
-  ctx.fillStyle = "#d5deea";
+  ctx.fillStyle = wavePalette().ink;
   let lastX = -80;
   for (const word of words) {
     const x = sampleX(word.start_sample);
@@ -1620,29 +2341,91 @@ function drawDecodeBus(ctx, item, bus) {
   }
 }
 
-function drawBuses(ctx, layout) {
-  for (const item of layout) {
-    const row = item.row;
-    if (row.kind !== "bus" || state.hidden.has(row.key)) continue;
-    const bus = row.bus;
-    if (bus.decode) {
-      drawDecodeBus(ctx, item, bus);
+function drawLabelBar(ctx, item) {
+  const pad = Math.max(8, item.height * 0.22);
+  const span = Math.max(1, item.height - pad * 2);
+  const barH = Math.max(2, span / 3);
+  const y = item.top + (item.height - barH) / 2;
+  ctx.fillStyle = traceColor(item.row.color);
+  ctx.fillRect(0, y, Math.max(wave.clientWidth || 0, 1), barH);
+}
+
+function busColumns(channels) {
+  let cols = null;
+  for (const index of channels) {
+    const candidate = state.tiles["logic:" + index];
+    if (candidate && (!cols || candidate.length > cols.length)) cols = candidate;
+  }
+  return cols;
+}
+
+function busValueRuns(bus, channels, cols) {
+  const bits = channels.length;
+  const runs = [];
+  let prev = null;
+  let start = 0;
+  let last = -1;
+  for (let i = 0; i < cols.length; i++) {
+    if (tileSample(i) >= state.total) break;
+    last = i;
+    const value = busValueAt(bus, i, channels);
+    if (prev == null) {
+      prev = value;
+      start = i;
       continue;
     }
-    const cols = state.tiles["logic:" + bus.channels[0]];
+    if (value !== prev) {
+      runs.push({ start_sample: tileSample(start), end_sample: tileSample(i), value: prev, bits });
+      prev = value;
+      start = i;
+    }
+  }
+  if (prev != null && last >= start) {
+    const spp = state.tileView && state.tileView.spp > 0 ? state.tileView.spp : view().spp;
+    runs.push({
+      start_sample: tileSample(start),
+      end_sample: tileSample(last) + spp,
+      value: prev,
+      bits,
+    });
+  }
+  return runs;
+}
+
+function drawBuses(ctx, layout) {
+  const canvasW = Math.max(wave.clientWidth || 0, 1);
+  for (const item of layout) {
+    const row = item.row;
+    if ((row.kind !== "bus" && row.kind !== "group") || state.hidden.has(row.key)) continue;
+    const bus = row.bus;
+    if (!bus) continue;
+    if (bus.decode) {
+      if (row.kind === "bus") drawDecodeBus(ctx, item, bus);
+      continue;
+    }
+    if (bus.type === "group" || row.kind === "group") {
+      drawLabelBar(ctx, item);
+      continue;
+    }
+    const channels = descendantChannels(bus);
+    if (!channels.length) continue;
+    const cols = busColumns(channels);
     if (!cols) continue;
     const pad = Math.max(8, item.height * 0.22);
     const top = item.top + pad;
     const bot = item.top + item.height - pad;
-    const max = Math.max(1, (1 << bus.channels.length) - 1);
-    if (bus.analog) {
+    const bits = channels.length;
+    const color = traceColor(row.color);
+    const analog = bus.analog || bus.radix === "analog";
+    if (analog) {
+      const max = Number((1n << BigInt(bits)) - 1n) || 1;
       ctx.beginPath();
-      ctx.strokeStyle = "#7dcea0";
+      ctx.strokeStyle = color;
       ctx.lineWidth = 1.4;
       let started = false;
       for (let i = 0; i < cols.length; i++) {
         if (tileSample(i) >= state.total) break;
-        const y = bot - (busValueAt(bus, i) / max) * (bot - top);
+        const y = bot - (Number(busValueAt(bus, i, channels)) / max) * (bot - top);
         const x = traceX(i);
         if (!started) {
           ctx.moveTo(x, y);
@@ -1652,24 +2435,13 @@ function drawBuses(ctx, layout) {
       ctx.stroke();
       continue;
     }
+    const runs = busValueRuns(bus, channels, cols);
+    const hexH = Math.min(48, Math.max(16, bot - top));
+    const mid = (top + bot) / 2;
     ctx.font = "12px sans-serif";
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = "#d5deea";
-    let prev = null;
-    let lastX = -100;
-    for (let i = 0; i < cols.length; i++) {
-      if (tileSample(i) >= state.total) break;
-      const value = busValueAt(bus, i);
-      const x = traceX(i);
-      if (prev == null) prev = value;
-      if (value !== prev || i === 0) {
-        if (x - lastX > 36) {
-          ctx.fillText("0x" + value.toString(16).toUpperCase(), x + 4, (top + bot) / 2);
-          lastX = x;
-        }
-        prev = value;
-      }
-    }
+    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82);
   }
 }
 
@@ -1733,12 +2505,20 @@ async function runTiles() {
 function tileRequests() {
   const seen = new Set();
   const rows = [];
-  for (const row of visibleRows()) {
-    if (row.kind !== "logic" && row.kind !== "analog") continue;
-    const key = row.tileKey || row.key;
-    if (seen.has(key)) continue;
+  const add = (row, key) => {
+    if (seen.has(key)) return;
     seen.add(key);
     rows.push({ row, key });
+  };
+  for (const row of visibleRows()) {
+    if (row.kind !== "logic" && row.kind !== "analog") continue;
+    add(row, row.tileKey || row.key);
+  }
+  for (const bus of sessionContainers()) {
+    if (bus.type === "group" || bus.decode) continue;
+    for (const index of descendantChannels(bus)) {
+      add({ kind: "logic", channel: index, tileKey: "logic:" + index }, "logic:" + index);
+    }
   }
   return rows;
 }
@@ -1794,24 +2574,44 @@ async function fetchTiles() {
   }
   if (state.req !== req) return;
   const now = view();
-  const sameView = now.start === start
-    && now.spp === spp
-    && Math.max(1, Math.floor(wave.clientWidth || 1)) === width;
-  if (!sameView) {
+  const widthNow = Math.max(1, Math.floor(wave.clientWidth || 1));
+  if (now.spp !== spp || widthNow !== width) {
     tileAgain = true;
     return;
   }
-  if (Object.keys(pending.got).length) {
+  const got = Object.keys(pending.got).length;
+  if (got) {
     const previous = state.tileView;
     const sameTileView = previous
       && previous.start === start
       && previous.spp === spp
       && previous.width === width;
-    state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
-    state.tileView = { start, spp, width };
-    drawWave();
-    drawRuler();
+    const complete = got >= pending.expect;
+    const next = { start, spp, width };
+    const panning = pointer && pointer.kind === "pan";
+    const accept = sameTileView || (complete && (
+      !panning || tileOverlap(next, now.start, now.spp, widthNow) >= tileOverlap(previous, now.start, now.spp, widthNow)
+    ));
+    if (accept) {
+      state.tiles = sameTileView ? Object.assign({}, state.tiles, pending.got) : pending.got;
+      state.tileView = next;
+      if (panning) scheduleViewPaint();
+      else {
+        drawWave();
+        drawRuler();
+      }
+    }
   }
+  if (now.start !== start) tileAgain = true;
+}
+
+function tileOverlap(tile, viewStart, viewSpp, viewWidth) {
+  if (!tile || !(tile.spp > 0) || !(viewSpp > 0)) return 0;
+  const a0 = tile.start;
+  const a1 = tile.start + tile.width * tile.spp;
+  const b0 = viewStart;
+  const b1 = viewStart + viewWidth * viewSpp;
+  return Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
 }
 
 async function httpTiles(req, bodies, pending) {
@@ -1934,13 +2734,13 @@ async function runCapture() {
   try {
     view().userNavigated = false;
     state.captureStarted = performance.now();
-    state.planned = Math.floor(settings.rate * settings.duration / 1000);
-    state.planned -= state.planned % 64;
+    state.planned = samplesForDuration(settings.durationNs, settings.rate);
     const status = await api({
       cmd: "configure",
       session: state.active,
       sample_rate_hz: settings.rate,
-      duration_ms: settings.duration,
+      duration_ms: Math.round(settings.durationNs / 1e6),
+      duration_ns: settings.durationNs,
       realtime: true,
       trigger_enabled: settings.trigger,
       trigger_percent: settings.percent,
@@ -2001,13 +2801,19 @@ function panelHtml(name) {
   if (name === "decode") {
     const query = escapeHtml(state.decodeQuery || "");
     return `<div class="decode-heading"><h2>Decode</h2>
-        <button class="decode-help" type="button" aria-label="Decoder panel help" title="Choose a protocol and press plus to add it. Select an enabled decoder to show its table; use its gear to configure channels, options, and overlay, or its trash icon to remove it. The arrow beside each decoded bus folds or shows its waveform channels, and the eye hides a row. A channel used by multiple decoders appears in each group.">?</button>
+        <button class="decode-help" type="button" aria-label="Decoder panel help" title="Open the protocol list, type to filter decoders, and press plus to add the highlighted one. Select an enabled decoder to show its table; use its gear to configure channels, options, and overlay, or its trash icon to remove it. The arrow beside each decoded bus folds or shows its waveform channels, and the eye hides a row. A channel used by multiple decoders appears in each group.">?</button>
       </div>
       <label class="decode-protocol-label" for="decoder-kind">Protocol</label>
       <div class="decode-add-row">
-        <select id="decoder-kind">
-          ${state.decoderCatalog.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("")}
-        </select>
+        <div class="decoder-picker" id="decoder-kind-picker">
+          <button type="button" id="decoder-kind" class="decoder-kind" aria-haspopup="listbox" aria-expanded="false" aria-controls="decoder-kind-list">
+            <span id="decoder-kind-label"></span>
+          </button>
+          <div id="decoder-kind-menu" class="decoder-kind-menu hidden">
+            <input id="decoder-kind-search" type="search" placeholder="Search decoders" aria-label="Search decoders" aria-controls="decoder-kind-list" aria-autocomplete="list" autocomplete="off" spellcheck="false">
+            <ul id="decoder-kind-list" role="listbox"></ul>
+          </div>
+        </div>
         <button id="add-decoder" class="decode-add" type="button" title="Add decoder" aria-label="Add decoder"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
       </div>
       <div class="decode-list-label">Enabled decoders</div>
@@ -2033,13 +2839,7 @@ function panelHtml(name) {
       <button class="block" id="pat-prev" type="button">Previous match</button>`;
   }
   if (name === "export") {
-    return `<h2>Export</h2>
-      <button class="block" id="export-csv" type="button">Save CSV…</button>
-      <button class="block" id="export-xlsx" type="button">Save Excel…</button>
-      <button class="block" id="download" type="button">Save .lvcap…</button>
-      <button class="block" id="download-dsl" type="button">Save .dsl…</button>
-      <button class="block" id="export-ann" type="button">Export annotations</button>
-      <p class="hint">Saving a capture asks where to put the file. CSV and Excel list one row per sample: time and logic levels. A capture longer than Excel's row limit is cut off. Firmware stays outside this repo.</p>`;
+    return `<h2>Export</h2><div class="export-form">${exportFormHtml("panel")}</div>`;
   }
   return `<h2>Measure</h2>
     <p id="measure-readout">${state.hoverText || "Hover a logic trace, or drag a measurement on the waveform."}</p>
@@ -2048,6 +2848,76 @@ function panelHtml(name) {
     <div id="span-list"></div>
     <h3>Saved pulses</h3>
     <div id="saved-measures"></div>`;
+}
+
+function streamCeiling(bands) {
+  if (!bands || !bands.length) return 0;
+  let max = 0;
+  for (const band of bands) max = Math.max(max, band.max_hz || 0);
+  return max;
+}
+
+function podLinkReduced(device) {
+  if (!device || device.kind !== "usb" || device.super_speed) return false;
+  const pid = Number.parseInt(String(device.id).split(":").pop(), 16);
+  const profile = (state.profiles || []).find((item) => item.product_id === pid);
+  if (profile) return streamCeiling(profile.super_stream_rates) > streamCeiling(profile.stream_rates);
+  return pid === 0x002c;
+}
+
+function reducedLinkTitle() {
+  const pods = (state.devices || []).filter(podLinkReduced);
+  if (!pods.length) return "";
+  const names = pods.map((device) => device.name).join(", ");
+  if (pods.length === 1) return `${names} is connected at USB 2. This pod supports USB 3.`;
+  return `${names} are connected at USB 2. These pods support USB 3.`;
+}
+
+function podArt(device) {
+  const label = `${device && device.id || ""} ${device && device.name || ""}`.toLowerCase();
+  if (/\b(scope|dso|oscilloscope)\b/.test(label)) return "/assets/scopeDevice.png";
+  return "/assets/logicDevice.png";
+}
+
+function podIconHtml(devices) {
+  const list = (Array.isArray(devices) ? devices : []).slice(0, 3);
+  const shown = list.length ? list : [null];
+  const n = shown.length;
+  const imgs = shown.map((device, index) => {
+    const stack = n - 1 - index;
+    const src = podArt(device);
+    const fallback = src === "/assets/logicDevice.png"
+      ? ""
+      : ` onerror="this.onerror=null;this.src='/assets/logicDevice.png'"`;
+    return `<img class="pod" src="${src}" alt="" style="--stack:${stack}"${fallback}>`;
+  });
+  return `<span class="pod-stack" data-count="${n}">${imgs.join("")}</span>`;
+}
+
+function connectedMarkup() {
+  const title = reducedLinkTitle();
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  const klass = title ? "connected reduced" : "connected";
+  return `<span class="${klass}"${titleAttr}><i class="dot"></i> Connected</span>`;
+}
+
+function paintPodIcons() {
+  const html = podIconHtml(state.devices || []);
+  for (const host of [document.querySelector(".device-chip"), document.getElementById("device-card")]) {
+    if (!host) continue;
+    const stack = host.querySelector(".pod-stack");
+    if (stack) stack.outerHTML = html;
+    else host.insertAdjacentHTML("afterbegin", html);
+  }
+}
+
+function paintConnected() {
+  const title = reducedLinkTitle();
+  for (const el of document.querySelectorAll(".device-chip .connected, .device-card .connected")) {
+    el.classList.toggle("reduced", !!title);
+    if (title) el.title = title;
+    else el.removeAttribute("title");
+  }
 }
 
 function devicePanel() {
@@ -2063,10 +2933,10 @@ function devicePanel() {
     : "";
   return `<h2>Device Settings</h2>
     <button type="button" class="device-card" id="device-card">
-      <svg class="pod" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2"></rect><path d="M7 6V4M12 6V4M17 6V4M7 20v-2M12 20v-2M17 20v-2"></path></svg>
+      ${podIconHtml(devices)}
       <div>
         <strong>${title}</strong>
-        <span class="connected"><i class="dot"></i> Connected</span>
+        ${connectedMarkup()}
         <p class="hint">${hardware ? "DreamSourceLab" : "Software demo"}</p>
       </div>
     </button>
@@ -2078,14 +2948,10 @@ function devicePanel() {
     </label>
     <p id="rate-note" class="hint">${rateNote()}</p>
     <label class="acq-row">Length
-      <select id="set-duration" aria-label="Capture length">
-        <option value="10">10 ms</option>
-        <option value="100">100 ms</option>
-        <option value="1000">1.0 s</option>
-        <option value="2000">2.0 s</option>
-        <option value="5000">5.0 s</option>
-      </select>
+      <input id="set-duration" list="duration-presets" type="text" aria-label="Capture length" spellcheck="false" autocomplete="off">
     </label>
+    <datalist id="duration-presets"></datalist>
+    <p id="duration-note" class="hint"></p>
     <label class="acq-row">Buffer
       <select id="set-depth" aria-label="Buffer mode">
         <option value="buffer">Buffer</option>
@@ -2130,6 +2996,114 @@ function devicePanel() {
     </details>`;
 }
 
+const TRIGGER_KINDS = [
+  { id: "rising", label: "Rising edge", path: "M4 16h7V8h9" },
+  { id: "falling", label: "Falling edge", path: "M4 8h7v8h9" },
+  { id: "any", label: "Any edge", path: "M3 16h5V8h8v8h5" },
+  { id: "high", label: "High level", path: "M4 8h16" },
+  { id: "low", label: "Low level", path: "M4 16h16" },
+];
+const PRE_TRIGGER_CHOICES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+
+function triggerKindIndex() {
+  const index = TRIGGER_KINDS.findIndex((kind) => kind.id === settings.triggerKind);
+  return index < 0 ? 0 : index;
+}
+
+function activeTriggerChannels() {
+  const probes = state.probes.length ? state.probes : state.channels;
+  if (!probes.length) return [{ index: settings.triggerChannel || 0, label: "0" }];
+  const enabled = probes.filter((probe) => channelIsEnabled(probe.index));
+  const labels = enabled.map((probe) => probe.name || String(probe.index));
+  const shared = labels.some((label, index) => labels.indexOf(label) !== index);
+  return enabled.map((probe) => ({
+    index: probe.index,
+    label: shared
+      ? `${deviceTag(probe.device_name)} ${probe.name || probe.index}`
+      : (probe.name || String(probe.index)),
+  }));
+}
+
+function syncTriggerChannelSelect(select) {
+  if (!select) return;
+  const choices = activeTriggerChannels();
+  const sig = choices.map((choice) => `${choice.index}:${choice.label}`).join("|");
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.replaceChildren();
+    for (const choice of choices) {
+      const option = document.createElement("option");
+      option.value = String(choice.index);
+      option.textContent = choice.label;
+      select.appendChild(option);
+    }
+  }
+  if (!choices.length) return;
+  if (!choices.some((choice) => choice.index === settings.triggerChannel)) {
+    settings.triggerChannel = choices[0].index;
+  }
+  if (select.value !== String(settings.triggerChannel)) select.value = String(settings.triggerChannel);
+}
+
+function syncPreTriggerSelect() {
+  const select = document.getElementById("trig-pre");
+  if (!select) return;
+  const value = Math.max(0, Math.min(90, Math.round(Number(settings.percent) || 0)));
+  settings.percent = value;
+  const values = PRE_TRIGGER_CHOICES.includes(value)
+    ? PRE_TRIGGER_CHOICES
+    : [...PRE_TRIGGER_CHOICES, value].sort((a, b) => a - b);
+  const sig = values.join(",");
+  if (select.dataset.sig !== sig) {
+    select.dataset.sig = sig;
+    select.replaceChildren();
+    for (const item of values) {
+      const option = document.createElement("option");
+      option.value = String(item);
+      option.textContent = `${item}%`;
+      select.appendChild(option);
+    }
+  }
+  if (select.value !== String(value)) select.value = String(value);
+}
+
+function paintTriggerKind() {
+  const kind = TRIGGER_KINDS[triggerKindIndex()];
+  const button = document.getElementById("trig-kind");
+  const path = document.getElementById("trig-kind-path");
+  const label = document.getElementById("trig-kind-label");
+  if (!button || !path || !label) return;
+  path.setAttribute("d", kind.path);
+  label.textContent = kind.label;
+  button.title = kind.label;
+  button.setAttribute("aria-label", `Trigger type, ${kind.label}`);
+}
+
+function paintTriggerArm() {
+  const button = document.getElementById("trig-arm");
+  if (!button) return;
+  button.setAttribute("aria-pressed", settings.trigger ? "true" : "false");
+  button.title = settings.trigger ? "Trigger on" : "Trigger off";
+  button.setAttribute("aria-label", settings.trigger ? "Disable trigger" : "Enable trigger");
+}
+
+function syncTriggerToolbar() {
+  paintTriggerArm();
+  paintTriggerKind();
+  syncTriggerChannelSelect(document.getElementById("trig-channel"));
+  syncPreTriggerSelect();
+  const panel = document.getElementById("panel-trig-channel");
+  if (panel && document.activeElement !== panel) syncTriggerChannelSelect(panel);
+  const edge = document.getElementById("panel-trig-edge");
+  if (edge && document.activeElement !== edge && edge.value !== settings.triggerKind) edge.value = settings.triggerKind;
+  const position = document.getElementById("set-position");
+  const positionLabel = document.getElementById("set-position-label");
+  if (position && document.activeElement !== position) {
+    position.value = String(settings.percent);
+    if (positionLabel) positionLabel.textContent = `${settings.percent}%`;
+  }
+}
+
 function triggerPanel() {
   const steps = settings.triggerSteps
     .map((step, index) => `<div class="step">
@@ -2141,7 +3115,7 @@ function triggerPanel() {
         <button type="button" data-remove="${index}">Remove</button>
       </div>`)
     .join("");
-  const source = (state.channels.length ? state.channels : [{ index: 0, name: "0" }]).map((channel) => `<option value="${channel.index}">${escapeHtml(channel.name)}</option>`).join("");
+  const source = activeTriggerChannels().map((choice) => `<option value="${choice.index}">${escapeHtml(choice.label)}</option>`).join("");
   return `<h2>Triggers</h2>
     <label class="check"><input id="trig-enable" type="checkbox"> Enable trigger</label>
     <label class="acq-row">Source
@@ -2151,8 +3125,9 @@ function triggerPanel() {
       <select id="panel-trig-edge" aria-label="Trigger type">
         <option value="rising">Rising edge</option>
         <option value="falling">Falling edge</option>
-        <option value="high">High</option>
-        <option value="low">Low</option>
+        <option value="any">Any edge</option>
+        <option value="high">High level</option>
+        <option value="low">Low level</option>
       </select>
     </label>
     <label class="acq-row">Position
@@ -2221,16 +3196,21 @@ function bindPanel(name) {
   if (name === "device") {
     loadDeviceChoices();
     bindSelect("set-rate", "rate", true);
-    bindSelect("set-duration", "duration", true);
+    const rate = document.getElementById("set-rate");
+    if (rate) rate.addEventListener("change", () => refillDurationField());
+    bindDurationField();
     bindSelect("set-depth", "depth", false);
     const depth = document.getElementById("set-depth");
     if (depth) {
       depth.addEventListener("change", () => {
         clampSampleRate();
         refillRateSelect();
+        paintRunIcon();
       });
     }
     bindSelect("set-run", "run", false);
+    const runMode = document.getElementById("set-run");
+    if (runMode) runMode.addEventListener("change", () => paintRunIcon());
     const repeat = document.getElementById("set-repeat");
     const threshold = document.getElementById("set-threshold");
     repeat.value = String(settings.repeatMs);
@@ -2267,6 +3247,7 @@ function bindPanel(name) {
       renderGutter();
       scheduleTiles();
       drawWave();
+      syncTriggerToolbar();
       selectTab("device");
     };
     for (const button of document.querySelectorAll("#channel-enable .ch-en")) {
@@ -2291,25 +3272,34 @@ function bindPanel(name) {
   if (name === "triggers") {
     const enable = document.getElementById("trig-enable");
     enable.checked = settings.trigger;
-    enable.addEventListener("change", () => { settings.trigger = enable.checked; });
+    enable.addEventListener("change", () => {
+      settings.trigger = enable.checked;
+      paintTriggerArm();
+    });
     const source = document.getElementById("panel-trig-channel");
     const edge = document.getElementById("panel-trig-edge");
     const position = document.getElementById("set-position");
     const positionLabel = document.getElementById("set-position-label");
     source.value = String(settings.triggerChannel);
-    if (!source.value) { source.selectedIndex = 0; settings.triggerChannel = Number(source.value || 0); }
+    if (source.options.length && !source.value) {
+      source.selectedIndex = 0;
+      settings.triggerChannel = Number(source.value || 0);
+    }
     edge.value = settings.triggerKind;
     position.value = String(settings.percent);
     positionLabel.textContent = settings.percent + "%";
     source.addEventListener("change", () => {
       settings.triggerChannel = Number(source.value);
+      syncTriggerChannelSelect(document.getElementById("trig-channel"));
     });
     edge.addEventListener("change", () => {
       settings.triggerKind = edge.value;
+      paintTriggerKind();
     });
     position.addEventListener("input", () => {
       settings.percent = Number(position.value);
       positionLabel.textContent = settings.percent + "%";
+      syncPreTriggerSelect();
     });
     document.getElementById("add-step").addEventListener("click", () => {
       const next = settings.triggerSteps.length === 0 ? 1 : settings.triggerSteps.length === 1 ? 3 : 0;
@@ -2317,6 +3307,7 @@ function bindPanel(name) {
       settings.trigger = true;
       const box = document.getElementById("trig-enable");
       if (box) box.checked = true;
+      paintTriggerArm();
       selectTab("triggers");
     });
     for (const input of document.querySelectorAll("#trigger-steps [data-field='channel']")) {
@@ -2341,6 +3332,7 @@ function bindPanel(name) {
     }
   }
   if (name === "decode") {
+    bindDecoderPicker();
     document.getElementById("add-decoder").addEventListener("click", () => addDecoder());
     const search = document.getElementById("decode-search");
     search.addEventListener("input", () => {
@@ -2361,13 +3353,7 @@ function bindPanel(name) {
     refreshMeasurements();
     renderMeasureList();
   }
-  if (name === "export") {
-    document.getElementById("export-csv").addEventListener("click", () => saveCaptureExport("csv"));
-    document.getElementById("export-xlsx").addEventListener("click", () => saveCaptureExport("xlsx"));
-    document.getElementById("download").addEventListener("click", () => saveCaptureExport("lvcap"));
-    document.getElementById("download-dsl").addEventListener("click", () => saveCaptureExport("dsl"));
-    document.getElementById("export-ann").addEventListener("click", exportAnnotations);
-  }
+  if (name === "export") bindExportForm("panel");
 }
 
 function renderMarkerList() {
@@ -2454,6 +3440,8 @@ function bindSelect(id, key, numeric) {
     settings[key] = numeric ? Number(el.value) : el.value;
   });
 }
+
+const HOST_MAX_SAMPLES = 16_000_000;
 
 const RATE_LADDER = [
   10_000, 20_000, 50_000, 100_000, 200_000, 500_000,
@@ -2606,6 +3594,145 @@ function refillRateSelect() {
     select.value = String(settings.rate);
   }
   if (note) note.textContent = rateNote();
+  refillDurationField();
+}
+
+function profileMemoryBits(profile) {
+  return profile && profile.memory_bits ? profile.memory_bits : 256 * 1024 * 1024;
+}
+
+function memoryBits() {
+  const pid = activeProductId();
+  const profile = (state.profiles || []).find((item) => item.product_id === pid)
+    || (state.profiles || []).find((item) => item.product_id === 0x0020);
+  return profileMemoryBits(profile);
+}
+
+function sessionSampleCeiling() {
+  if (settings.depth === "stream") return HOST_MAX_SAMPLES;
+  const devices = (state.devices || []).filter((device) => String(device.id).startsWith("usb:"));
+  if (devices.length < 1) return HOST_MAX_SAMPLES;
+  if (devices.length < 2) return Math.floor(memoryBits() / enabledChannelCount());
+  let offset = 0;
+  let ceiling = Infinity;
+  for (const device of devices) {
+    const pid = Number.parseInt(String(device.id).split(":").pop(), 16);
+    const profile = (state.profiles || []).find((item) => item.product_id === pid);
+    const width = profile ? profile.channels : (pid === 0x002c ? 32 : 16);
+    let count = 0;
+    for (let index = 0; index < width; index += 1) {
+      if (channelIsEnabled(offset + index)) count += 1;
+    }
+    offset += width;
+    if (!count) continue;
+    const share = Math.floor(profileMemoryBits(profile) / count);
+    if (share < ceiling) ceiling = share;
+  }
+  return Number.isFinite(ceiling) ? ceiling : HOST_MAX_SAMPLES;
+}
+
+function durationLimits() {
+  const rate = Math.max(1, settings.rate);
+  const ceiling = sessionSampleCeiling();
+  const aligned = ceiling - (ceiling % 64);
+  const minNs = Number((64n * 1_000_000_000n + BigInt(rate) - 1n) / BigInt(rate));
+  const maxNs = Number((BigInt(Math.max(aligned, 64)) * 1_000_000_000n) / BigInt(rate));
+  return { minNs, maxNs: Math.max(minNs, maxNs), ceiling: Math.max(aligned, 64), rate };
+}
+
+function samplesForDuration(ns, rate) {
+  const total = Number((BigInt(Math.max(0, rate)) * BigInt(Math.max(0, ns))) / 1_000_000_000n);
+  return total - (total % 64);
+}
+
+function parseDurationNs(text) {
+  const match = String(text).trim().match(/^(\d+(?:\.\d+)?)\s*(ns|us|µs|μs|ms|s)?$/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value < 0) return null;
+  const unit = (match[2] || "ms").toLowerCase();
+  const scale = unit === "s" ? 1e9 : unit === "ms" ? 1e6 : (unit === "us" || unit === "µs" || unit === "μs") ? 1e3 : 1;
+  const ns = Math.round(value * scale);
+  if (!Number.isSafeInteger(ns)) return null;
+  return ns;
+}
+
+function formatDuration(ns) {
+  const units = [[1e9, "s"], [1e6, "ms"], [1e3, "us"], [1, "ns"]];
+  for (const [scale, unit] of units) {
+    if (ns + 0.5 < scale) continue;
+    const rounded = Math.round((ns / scale) * 1000) / 1000;
+    if (rounded < 1 && unit !== "ns") continue;
+    const text = Number.isInteger(rounded) ? String(rounded) : String(rounded);
+    return text + " " + unit;
+  }
+  return "0 ns";
+}
+
+function durationPresets(limits) {
+  const picked = new Set([limits.minNs, limits.maxNs]);
+  if (2_000_000_000 >= limits.minNs && 2_000_000_000 <= limits.maxNs) picked.add(2_000_000_000);
+  for (let base = 1; base <= limits.maxNs; base *= 10) {
+    for (const step of [1, 2, 5]) {
+      const ns = step * base;
+      if (ns >= limits.minNs && ns <= limits.maxNs) picked.add(ns);
+    }
+    if (base > limits.maxNs / 10) break;
+  }
+  return [...picked].sort((a, b) => a - b);
+}
+
+function durationNote(limits) {
+  return `${formatDuration(limits.minNs)} to ${formatDuration(limits.maxNs)}. The capture is rounded down to a multiple of 64 samples.`;
+}
+
+function clampDuration(limits) {
+  if (!(settings.durationNs > 0)) settings.durationNs = 2_000_000_000;
+  if (settings.durationNs < limits.minNs) settings.durationNs = limits.minNs;
+  if (settings.durationNs > limits.maxNs) settings.durationNs = limits.maxNs;
+}
+
+function refillDurationField() {
+  const input = document.getElementById("set-duration");
+  const list = document.getElementById("duration-presets");
+  const note = document.getElementById("duration-note");
+  if (!input && !list && !note) return;
+  const limits = durationLimits();
+  clampDuration(limits);
+  if (list) {
+    list.innerHTML = durationPresets(limits).map((ns) => `<option value="${formatDuration(ns)}"></option>`).join("");
+  }
+  if (input && document.activeElement !== input) input.value = formatDuration(settings.durationNs);
+  if (note) note.textContent = durationNote(limits);
+}
+
+function commitDuration(text) {
+  const ns = parseDurationNs(text);
+  if (ns == null) {
+    refillDurationField();
+    const note = document.getElementById("duration-note");
+    if (note) note.textContent = "Use a length like 250 us, 10 ms, or 2 s.";
+    return;
+  }
+  const limits = durationLimits();
+  const samples = samplesForDuration(ns, limits.rate);
+  if (samples < 64) settings.durationNs = limits.minNs;
+  else if (samples > limits.ceiling) settings.durationNs = limits.maxNs;
+  else settings.durationNs = ns;
+  refillDurationField();
+}
+
+function bindDurationField() {
+  refillDurationField();
+  const input = document.getElementById("set-duration");
+  if (!input) return;
+  const commit = () => commitDuration(input.value);
+  input.addEventListener("change", commit);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    commit();
+  });
 }
 
 function bindCheck(id, key) {
@@ -2626,6 +3753,8 @@ function syncDeviceSelect() {
   const name = document.getElementById("device-name");
   const key = (state.devices || []).map((device) => device.id).join("+");
   if (name) name.textContent = deviceLabel(key);
+  paintPodIcons();
+  paintConnected();
 }
 
 function deviceMenuButton(id, label) {
@@ -2675,7 +3804,126 @@ function closeDeviceMenu() {
   if (menu) menu.classList.add("hidden");
 }
 
+function closeDeviceAcqMenu() {
+  const menu = document.getElementById("device-acq-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function closeRunMenu() {
+  const menu = document.getElementById("run-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function openRunMenu() {
+  closeMenu();
+  closeDeviceMenu();
+  closeDeviceAcqMenu();
+  closeBusMenu();
+  closeDecoderPicker();
+  const menu = document.getElementById("run-menu");
+  if (!menu) return;
+  menu.replaceChildren();
+  for (const [id, label] of [["single", "Single"], ["repeat", "Repeat"], ["loop", "Loop"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (settings.run === id) button.setAttribute("aria-current", "true");
+    button.addEventListener("click", () => {
+      settings.run = id;
+      const select = document.getElementById("set-run");
+      if (select) select.value = id;
+      paintRunIcon();
+      closeRunMenu();
+    });
+    menu.append(button);
+  }
+  menu.classList.remove("hidden");
+  const rect = runBtn.getBoundingClientRect();
+  const width = menu.offsetWidth || 140;
+  let left = rect.left;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  menu.style.left = left + "px";
+  menu.style.top = (rect.bottom + 6) + "px";
+}
+
+function acqChoice(label, selected, apply) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (selected) button.setAttribute("aria-current", "true");
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    apply();
+    closeDeviceAcqMenu();
+  });
+  return button;
+}
+
+function acqSubmenu(title, value, items) {
+  const row = document.createElement("div");
+  row.className = "device-sub";
+  const label = document.createElement("button");
+  label.type = "button";
+  const name = document.createElement("span");
+  name.textContent = title;
+  const current = document.createElement("span");
+  current.className = "menu-key";
+  current.textContent = value;
+  label.append(name, current);
+  label.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    row.classList.toggle("open");
+  });
+  const sub = document.createElement("div");
+  sub.className = "device-submenu";
+  for (const item of items) sub.append(item);
+  row.append(label, sub);
+  return row;
+}
+
+function renderDeviceAcqMenu() {
+  const menu = document.getElementById("device-acq-menu");
+  if (!menu) return;
+  menu.replaceChildren();
+  const choice = clampSampleRate();
+  const rates = choice.rates.map((rate) => acqChoice(formatSampleRate(rate), rate === settings.rate, () => {
+    settings.rate = rate;
+    refillRateSelect();
+    refillDurationField();
+  }));
+  const limits = durationLimits();
+  clampDuration(limits);
+  const lengths = durationPresets(limits).map((ns) => acqChoice(formatDuration(ns), ns === settings.durationNs, () => {
+    commitDuration(formatDuration(ns));
+  }));
+  menu.append(
+    acqSubmenu("Sample rate", formatSampleRate(settings.rate), rates),
+    acqSubmenu("Length", formatDuration(settings.durationNs), lengths),
+  );
+}
+
+function openDeviceAcqMenu(x, y) {
+  closeDeviceMenu();
+  closeRunMenu();
+  const menu = document.getElementById("device-acq-menu");
+  if (!menu) return;
+  renderDeviceAcqMenu();
+  menu.classList.remove("hidden");
+  const width = menu.offsetWidth || 220;
+  let left = x;
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  let top = y;
+  const height = menu.offsetHeight;
+  if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - 8 - height);
+  menu.style.left = left + "px";
+  menu.style.top = top + "px";
+  const flip = left + width + 196 > window.innerWidth;
+  for (const row of menu.querySelectorAll(".device-sub")) row.classList.toggle("flip", flip);
+}
+
 function openDeviceMenu(anchor) {
+  closeDeviceAcqMenu();
+  closeRunMenu();
   const menu = document.getElementById("device-menu");
   if (!menu) return;
   if (!menu.classList.contains("hidden")) {
@@ -2720,6 +3968,7 @@ async function loadDeviceChoices() {
         note.textContent = `${tested.join(", ") || "No pod"} tested on hardware. ${untested} other logic product ids stay closed.`;
       }
       if (state.tab === "device") refillRateSelect();
+      syncDeviceSelect();
     }).catch(() => {});
   } catch (err) {
     statusEl.textContent = err.message;
@@ -2778,6 +4027,179 @@ function protocolLabel(protocol) {
   return state.decoderCatalog.find((item) => item.id === protocol)?.name || PROTOCOL_LABEL[protocol] || protocol;
 }
 
+function decoderMatches(item, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return true;
+  const tags = Array.isArray(item.tags) ? item.tags.join(" ") : "";
+  return [item.name, item.id, item.longname, item.desc, tags]
+    .filter((part) => part != null && part !== "")
+    .join("\n")
+    .toLowerCase()
+    .includes(needle);
+}
+
+function chosenDecoderProtocol() {
+  const catalog = state.decoderCatalog || [];
+  if (state.decoderProtocol && catalog.some((item) => item.id === state.decoderProtocol)) {
+    return state.decoderProtocol;
+  }
+  return catalog[0] ? catalog[0].id : "";
+}
+
+function protocolToAdd() {
+  const menu = document.getElementById("decoder-kind-menu");
+  if (menu && !menu.classList.contains("hidden")) {
+    const active = menu.querySelector("[role='option'][aria-selected='true']");
+    if (active && active.dataset.id) return active.dataset.id;
+  }
+  return chosenDecoderProtocol();
+}
+
+let decoderPickIndex = 0;
+
+function placeDecoderPicker() {
+  const button = document.getElementById("decoder-kind");
+  const menu = document.getElementById("decoder-kind-menu");
+  if (!button || !menu || menu.classList.contains("hidden")) return;
+  const rect = button.getBoundingClientRect();
+  const gap = 4;
+  const below = window.innerHeight - rect.bottom - gap - 8;
+  const above = rect.top - gap - 8;
+  const downward = below >= 160 || below >= above;
+  const limit = Math.max(120, Math.min(240, downward ? below : above));
+  menu.style.left = rect.left + "px";
+  menu.style.width = rect.width + "px";
+  menu.style.maxHeight = limit + "px";
+  if (downward) {
+    menu.style.top = (rect.bottom + gap) + "px";
+    return;
+  }
+  menu.style.top = "0px";
+  menu.style.top = Math.max(8, rect.top - gap - menu.offsetHeight) + "px";
+}
+
+function renderDecoderPickerList(matches) {
+  const list = document.getElementById("decoder-kind-list");
+  const search = document.getElementById("decoder-kind-search");
+  if (!list) return;
+  list.replaceChildren();
+  if (!matches.length) {
+    const empty = document.createElement("li");
+    empty.className = "decoder-kind-empty";
+    empty.textContent = "No matching decoders";
+    list.append(empty);
+    decoderPickIndex = -1;
+    if (search) search.setAttribute("aria-activedescendant", "");
+    return;
+  }
+  if (decoderPickIndex < 0 || decoderPickIndex >= matches.length) decoderPickIndex = 0;
+  matches.forEach((item, index) => {
+    const row = document.createElement("li");
+    row.setAttribute("role", "option");
+    row.dataset.id = item.id;
+    row.id = "decoder-kind-opt-" + index;
+    if (index === decoderPickIndex) row.setAttribute("aria-selected", "true");
+    const name = document.createElement("span");
+    name.className = "decoder-kind-name";
+    name.textContent = item.name || item.id;
+    const id = document.createElement("span");
+    id.className = "decoder-kind-id";
+    id.textContent = item.id;
+    row.append(name, id);
+    row.addEventListener("pointerdown", (ev) => ev.preventDefault());
+    row.addEventListener("click", () => chooseDecoderProtocol(item.id));
+    list.append(row);
+  });
+  const active = list.querySelector("[aria-selected='true']");
+  if (search) search.setAttribute("aria-activedescendant", active ? active.id : "");
+}
+
+function closeDecoderPicker() {
+  const menu = document.getElementById("decoder-kind-menu");
+  const button = document.getElementById("decoder-kind");
+  if (!menu || !button) return;
+  menu.classList.add("hidden");
+  button.setAttribute("aria-expanded", "false");
+  const list = document.getElementById("decoder-kind-list");
+  if (list) list.replaceChildren();
+  const search = document.getElementById("decoder-kind-search");
+  if (search) {
+    search.value = "";
+    search.setAttribute("aria-activedescendant", "");
+  }
+}
+
+function openDecoderPicker() {
+  const menu = document.getElementById("decoder-kind-menu");
+  const button = document.getElementById("decoder-kind");
+  const search = document.getElementById("decoder-kind-search");
+  if (!menu || !button || !search) return;
+  menu.classList.remove("hidden");
+  button.setAttribute("aria-expanded", "true");
+  search.value = "";
+  const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, ""));
+  const selected = chosenDecoderProtocol();
+  const found = matches.findIndex((item) => item.id === selected);
+  decoderPickIndex = found >= 0 ? found : 0;
+  renderDecoderPickerList(matches);
+  placeDecoderPicker();
+  search.focus();
+  const active = document.getElementById("decoder-kind-list").querySelector("[aria-selected='true']");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function chooseDecoderProtocol(id) {
+  state.decoderProtocol = id;
+  const label = document.getElementById("decoder-kind-label");
+  if (label) label.textContent = protocolLabel(id);
+  closeDecoderPicker();
+}
+
+function bindDecoderPicker() {
+  const button = document.getElementById("decoder-kind");
+  const picker = document.getElementById("decoder-kind-picker");
+  const search = document.getElementById("decoder-kind-search");
+  if (!button || !picker || !search) return;
+  const current = chosenDecoderProtocol();
+  if (current) state.decoderProtocol = current;
+  const label = document.getElementById("decoder-kind-label");
+  if (label) label.textContent = current ? protocolLabel(current) : "Decoder";
+  button.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const menu = document.getElementById("decoder-kind-menu");
+    if (menu.classList.contains("hidden")) openDecoderPicker();
+    else closeDecoderPicker();
+  });
+  picker.addEventListener("click", (ev) => ev.stopPropagation());
+  search.addEventListener("input", () => {
+    const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, search.value));
+    decoderPickIndex = matches.length ? 0 : -1;
+    renderDecoderPickerList(matches);
+  });
+  search.addEventListener("keydown", (ev) => {
+    const matches = (state.decoderCatalog || []).filter((item) => decoderMatches(item, search.value));
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!matches.length) return;
+      const delta = ev.key === "ArrowDown" ? 1 : -1;
+      const base = decoderPickIndex < 0 ? 0 : decoderPickIndex;
+      decoderPickIndex = (base + delta + matches.length) % matches.length;
+      renderDecoderPickerList(matches);
+      const active = document.getElementById("decoder-kind-list").querySelector("[aria-selected='true']");
+      if (active) active.scrollIntoView({ block: "nearest" });
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      const match = matches[decoderPickIndex];
+      if (match) chooseDecoderProtocol(match.id);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeDecoderPicker();
+      button.focus();
+    }
+  });
+}
+
 function emitsProtocol(protocol, expected) {
   if (!expected) return false;
   if (protocol === expected) return true;
@@ -2786,7 +4208,8 @@ function emitsProtocol(protocol, expected) {
 }
 
 async function addDecoder(protocol) {
-  protocol = protocol || document.getElementById("decoder-kind").value;
+  protocol = protocol || protocolToAdd();
+  if (!protocol) return;
   try {
     const schema = (state.decoderCatalog || []).find((item) => item.id === protocol);
     const parent = schema?.stack_on && state.decoders.find((row) => emitsProtocol(row.protocol, schema.stack_on));
@@ -3004,17 +4427,6 @@ function rowAt(clientY) {
   return layout[layout.length - 1].row;
 }
 
-function boundaryAt(clientY) {
-  const rect = wave.getBoundingClientRect();
-  const y = clientY - rect.top;
-  const { layout } = rowMetrics();
-  for (let index = 0; index < layout.length - 1; index++) {
-    const edge = layout[index].top + layout[index].height;
-    if (Math.abs(y - edge) <= 4) return layout[index].row.key;
-  }
-  return null;
-}
-
 function placeEdgeButtons(clientY) {
   state.edgePointerY = clientY;
   const prev = document.getElementById("edge-prev");
@@ -3050,32 +4462,14 @@ function hideEdgeButtons() {
 
 function activeLogicChannel() {
   if (state.hoverKey && state.hoverKey.startsWith("logic:")) return state.hoverChannel;
-  const selected = view().selected;
+  const v = ensureSelection();
   const rows = orderedRows();
-  const chosen = rows.find((row) => row.key === selected && row.kind === "logic");
+  const anchor = rows.find((row) => row.key === v.anchor && row.kind === "logic");
+  if (anchor) return anchor.channel;
+  const chosen = rows.find((row) => v.selection.includes(row.key) && row.kind === "logic");
   if (chosen) return chosen.channel;
   const first = rows.find((row) => row.kind === "logic");
   return first ? first.channel : 0;
-}
-
-async function exportAnnotations() {
-  try {
-    const query = (state.decodeQuery || "").trim();
-    const data = await api({
-      cmd: "export_annotations",
-      session: state.active,
-      format: "csv",
-      query: query || null,
-    });
-    const blob = new Blob([data], { type: "text/csv" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = "annotations.csv";
-    link.click();
-    URL.revokeObjectURL(link.href);
-  } catch (err) {
-    statusEl.textContent = err.message;
-  }
 }
 
 async function searchPattern(forward) {
@@ -3229,18 +4623,59 @@ const SAVE_KINDS = {
 
 let saveJob = null;
 
-function saveCaptureExport(kind) {
+let pendingSavePick = null;
+
+function pickSaveFile(kind) {
+  return new Promise((resolve) => {
+    if (pendingSavePick) pendingSavePick.resolve(null);
+    pendingSavePick = { kind, resolve };
+    window.ipc.postMessage("save-file:" + kind);
+  });
+}
+
+window.logicviewSaveSelected = (kind, path) => {
+  const pending = pendingSavePick;
+  pendingSavePick = null;
+  if (!pending || pending.kind !== kind) return;
+  pending.resolve(path || null);
+};
+
+async function saveCaptureExport(kind) {
   const spec = SAVE_KINDS[kind];
   if (!spec) return;
-  openSaveDialog({
-    title: spec.title,
-    note: spec.note,
-    filename: spec.filename,
-    ext: spec.ext,
-    mime: spec.mime,
-    picker: spec.picker,
-    produce: () => fetchCaptureBlob(spec.path),
-  });
+  if (!(state.total > 0)) {
+    statusEl.textContent = "nothing captured yet";
+    return;
+  }
+  if (window.ipc && kind === "lvcap") {
+    const path = await pickSaveFile(kind);
+    if (!path) {
+      statusEl.textContent = "save cancelled";
+      return;
+    }
+    try {
+      const response = await fetch("/api/save-as", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok || !json.ok) throw new Error(json.error || "save failed");
+      statusEl.textContent = "saved " + (json.path || path);
+    } catch (err) {
+      statusEl.textContent = err.message || "save failed";
+    }
+    return;
+  }
+  try {
+    const produced = await fetchCaptureBlob(spec.path);
+    const blob = produced instanceof Blob ? produced : new Blob([produced], { type: spec.mime || "application/octet-stream" });
+    const wrote = await writeChosenFile(spec.filename, blob, spec.picker);
+    if (wrote === "cancel") statusEl.textContent = "save cancelled";
+    else statusEl.textContent = "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  }
 }
 
 async function fetchCaptureBlob(path) {
@@ -3321,6 +4756,200 @@ async function writeChosenFile(name, blob, pickerType) {
   return name;
 }
 
+const EXPORT_TYPES = [
+  { id: "csv", label: "CSV" },
+  { id: "xlsx", label: "Excel" },
+  { id: "lvcap", label: "LogicView (.lvcap)" },
+  { id: "dsl", label: "DSL (.dsl)" },
+  { id: "annotations", label: "Annotations CSV" },
+];
+
+function storedNumber(key, fallback) {
+  try {
+    const value = Number(localStorage.getItem(key));
+    if (Number.isInteger(value) && value >= 1) return value;
+  } catch (_) { /* private mode keeps the counter in memory */ }
+  return fallback;
+}
+
+function storedText(key) {
+  try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+
+let exportSerial = storedNumber("logicview-export-serial", 1);
+const exportChoice = {
+  kind: "csv",
+  directory: storedText("logicview-export-dir"),
+  filename: `Capture(${storedNumber("logicview-export-serial", 1)})`,
+};
+
+function captureFileName(n) {
+  return `Capture(${n})`;
+}
+
+function exportFormHtml(prefix) {
+  const options = EXPORT_TYPES.map((item) => {
+    const selected = item.id === exportChoice.kind ? " selected" : "";
+    return `<option value="${item.id}"${selected}>${escapeHtml(item.label)}</option>`;
+  }).join("");
+  return `<label class="field">Type
+      <select id="${prefix}-export-kind" aria-label="Export type">${options}</select>
+    </label>
+    <label class="field">Location
+      <span class="path-row export-location">
+        <input id="${prefix}-export-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Output folder" value="${escapeHtml(exportChoice.directory)}">
+        <button type="button" class="path-browse" data-path-target="${prefix}-export-dir" aria-label="Choose output folder">...</button>
+      </span>
+    </label>
+    <label class="field">File name
+      <input id="${prefix}-export-name" type="text" spellcheck="false" autocomplete="off" value="${escapeHtml(exportChoice.filename)}">
+    </label>
+    <button class="block" id="${prefix}-export-go" type="button">Export</button>
+    <p class="hint">CSV and Excel list one row per sample. A long capture is cut at Excel's row limit.</p>`;
+}
+
+function syncExportChoice(prefix) {
+  const kind = document.getElementById(`${prefix}-export-kind`);
+  const dir = document.getElementById(`${prefix}-export-dir`);
+  const name = document.getElementById(`${prefix}-export-name`);
+  if (kind) exportChoice.kind = kind.value;
+  if (dir && dir.value !== exportChoice.directory) rememberExportDirectory(dir.value);
+  if (name) exportChoice.filename = name.value;
+  paintExportFields(prefix);
+}
+
+function paintExportFields(except, force) {
+  for (const prefix of ["panel", "dialog"]) {
+    if (prefix === except) continue;
+    const kind = document.getElementById(`${prefix}-export-kind`);
+    const dir = document.getElementById(`${prefix}-export-dir`);
+    const name = document.getElementById(`${prefix}-export-name`);
+    if (kind && (force || document.activeElement !== kind)) kind.value = exportChoice.kind;
+    if (dir && (force || document.activeElement !== dir)) dir.value = exportChoice.directory;
+    if (name && (force || document.activeElement !== name)) name.value = exportChoice.filename;
+  }
+}
+
+function parentDirectory(value) {
+  const trimmed = String(value || "").replace(/[\\/]+$/, "");
+  const index = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  if (index < 0) return "";
+  const parent = trimmed.slice(0, index);
+  if (/^[A-Za-z]:$/.test(parent)) return parent + "\\";
+  return parent;
+}
+
+function assignExportDirectory(input, folder) {
+  if (!input || !folder) return;
+  input.value = folder;
+  syncExportChoice(input.id.startsWith("dialog-") ? "dialog" : "panel");
+}
+
+function bindExportForm(prefix) {
+  const kind = document.getElementById(`${prefix}-export-kind`);
+  const dir = document.getElementById(`${prefix}-export-dir`);
+  const name = document.getElementById(`${prefix}-export-name`);
+  const go = document.getElementById(`${prefix}-export-go`);
+  if (!kind || !dir || !name || !go || kind.dataset.bound) return;
+  kind.dataset.bound = "1";
+  kind.addEventListener("change", () => syncExportChoice(prefix));
+  dir.addEventListener("input", () => syncExportChoice(prefix));
+  name.addEventListener("input", () => syncExportChoice(prefix));
+  go.addEventListener("click", () => runExport(prefix));
+  const row = dir.closest(".export-location") || dir;
+  row.addEventListener("dragenter", (ev) => {
+    ev.preventDefault();
+    row.classList.add("dragover");
+  });
+  row.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+    row.classList.add("dragover");
+  });
+  row.addEventListener("dragleave", (ev) => {
+    if (ev.relatedTarget && row.contains(ev.relatedTarget)) return;
+    row.classList.remove("dragover");
+  });
+  row.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    row.classList.remove("dragover");
+    const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+    const raw = file && file.path;
+    if (!raw) {
+      statusEl.textContent = "Drop a folder on the location field.";
+      return;
+    }
+    const leaf = String(raw).split(/[\\/]/).pop() || "";
+    assignExportDirectory(dir, /\.[A-Za-z0-9]{1,8}$/.test(leaf) ? parentDirectory(raw) : raw);
+  });
+}
+
+function advanceExportName() {
+  exportSerial += 1;
+  try { localStorage.setItem("logicview-export-serial", String(exportSerial)); } catch (_) { /* the next name is still shown */ }
+  exportChoice.filename = captureFileName(exportSerial);
+  paintExportFields(null, true);
+}
+
+async function runExport(prefix) {
+  syncExportChoice(prefix);
+  const directory = exportChoice.directory.trim();
+  if (!directory) {
+    statusEl.textContent = "Choose an output folder";
+    return;
+  }
+  const filename = exportChoice.filename.trim().replace(/[\\/]/g, "");
+  if (!filename || filename === "." || filename === "..") {
+    statusEl.textContent = "Enter a file name";
+    return;
+  }
+  const button = document.getElementById(`${prefix}-export-go`);
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch("/api/export-to", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: exportChoice.kind,
+        directory,
+        filename,
+        query: (state.decodeQuery || "").trim() || null,
+      }),
+    });
+    const text = await response.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch (_) { json = { error: text }; }
+    if (!response.ok || json.ok === false) throw new Error(json.error || "export failed");
+    if (json.rows != null && json.total != null && Number(json.rows) !== Number(json.total)) {
+      statusEl.textContent = `exported ${Number(json.rows).toLocaleString()} of ${Number(json.total).toLocaleString()} samples`;
+    } else {
+      statusEl.textContent = "saved " + (json.path || filename);
+    }
+    advanceExportName();
+  } catch (err) {
+    statusEl.textContent = err.message || "export failed";
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function openExportDialog() {
+  paintExportFields(null, true);
+  const dialog = document.getElementById("export-dialog");
+  const logo = dialog.querySelector(".export-logo");
+  dialog.showModal();
+  if (logo && !logo.naturalWidth) {
+    logo.removeAttribute("src");
+    logo.src = "/assets/ExportFileLogo.png";
+  }
+}
+
+function closeExportDialog() {
+  const dialog = document.getElementById("export-dialog");
+  if (dialog.open) dialog.close();
+}
+
 function setupDocument() {
   const v = view();
   const mode = document.getElementById("cursor-mode");
@@ -3335,7 +4964,9 @@ function setupDocument() {
     hidden: [...state.hidden],
     buses: v.buses || [],
     nextBus: v.nextBus || 1,
-    selected: v.selected || null,
+    selection: ensureSelection().selection,
+    anchor: v.anchor || null,
+    selected: v.anchor || null,
     colors: v.colors || {},
     markers: (v.markers || []).map((marker) => ({
       id: marker.id,
@@ -3401,8 +5032,19 @@ async function applySetup(doc) {
   v.names = doc.names && typeof doc.names === "object" ? doc.names : {};
   v.colors = doc.colors && typeof doc.colors === "object" ? doc.colors : {};
   v.buses = Array.isArray(doc.buses) ? doc.buses : [];
+  for (const bus of v.buses) normalizeContainerInPlace(bus);
   v.nextBus = Number(doc.nextBus) || v.nextBus || 1;
-  v.selected = doc.selected || null;
+  if (Array.isArray(doc.selection)) {
+    v.selection = doc.selection;
+    v.anchor = doc.anchor || doc.selection[0] || null;
+  } else if (doc.selected) {
+    v.selection = [doc.selected];
+    v.anchor = doc.selected;
+  } else {
+    v.selection = [];
+    v.anchor = null;
+  }
+  v.selected = v.anchor;
   v.markers = Array.isArray(doc.markers) ? doc.markers : [];
   const maxMarker = v.markers.reduce((max, marker) => Math.max(max, Number(marker.id) || 0), 0);
   state.nextMarker = Math.max(state.nextMarker, maxMarker + 1);
@@ -3552,6 +5194,72 @@ async function openCaptureFile(file) {
   await applyImportedCapture(json.data, file.name);
 }
 
+let pendingFilePick = null;
+
+function pickCaptureFile(kind) {
+  if (window.ipc) {
+    return new Promise((resolve) => {
+      if (pendingFilePick) pendingFilePick.resolve(null);
+      pendingFilePick = { kind, resolve };
+      window.ipc.postMessage("pick-file:" + kind);
+    });
+  }
+  const input = document.getElementById(kind === "load" ? "load-file" : "import-file");
+  return new Promise((resolve) => {
+    const onChange = () => {
+      input.removeEventListener("change", onChange);
+      const file = input.files && input.files[0];
+      input.value = "";
+      resolve(file || null);
+    };
+    input.addEventListener("change", onChange);
+    input.click();
+  });
+}
+
+window.logicviewFileSelected = (kind, path) => {
+  const pending = pendingFilePick;
+  pendingFilePick = null;
+  if (!pending || pending.kind !== kind) return;
+  pending.resolve(path || null);
+};
+
+function captureLeaf(picked) {
+  if (!picked) return "";
+  if (typeof picked === "string") return picked.split(/[\\/]/).pop() || "";
+  return picked.name || "";
+}
+
+async function openPickedCapture(picked) {
+  if (typeof picked === "string") await openNativeCapture(picked);
+  else await openCaptureFile(picked);
+}
+
+async function loadSavedCapture() {
+  const picked = await pickCaptureFile("load");
+  if (!picked) return;
+  if (!captureLeaf(picked).toLowerCase().endsWith(".lvcap")) {
+    statusEl.textContent = "Load a .lvcap capture";
+    return;
+  }
+  await openPickedCapture(picked);
+}
+
+async function importCapture() {
+  const picked = await pickCaptureFile("import");
+  if (!picked) return;
+  if (!isCaptureName(captureLeaf(picked))) {
+    statusEl.textContent = "Import a .lvcap or .dsl capture";
+    return;
+  }
+  await openPickedCapture(picked);
+}
+
+function closeLogicView() {
+  if (window.ipc) window.ipc.postMessage("close");
+  else window.close();
+}
+
 async function applyImportedCapture(data, name) {
   state.tiles = {};
   state.annotations = [];
@@ -3607,7 +5315,7 @@ function bindCaptureDrop() {
   window.addEventListener("drop", (ev) => {
     if (!dragHasFile(ev)) return;
     ev.preventDefault();
-    if (ev.target.closest && ev.target.closest(".wave-stage, #preferences-dialog")) return;
+    if (ev.target.closest && ev.target.closest(".wave-stage, #preferences-dialog, .export-location")) return;
     statusEl.textContent = "Drop the capture on the waveform";
   });
 }
@@ -3720,7 +5428,13 @@ async function snapMarker(marker, clientX, clientY) {
 
 wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
-  if (!row || (row.kind !== "bus" && row.kind !== "decode") || !row.bus) return;
+  if (!row || !row.bus) return;
+  if ((row.kind === "group" || row.kind === "bus") && !row.bus.decode) {
+    ev.preventDefault();
+    openContainerMenu(row.bus, ev.clientX, ev.clientY);
+    return;
+  }
+  if (row.kind !== "bus" && row.kind !== "decode") return;
   ev.preventDefault();
   openBusMenu(row.bus, ev.clientX, ev.clientY);
 });
@@ -3728,7 +5442,17 @@ wave.addEventListener("contextmenu", (ev) => {
 wave.addEventListener("wheel", (ev) => {
   ev.preventDefault();
   if (state.total <= 0) return;
-  stepZoom(ev.deltaY > 0);
+  if (!zoomAnchor) {
+    const rect = wave.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const v = view();
+    zoomAnchor = { x, sample: v.start + x * v.spp };
+  }
+  clearTimeout(zoomAnchorTimer);
+  zoomAnchorTimer = setTimeout(() => {
+    zoomAnchor = null;
+  }, 300);
+  stepZoom(ev.deltaY > 0, zoomAnchor);
 }, { passive: false });
 
 function currentTimebaseIndex() {
@@ -3739,14 +5463,15 @@ function currentTimebaseIndex() {
   return index;
 }
 
-function stepZoom(out) {
+function stepZoom(out, anchor) {
   const slider = document.getElementById("timebase");
   if (!slider || state.total <= 0) return;
+  if (out && view().spp >= fitSpp() * (1 - 1e-9)) return;
   const current = currentTimebaseIndex();
   const next = Math.max(0, Math.min(TIME_DIVS.length - 1, current + (out ? 1 : -1)));
   if (next === current) return;
   slider.value = String(next);
-  applyTimebase(next);
+  applyTimebase(next, anchor);
   drawWave();
 }
 
@@ -3754,7 +5479,7 @@ function zoomAt(sample, x, factor) {
   const v = view();
   const width = Math.max(1, wave.clientWidth);
   const minSpp = 1 / 32;
-  const maxSpp = Math.max(minSpp, (Math.max(state.total, 1) / width) * 4);
+  const maxSpp = state.total > 0 ? state.total / width : minSpp;
   const before = v.spp;
   v.spp = Math.min(maxSpp, Math.max(minSpp, before * factor));
   if (v.spp === before) return;
@@ -3770,11 +5495,6 @@ function zoomAt(sample, x, factor) {
 
 wave.addEventListener("pointerdown", (ev) => {
   if (ev.button !== 0) return;
-  const boundary = state.total > 0 ? boundaryAt(ev.clientY) : null;
-  if (boundary && state.tool !== "marker" && state.tool !== "measure") {
-    startRowResize(boundary, ev.clientY);
-    return;
-  }
   if (state.total <= 0) return;
   const rect = wave.getBoundingClientRect();
   const x = ev.clientX - rect.left;
@@ -3817,6 +5537,18 @@ wave.addEventListener("pointerdown", (ev) => {
   wave.setPointerCapture(ev.pointerId);
 });
 
+let viewPaintQueued = false;
+function scheduleViewPaint() {
+  if (viewPaintQueued) return;
+  viewPaintQueued = true;
+  requestAnimationFrame(() => {
+    viewPaintQueued = false;
+    drawWave();
+    drawRuler();
+    drawOverview();
+  });
+}
+
 wave.addEventListener("pointermove", (ev) => {
   const rect = wave.getBoundingClientRect();
   state.hoverX = ev.clientX - rect.left;
@@ -3826,8 +5558,7 @@ wave.addEventListener("pointermove", (ev) => {
     v.userNavigated = true;
     clampView();
     scheduleTiles();
-    drawRuler();
-    drawOverview();
+    scheduleViewPaint();
     hideHover();
     return;
   }
@@ -3910,18 +5641,68 @@ wave.addEventListener("pointerleave", () => {
   drawWave();
 });
 
-overview.addEventListener("pointerdown", (ev) => {
-  if (state.total <= 0) return;
+function overviewMetrics() {
   const rect = overview.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
+  const width = Math.max(1, rect.width);
   const v = view();
-  const span = wave.clientWidth * v.spp;
-  v.start = (x / rect.width) * state.total - span / 2;
+  const span = Math.max(1, wave.clientWidth * v.spp);
+  const x0 = (v.start / state.total) * width;
+  const x1 = Math.min(width, ((v.start + span) / state.total) * width);
+  return { rect, width, span, x0, x1: Math.max(x0 + 2, x1) };
+}
+
+function scrollOverviewTo(start) {
+  const v = view();
+  v.start = start;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
+  drawWave();
+  drawRuler();
   drawOverview();
+}
+
+let overviewDrag = null;
+
+overview.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0 || state.total <= 0) return;
+  const metrics = overviewMetrics();
+  const x = ev.clientX - metrics.rect.left;
+  if (x >= metrics.x0 && x <= metrics.x1) {
+    overviewDrag = {
+      pointer: ev.pointerId,
+      grab: x - metrics.x0,
+      thumb: metrics.x1 - metrics.x0,
+    };
+    overview.setPointerCapture(ev.pointerId);
+    overview.classList.add("dragging");
+    return;
+  }
+  const page = wave.clientWidth * view().spp;
+  scrollOverviewTo(view().start + (x < metrics.x0 ? -page : page));
 });
+
+overview.addEventListener("pointermove", (ev) => {
+  if (!overviewDrag || ev.pointerId !== overviewDrag.pointer) return;
+  const rect = overview.getBoundingClientRect();
+  const width = Math.max(1, rect.width);
+  const x = ev.clientX - rect.left;
+  let left = x - overviewDrag.grab;
+  const maxLeft = Math.max(0, width - overviewDrag.thumb);
+  if (left < 0) left = 0;
+  if (left > maxLeft) left = maxLeft;
+  scrollOverviewTo((left / width) * state.total);
+});
+
+function endOverviewDrag(ev) {
+  if (!overviewDrag || ev.pointerId !== overviewDrag.pointer) return;
+  overviewDrag = null;
+  overview.classList.remove("dragging");
+  if (overview.hasPointerCapture(ev.pointerId)) overview.releasePointerCapture(ev.pointerId);
+}
+
+overview.addEventListener("pointerup", endOverviewDrag);
+overview.addEventListener("pointercancel", endOverviewDrag);
 
 function queueHover(ev) {
   state.hoverSequence += 1;
@@ -3958,7 +5739,7 @@ async function decodedHoverBounds(row, sample, session, sequence) {
 }
 
 async function busHoverBounds(row, sample, session) {
-  const channels = [...new Set(row.bus.channels || [])];
+  const channels = [...new Set(descendantChannels(row.bus))];
   if (!channels.length) return null;
   const metrics = await Promise.all(channels.map((channel) => api({ cmd: "measure", session, channel, sample })));
   const starts = metrics.map((item) => item.pulse_start);
@@ -4106,23 +5887,24 @@ function formatDiv(seconds) {
   return formatSeconds(seconds).replace(/\.000(?=\s)/, "") + "/div";
 }
 
-function applyTimebase(index) {
+function applyTimebase(index, anchor) {
   if (!Number.isInteger(index) || index < 0 || index >= TIME_DIVS.length) return;
   const seconds = TIME_DIVS[index];
   const px = Math.max(40, (wave.clientWidth || 800) / 10);
   const v = view();
   const width = Math.max(1, wave.clientWidth);
-  const mid = v.start + (width / 2) * v.spp;
-  v.spp = (seconds * Math.max(1, state.rate)) / px;
-  v.start = mid - (width / 2) * v.spp;
+  const sample = anchor ? anchor.sample : v.start + (width / 2) * v.spp;
+  const x = anchor ? anchor.x : width / 2;
+  const fit = state.total > 0 ? fitSpp() : v.spp;
+  v.spp = Math.min(fit, (seconds * Math.max(1, state.rate)) / px);
+  v.start = sample - x * v.spp;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
   drawWave();
   drawRuler();
   drawOverview();
-  const label = document.getElementById("timebase-label");
-  if (label) label.textContent = formatDiv(seconds);
+  syncTimebaseLabel();
 }
 
 function bindSplitters() {
@@ -4151,12 +5933,17 @@ function bindSplitters() {
 
 const MENUS = {
   file: [
-    ["Save setup…", () => saveSetup()],
-    ["Open setup…", () => document.getElementById("setup-file").click()],
-    ["Export CSV…", () => saveCaptureExport("csv")],
-    ["Export Excel…", () => saveCaptureExport("xlsx")],
-    ["Save .lvcap…", () => saveCaptureExport("lvcap")],
-    ["Save .dsl…", () => saveCaptureExport("dsl")],
+    { label: "New Capture", shortcut: "Ctrl+N", run: () => addSession() },
+    { label: "Load Saved Capture", shortcut: "Ctrl+O", run: () => loadSavedCapture() },
+    { label: "Save Capture As…", shortcut: "Ctrl+Shift+S", run: () => saveCaptureExport("lvcap") },
+    { separator: true },
+    { label: "Save setup…", run: () => saveSetup() },
+    { label: "Open setup…", run: () => document.getElementById("setup-file").click() },
+    { separator: true },
+    { label: "Export Capture…", shortcut: "Ctrl+E", run: () => openExportDialog() },
+    { label: "Import Capture…", shortcut: "Ctrl+I", run: () => importCapture() },
+    { separator: true },
+    { label: "Close LogicView", shortcut: "Alt+F4", run: () => closeLogicView() },
   ],
   edit: [["Clear markers", () => {
     view().markers = [];
@@ -4178,7 +5965,7 @@ const MENUS = {
     ["Previous edge", () => stepEdge(false)],
     ["Next edge", () => stepEdge(true)],
     ["Add marker", () => setTool("marker")],
-    ["Group channels as a bus", () => openBusDialog()],
+    ["Create group…", () => openBusDialog()],
   ],
   help: [["About...", () => document.getElementById("about-dialog").showModal()]],
 };
@@ -4190,6 +5977,7 @@ function closeMenu() {
 }
 
 function openMenu(button) {
+  closeRunMenu();
   const name = button.dataset.menu;
   if (state.menu === name) {
     closeMenu();
@@ -4208,13 +5996,56 @@ function openMenu(button) {
     add.setAttribute("aria-haspopup", "true");
     const submenu = document.createElement("div");
     submenu.className = "decode-menu-choices";
-    for (const { id: protocol, name: label } of state.decoderCatalog) {
+    const search = document.createElement("input");
+    search.type = "search";
+    search.className = "decode-menu-search";
+    search.placeholder = "Search decoders";
+    search.setAttribute("aria-label", "Search decoders");
+    search.autocomplete = "off";
+    search.spellcheck = false;
+    const applyMenuFilter = () => {
+      let visible = 0;
+      for (const choice of submenu.querySelectorAll("button")) {
+        const item = (state.decoderCatalog || []).find((row) => row.id === choice.dataset.id);
+        const hide = !item || !decoderMatches(item, search.value);
+        choice.classList.toggle("filtered-out", hide);
+        if (!hide) visible += 1;
+      }
+      const empty = submenu.querySelector(".decoder-kind-empty");
+      if (empty) empty.classList.toggle("filtered-out", visible > 0);
+    };
+    search.addEventListener("click", (ev) => ev.stopPropagation());
+    search.addEventListener("input", applyMenuFilter);
+    search.addEventListener("keydown", (ev) => {
+      ev.stopPropagation();
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeMenu();
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const choice = [...submenu.querySelectorAll("button")].find((button) => !button.classList.contains("filtered-out"));
+        if (choice) choice.click();
+      }
+    });
+    submenu.append(search);
+    for (const item of state.decoderCatalog) {
       const choice = document.createElement("button");
       choice.type = "button";
-      choice.textContent = label;
-      choice.addEventListener("click", () => { closeMenu(); addDecoder(protocol); });
+      choice.dataset.id = item.id;
+      const name = document.createElement("span");
+      name.className = "decoder-kind-name";
+      name.textContent = item.name || item.id;
+      const id = document.createElement("span");
+      id.className = "decoder-kind-id";
+      id.textContent = item.id;
+      choice.append(name, id);
+      choice.addEventListener("click", () => { closeMenu(); addDecoder(item.id); });
       submenu.append(choice);
     }
+    const empty = document.createElement("div");
+    empty.className = "decoder-kind-empty filtered-out";
+    empty.textContent = "No matching decoders";
+    submenu.append(empty);
     add.addEventListener("click", () => wrapper.classList.toggle("open"));
     wrapper.append(add, submenu);
     pop.append(wrapper);
@@ -4229,13 +6060,30 @@ function openMenu(button) {
       pop.append(item);
     }
   }
-  for (const [label, fn] of MENUS[name]) {
+  for (const entry of MENUS[name]) {
+    if (entry && entry.separator) {
+      const separator = document.createElement("div");
+      separator.className = "menu-separator";
+      pop.append(separator);
+      continue;
+    }
+    const label = Array.isArray(entry) ? entry[0] : entry.label;
+    const run = Array.isArray(entry) ? entry[1] : entry.run;
+    const shortcut = Array.isArray(entry) ? "" : entry.shortcut;
     const item = document.createElement("button");
     item.type = "button";
-    item.textContent = label;
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.append(text);
+    if (shortcut) {
+      const key = document.createElement("span");
+      key.className = "menu-key";
+      key.textContent = shortcut;
+      item.append(key);
+    }
     item.addEventListener("click", () => {
       closeMenu();
-      fn();
+      run();
     });
     pop.appendChild(item);
   }
@@ -4252,16 +6100,51 @@ function openMenu(button) {
 }
 
 document.getElementById("run").addEventListener("click", () => runCapture());
+document.getElementById("run").addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const menu = document.getElementById("run-menu");
+  if (menu && !menu.classList.contains("hidden")) closeRunMenu();
+  else openRunMenu();
+});
 document.getElementById("stop").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
 document.getElementById("device-select").addEventListener("click", (ev) => {
   ev.stopPropagation();
   openDeviceMenu(document.querySelector(".device-chip"));
 });
+document.querySelector(".device-chip").addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  openDeviceAcqMenu(ev.clientX, ev.clientY);
+});
 document.getElementById("tool-marker").addEventListener("click", () => setTool("marker"));
 document.getElementById("tool-measure").addEventListener("click", () => setTool("measure"));
 document.getElementById("zoom-in").addEventListener("click", () => stepZoom(false));
 document.getElementById("zoom-out").addEventListener("click", () => stepZoom(true));
+document.getElementById("trig-arm").addEventListener("click", () => {
+  settings.trigger = !settings.trigger;
+  const enable = document.getElementById("trig-enable");
+  if (enable) enable.checked = settings.trigger;
+  paintTriggerArm();
+});
+document.getElementById("trig-kind").addEventListener("click", () => {
+  const next = TRIGGER_KINDS[(triggerKindIndex() + 1) % TRIGGER_KINDS.length];
+  settings.triggerKind = next.id;
+  syncTriggerToolbar();
+});
+document.getElementById("trig-channel").addEventListener("change", (ev) => {
+  settings.triggerChannel = Number(ev.target.value);
+  const panel = document.getElementById("panel-trig-channel");
+  if (panel) panel.value = ev.target.value;
+});
+document.getElementById("trig-pre").addEventListener("change", (ev) => {
+  settings.percent = Number(ev.target.value);
+  const position = document.getElementById("set-position");
+  const positionLabel = document.getElementById("set-position-label");
+  if (position) position.value = String(settings.percent);
+  if (positionLabel) positionLabel.textContent = `${settings.percent}%`;
+});
 document.getElementById("edge-prev").addEventListener("click", (ev) => {
   ev.stopPropagation();
   stepEdge(false, state.edgeChannel);
@@ -4312,21 +6195,117 @@ for (const button of document.querySelectorAll(".menubar button")) {
     ev.stopPropagation();
     openMenu(button);
   });
+  button.addEventListener("mouseenter", () => {
+    if (state.menu && state.menu !== button.dataset.menu) openMenu(button);
+  });
 }
+sideBody.addEventListener("scroll", () => placeDecoderPicker());
+window.addEventListener("resize", () => placeDecoderPicker());
 document.addEventListener("click", (ev) => {
+  if (!ev.target.closest("#decoder-kind-picker")) closeDecoderPicker();
   if (!ev.target.closest(".menu-pop") && !ev.target.closest(".menubar")) closeMenu();
   if (!ev.target.closest("#device-menu") && !ev.target.closest("#device-select") && !ev.target.closest("#device-card")) {
     closeDeviceMenu();
   }
+  if (!ev.target.closest("#device-acq-menu")) closeDeviceAcqMenu();
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
+  if (!ev.target.closest("#run-menu") && !ev.target.closest("#run")) closeRunMenu();
   if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
+});
+
+let menuDismissTimer = 0;
+let menuDismissGroup = "";
+
+function menuGroup(node) {
+  if (!node || !node.closest) return "";
+  if (node.closest("#menu-pop") || node.closest(".menubar")) return "bar";
+  if (node.closest("#device-menu") || node.closest(".device-chip") || node.closest("#device-card")) return "device";
+  if (node.closest("#device-acq-menu")) return "acq";
+  if (node.closest("#decoder-kind-menu") || node.closest("#decoder-kind-picker")) return "decode";
+  if (node.closest("#bus-menu")) return "bus";
+  if (node.closest("#run-menu") || node.closest("#run")) return "run";
+  return "";
+}
+
+function groupIsOpen(group) {
+  if (group === "bar") return !!state.menu;
+  const id = {
+    device: "device-menu",
+    acq: "device-acq-menu",
+    decode: "decoder-kind-menu",
+    bus: "bus-menu",
+    run: "run-menu",
+  }[group];
+  const el = id && document.getElementById(id);
+  return !!(el && !el.classList.contains("hidden"));
+}
+
+function dismissMenuGroup(group) {
+  if (group === "bar") closeMenu();
+  else if (group === "device") closeDeviceMenu();
+  else if (group === "acq") closeDeviceAcqMenu();
+  else if (group === "decode") closeDecoderPicker();
+  else if (group === "bus") closeBusMenu();
+  else if (group === "run") closeRunMenu();
+}
+
+function scheduleMenuDismiss(group) {
+  clearTimeout(menuDismissTimer);
+  menuDismissGroup = group;
+  menuDismissTimer = setTimeout(() => {
+    if (menuDismissGroup !== group) return;
+    menuDismissGroup = "";
+    dismissMenuGroup(group);
+  }, 180);
+}
+
+document.addEventListener("mouseout", (ev) => {
+  const group = menuGroup(ev.target);
+  if (!group || !groupIsOpen(group)) return;
+  if (menuGroup(ev.relatedTarget) === group) return;
+  scheduleMenuDismiss(group);
+});
+document.addEventListener("mouseover", (ev) => {
+  if (menuGroup(ev.target) !== menuDismissGroup) return;
+  clearTimeout(menuDismissTimer);
+  menuDismissGroup = "";
 });
 
 document.getElementById("about-close").addEventListener("click", () => document.getElementById("about-dialog").close());
 
+function menuChord(ev) {
+  if (ev.altKey && ev.key === "F4") return null;
+  if (!(ev.ctrlKey || ev.metaKey || ev.altKey)) return null;
+  const parts = [];
+  if (ev.ctrlKey || ev.metaKey) parts.push("Ctrl");
+  if (ev.shiftKey) parts.push("Shift");
+  if (ev.altKey) parts.push("Alt");
+  const key = ev.key.length === 1 ? ev.key.toUpperCase() : ev.key;
+  if (key === "Control" || key === "Shift" || key === "Alt" || key === "Meta") return null;
+  parts.push(key);
+  return parts.join("+");
+}
+
+function runMenuShortcut(chord) {
+  for (const entries of Object.values(MENUS)) {
+    for (const entry of entries) {
+      if (!entry || Array.isArray(entry) || entry.shortcut !== chord || typeof entry.run !== "function") continue;
+      entry.run();
+      return true;
+    }
+  }
+  return false;
+}
+
 window.addEventListener("keydown", (ev) => {
-  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open) return;
+  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open || document.getElementById("export-dialog").open) return;
   if (ev.target.matches("input, select, textarea")) return;
+  const chord = menuChord(ev);
+  if (chord && runMenuShortcut(chord)) {
+    ev.preventDefault();
+    return;
+  }
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
   const key = ev.key;
   if (key === " " || key === "s" || key === "S") {
     ev.preventDefault();
@@ -4346,11 +6325,17 @@ window.addEventListener("keydown", (ev) => {
     return;
   }
   if (key === "Escape") {
+    const pickerMenu = document.getElementById("decoder-kind-menu");
+    if (pickerMenu && !pickerMenu.classList.contains("hidden")) {
+      closeDecoderPicker();
+      return;
+    }
     const save = document.getElementById("save-dialog");
     const fly = document.getElementById("color-flyout");
     if (save && !save.classList.contains("hidden")) closeSaveDialog();
     else if (fly && !fly.classList.contains("hidden")) closeColorFlyout();
     else if (state.menu) closeMenu();
+    else if (!document.getElementById("run-menu").classList.contains("hidden")) closeRunMenu();
     else if (state.tool) setTool(state.tool);
     return;
   }
@@ -4494,30 +6479,127 @@ function showTriggered() {
   }, 700);
 }
 
-function openBusDialog() {
-  const host = document.getElementById("bus-channels");
-  const probes = state.probes.length ? state.probes : state.channels;
-  host.replaceChildren();
-  for (const probe of probes) {
-    const label = document.createElement("label");
-    label.className = "check";
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.value = String(probe.index);
-    label.append(box, document.createTextNode(" " + probe.name));
-    host.appendChild(label);
+let editingGroupId = null;
+
+function displayedContainerName(container) {
+  const names = view().names;
+  const key = "bus:" + container.id;
+  return (names && names[key]) || container.name || ("Group " + container.id);
+}
+
+function groupMemberLabel(member) {
+  if (member.kind === "group") {
+    const child = sessionContainers().find((item) => Number(item.id) === Number(member.id));
+    return child ? displayedContainerName(child) : ("Group " + member.id);
   }
-  document.getElementById("bus-name").value = "Bus " + (view().nextBus || 1);
+  const channel = state.channels.find((item) => item.index === Number(member.index));
+  return channel ? channel.name : ("Channel " + member.index);
+}
+
+function setGroupDialogMode(editing) {
+  const dialog = document.getElementById("bus-dialog");
+  const title = document.getElementById("bus-dialog-title");
+  const submit = document.getElementById("bus-submit");
+  if (dialog) dialog.setAttribute("aria-label", editing ? "Edit a group" : "Create a group");
+  if (title) title.textContent = editing ? "Edit group" : "Create group";
+  if (submit) submit.textContent = editing ? "Apply" : "Create";
+}
+
+function paintGroupMembers(members, leaves) {
+  const host = document.getElementById("bus-channels");
+  host.replaceChildren();
+  host.dataset.leaves = String(leaves);
+  for (const member of members) {
+    const line = document.createElement("div");
+    line.className = "channel-line";
+    line.textContent = groupMemberLabel(member);
+    host.appendChild(line);
+  }
+}
+
+function syncGroupDialog() {
+  const type = document.querySelector('input[name="group-type"]:checked');
+  const bus = !type || type.value === "bus";
+  document.getElementById("bus-radix").classList.toggle("hidden", !bus);
+  document.getElementById("bus-msb").classList.toggle("hidden", !bus);
+  document.getElementById("group-label-note").classList.toggle("hidden", bus);
+  const host = document.getElementById("bus-channels");
+  const stored = Number(host && host.dataset.leaves);
+  const count = Number.isFinite(stored) ? stored : document.querySelectorAll("#bus-channels .channel-line").length;
+  const hint = document.getElementById("bus-hint");
+  const submit = document.getElementById("bus-submit");
+  const msb = document.getElementById("bus-msb-first");
+  if (bus && count < 2) hint.textContent = "A bus needs at least two channels";
+  else if (!count) hint.textContent = "Select a logic channel";
+  else if (bus) hint.textContent = msb && msb.checked ? "Top channel is the high bit" : "Top channel is the low bit";
+  else hint.textContent = "";
+  if (submit) submit.disabled = (bus && count < 2) || !count;
+  const name = document.getElementById("bus-name");
+  if (editingGroupId == null && /^(Bus|Group) \d+$/.test(name.value)) {
+    name.value = (bus ? "Bus " : "Group ") + name.value.split(" ")[1];
+  }
+}
+
+function openBusDialog() {
+  const members = selectedGroupMembers();
+  if (!members.length) {
+    statusEl.textContent = "Select logic channels, then create a group";
+    return;
+  }
+  editingGroupId = null;
+  const leaves = memberLeafChannels(members);
+  paintGroupMembers(members, leaves.length);
+  const type = leaves.length >= 2 ? "bus" : "group";
+  const radio = document.querySelector(`input[name="group-type"][value="${type}"]`);
+  if (radio) radio.checked = true;
+  const hex = document.querySelector('input[name="bus-radix"][value="hex"]');
+  if (hex) hex.checked = true;
+  const msb = document.getElementById("bus-msb-first");
+  if (msb) msb.checked = true;
+  const name = document.getElementById("bus-name");
+  name.value = (type === "group" ? "Group " : "Bus ") + (view().nextBus || 1);
+  setGroupDialogMode(false);
+  syncGroupDialog();
+  document.getElementById("bus-dialog").classList.remove("hidden");
+}
+
+function openEditGroup(bus) {
+  if (!bus || bus.decode) return;
+  editingGroupId = Number(bus.id);
+  const members = (bus.members || []).map((member) => (
+    member.kind === "group"
+      ? { kind: "group", id: Number(member.id) }
+      : { kind: "channel", index: Number(member.index) }
+  ));
+  paintGroupMembers(members, descendantChannels(bus).length);
+  const type = bus.type === "group" ? "group" : "bus";
+  const radio = document.querySelector(`input[name="group-type"][value="${type}"]`);
+  if (radio) radio.checked = true;
+  const radix = bus.radix && bus.radix !== "analog" ? bus.radix : "hex";
+  const radixRadio = document.querySelector(`input[name="bus-radix"][value="${radix}"]`);
+  if (radixRadio) radixRadio.checked = true;
+  const msb = document.getElementById("bus-msb-first");
+  if (msb) msb.checked = !!bus.msbFirst;
+  document.getElementById("bus-name").value = displayedContainerName(bus);
+  setGroupDialogMode(true);
+  syncGroupDialog();
   document.getElementById("bus-dialog").classList.remove("hidden");
 }
 
 function closeBusDialog() {
+  editingGroupId = null;
   document.getElementById("bus-dialog").classList.add("hidden");
 }
 
 function closeBusMenu() {
   const menu = document.getElementById("bus-menu");
   if (menu) menu.classList.add("hidden");
+}
+
+function placeBusMenu(menu, x, y) {
+  menu.classList.remove("hidden");
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
 }
 
 function openBusMenu(bus, x, y) {
@@ -4527,38 +6609,282 @@ function openBusMenu(bus, x, y) {
   item.type = "button";
   item.textContent = bus.analog ? "Hex view" : "Analog view";
   item.addEventListener("click", () => {
-    if (bus.decode) {
-      const analog = !bus.analog;
-      if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
-      state.spiView[bus.decode].analog = analog;
-      const pref = decodePref(bus.decode);
-      if (analog) pref.format = "analog";
-      else if (pref.format === "analog") pref.format = "hex";
-    } else {
-      bus.analog = !bus.analog;
-    }
+    const analog = !bus.analog;
+    if (!state.spiView[bus.decode]) state.spiView[bus.decode] = { analog: false };
+    state.spiView[bus.decode].analog = analog;
+    const pref = decodePref(bus.decode);
+    if (analog) pref.format = "analog";
+    else if (pref.format === "analog") pref.format = "hex";
     state.gutterSig = "";
     closeBusMenu();
     renderGutter();
     drawWave();
   });
   menu.append(item);
-  if (!bus.decode) {
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.textContent = "Remove bus";
-    remove.addEventListener("click", () => {
-      view().buses = view().buses.filter((entry) => entry.id !== bus.id);
-      state.gutterSig = "";
+  placeBusMenu(menu, x, y);
+}
+
+function openCreateGroupMenu(x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  const item = document.createElement("button");
+  item.type = "button";
+  item.textContent = "Create group…";
+  item.addEventListener("click", () => {
+    closeBusMenu();
+    openBusDialog();
+  });
+  menu.append(item);
+  placeBusMenu(menu, x, y);
+}
+
+function canUngroupSignal(row) {
+  if (!plainLogic(row) || row.containerId == null) return false;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  return !!(container && !container.decode);
+}
+
+function ungroupSignal(row) {
+  if (!canUngroupSignal(row)) return;
+  const container = sessionContainers().find((item) => Number(item.id) === Number(row.containerId));
+  const index = Number(row.channel);
+  const at = (container.members || []).findIndex((member) => member.kind === "channel" && Number(member.index) === index);
+  if (at < 0) return;
+  container.members.splice(at, 1);
+  container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  const parent = parentContainer(container.id);
+  if (parent) {
+    const groupAt = parent.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(container.id));
+    parent.members.splice(groupAt < 0 ? parent.members.length : groupAt + 1, 0, { kind: "channel", index });
+    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  } else {
+    const key = "logic:" + index;
+    const order = view().order && view().order.length ? [...view().order] : sourceRows().map((item) => item.key);
+    const without = order.filter((item) => item !== key);
+    const groupAt = without.indexOf("bus:" + container.id);
+    if (groupAt >= 0) without.splice(groupAt + 1, 0, key);
+    else without.unshift(key);
+    persistOrder(without);
+  }
+  deleteEmptyContainers();
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function openSignalMenu(row, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  if (canUngroupSignal(row)) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.textContent = "Ungroup";
+    item.addEventListener("click", () => {
+      ungroupSignal(row);
       closeBusMenu();
-      renderGutter();
+    });
+    menu.append(item);
+  }
+  if (selectedGroupMembers().length) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.textContent = "Create group…";
+    item.addEventListener("click", () => {
+      closeBusMenu();
+      openBusDialog();
+    });
+    menu.append(item);
+  }
+  if (!menu.childElementCount) return;
+  placeBusMenu(menu, x, y);
+}
+
+function openContainerMenu(bus, x, y) {
+  const menu = document.getElementById("bus-menu");
+  menu.replaceChildren();
+  if (bus.type !== "group") {
+    for (const [value, label] of [["hex", "Hex"], ["dec", "Decimal"], ["bin", "Binary"], ["oct", "Octal"]]) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.textContent = (bus.radix === value ? "✓ " : "") + label;
+      item.addEventListener("click", () => {
+        bus.radix = value;
+        bus.analog = false;
+        state.gutterSig = "";
+        closeBusMenu();
+        renderGutter();
+        drawWave();
+      });
+      menu.append(item);
+    }
+    const msb = document.createElement("button");
+    msb.type = "button";
+    msb.textContent = (bus.msbFirst ? "✓ " : "") + "MSB first";
+    msb.addEventListener("click", () => {
+      bus.msbFirst = !bus.msbFirst;
+      closeBusMenu();
       drawWave();
     });
-    menu.append(remove);
+    menu.append(msb);
   }
-  menu.classList.remove("hidden");
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.textContent = "Edit Group";
+  edit.addEventListener("click", () => {
+    closeBusMenu();
+    openEditGroup(bus);
+  });
+  menu.append(edit);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = bus.type === "group" ? "Ungroup" : "Remove bus";
+  remove.addEventListener("click", () => {
+    removeContainer(bus.id);
+    closeBusMenu();
+  });
+  menu.append(remove);
+  placeBusMenu(menu, x, y);
+}
+
+function deleteEmptyContainers() {
+  let guard = view().buses.length + 1;
+  while (guard-- > 0) {
+    const empty = new Set(view().buses.filter((container) => !(container.members || []).length).map((container) => Number(container.id)));
+    if (!empty.size) return;
+    for (const container of view().buses) {
+      container.members = (container.members || []).filter((member) => !(member.kind === "group" && empty.has(Number(member.id))));
+      container.channels = container.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+    }
+    view().buses = view().buses.filter((container) => !empty.has(Number(container.id)));
+  }
+}
+
+function placeTopLevelOrder(container, anchorKey, removedKeys, orderSnapshot) {
+  const key = "bus:" + container.id;
+  const order = orderSnapshot && orderSnapshot.length ? [...orderSnapshot] : sourceRows().map((row) => row.key);
+  const drop = new Set(removedKeys || []);
+  drop.add(key);
+  const anchorAt = anchorKey ? order.indexOf(anchorKey) : -1;
+  const next = order.filter((item) => !drop.has(item));
+  const insertAt = anchorAt < 0 ? 0 : order.slice(0, anchorAt).filter((item) => !drop.has(item)).length;
+  next.splice(Math.max(0, Math.min(insertAt, next.length)), 0, key);
+  persistOrder(next);
+}
+
+function removeContainer(id) {
+  const container = sessionContainers().find((item) => Number(item.id) === Number(id));
+  if (!container) return;
+  const parent = parentContainer(id);
+  const members = container.members || [];
+  if (parent) {
+    const at = parent.members.findIndex((member) => member.kind === "group" && Number(member.id) === Number(id));
+    const rest = parent.members.filter((_, index) => index !== at);
+    const insert = at < 0 ? rest.length : at;
+    parent.members = [...rest.slice(0, insert), ...members, ...rest.slice(insert)];
+    parent.channels = parent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+  } else {
+    const order = view().order ? [...view().order] : [];
+    const at = order.indexOf("bus:" + id);
+    const childKeys = members.filter((member) => member.kind === "group").map((member) => "bus:" + member.id);
+    if (at >= 0) order.splice(at, 1, ...childKeys);
+    else order.push(...childKeys);
+    if (order.length) persistOrder(order.filter((key) => key !== "bus:" + id));
+  }
+  view().buses = view().buses.filter((item) => Number(item.id) !== Number(id));
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+}
+
+function createChannelGroup(type, name, radix, msbFirst) {
+  const picked = selectedGroupMembers();
+  const leaves = memberLeafChannels(picked);
+  if (type === "bus" && leaves.length < 2) {
+    statusEl.textContent = "A bus needs at least two channels";
+    return false;
+  }
+  if (!picked.length || !leaves.length) {
+    statusEl.textContent = "Select a logic channel";
+    return false;
+  }
+  const v = view();
+  const used = sessionContainers().reduce((max, container) => Math.max(max, Number(container.id) || 0), 0);
+  const id = Math.max(v.nextBus || 1, used + 1);
+  v.nextBus = id + 1;
+  const container = {
+    id,
+    name,
+    type,
+    members: picked.map((member) => (
+      member.kind === "group"
+        ? { kind: "group", id: Number(member.id) }
+        : { kind: "channel", index: Number(member.index) }
+    )),
+    channels: picked.filter((member) => member.kind === "channel").map((member) => Number(member.index)),
+    radix: type === "bus" ? radix : "hex",
+    msbFirst: type === "bus" ? !!msbFirst : false,
+    folded: false,
+    analog: false,
+  };
+  const parents = picked.map((member) => memberCurrentParent(member));
+  const firstParent = parents[0] || null;
+  const shared = parents.every((parent) => (
+    !parent && !firstParent ? true : !!(parent && firstParent && Number(parent.id) === Number(firstParent.id))
+  ));
+  if (shared && firstParent) {
+    let first = firstParent.members.findIndex((member) => picked.some((item) => memberMatches(member, item)));
+    if (first < 0) first = firstParent.members.length;
+    firstParent.members = firstParent.members.filter((member) => !picked.some((item) => memberMatches(member, item)));
+    firstParent.members.splice(first, 0, { kind: "group", id });
+    firstParent.channels = firstParent.members.filter((member) => member.kind === "channel").map((member) => Number(member.index));
+    for (const member of picked) {
+      if (member.kind === "group") forgetTopLevelKey("bus:" + member.id);
+    }
+    v.buses.push(container);
+  } else {
+    const anchorKey = picked[0].kind === "group" ? ("bus:" + picked[0].id) : ("logic:" + picked[0].index);
+    const snapshot = v.order && v.order.length ? [...v.order] : sourceRows().map((row) => row.key);
+    for (const member of picked) {
+      if (member.kind === "channel") detachChannel(member.index);
+      else detachGroupMember(member.id);
+    }
+    v.buses.push(container);
+    deleteEmptyContainers();
+    const removed = picked.filter((member) => member.kind === "group").map((member) => "bus:" + member.id);
+    placeTopLevelOrder(container, anchorKey, removed, snapshot);
+  }
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+  return true;
+}
+
+function applyGroupEdits(id, type, name, radix, msbFirst) {
+  const container = sessionContainers().find((item) => Number(item.id) === Number(id));
+  if (!container) return false;
+  const leaves = descendantChannels(container).length;
+  if (type === "bus" && leaves < 2) {
+    statusEl.textContent = "A bus needs at least two channels";
+    return false;
+  }
+  if (!leaves) {
+    statusEl.textContent = "Select a logic channel";
+    return false;
+  }
+  container.name = name;
+  container.type = type === "group" ? "group" : "bus";
+  container.radix = container.type === "bus" ? radix : "hex";
+  container.msbFirst = container.type === "bus" ? !!msbFirst : false;
+  container.analog = false;
+  if (view().names) delete view().names["bus:" + container.id];
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  scheduleTiles();
+  return true;
 }
 
 function channelSpec(channel) {
@@ -4662,11 +6988,40 @@ function closeDecodeConfig() {
   document.getElementById("decode-config").classList.add("hidden");
 }
 
-let preferences = { firmware_dir: "", scripts_dir: "", theme: "system" };
+let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "" };
+let exportDirTimer = null;
+let exportDirSave = 0;
+
+function rememberExportDirectory(directory) {
+  exportChoice.directory = directory;
+  preferences.export_dir = directory;
+  try { localStorage.setItem("logicview-export-dir", directory); } catch (_) { /* the saved preferences still hold the folder */ }
+  clearTimeout(exportDirTimer);
+  exportDirTimer = setTimeout(persistExportDirectory, 250);
+}
+
+async function persistExportDirectory() {
+  const seq = ++exportDirSave;
+  const directory = preferences.export_dir || "";
+  try {
+    const response = await fetch("/api/export-dir", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ directory }),
+    });
+    if (!response.ok || seq !== exportDirSave) return;
+    const saved = await response.json();
+    if (seq === exportDirSave) preferences = saved;
+  } catch (_) { /* the field still holds the folder for this session */ }
+}
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 function applyTheme() {
   const light = preferences.theme === "light" || (preferences.theme === "system" && systemTheme.matches);
   document.documentElement.dataset.theme = light ? "light" : "dark";
+  state.gutterSig = "";
+  renderGutter();
+  drawWave();
+  if (window.ipc) window.ipc.postMessage("theme:" + (light ? "light" : "dark"));
 }
 systemTheme.addEventListener("change", applyTheme);
 async function loadDecoderCatalog() {
@@ -4676,6 +7031,12 @@ async function loadPreferences() {
   const response = await fetch("/api/preferences");
   if (!response.ok) throw new Error("Could not load preferences");
   preferences = await response.json();
+  if (preferences.export_dir) {
+    exportChoice.directory = preferences.export_dir;
+  } else if (exportChoice.directory) {
+    rememberExportDirectory(exportChoice.directory);
+  }
+  paintExportFields(null, true);
   applyTheme();
 }
 document.getElementById("preferences-open").addEventListener("click", () => {
@@ -4744,15 +7105,30 @@ document.addEventListener("click", (ev) => {
     document.getElementById("mcp-open").setAttribute("aria-expanded", "false");
   }
 });
-for (const button of document.querySelectorAll(".path-browse")) {
-  button.addEventListener("click", () => {
-    if (window.ipc) window.ipc.postMessage("pick-directory:" + button.dataset.pathTarget);
-    else document.getElementById("preferences-error").textContent = "Folder selection is available in the desktop app; enter a path here.";
-  });
-}
+document.addEventListener("click", (ev) => {
+  const source = ev.target.nodeType === 1 ? ev.target : ev.target.parentElement;
+  const button = source && source.closest(".path-browse");
+  if (!button) return;
+  if (window.ipc) {
+    window.ipc.postMessage("pick-directory:" + button.dataset.pathTarget);
+    return;
+  }
+  const message = "Folder selection is available in the desktop app; enter a path here.";
+  if (String(button.dataset.pathTarget || "").startsWith("preferences-")) {
+    document.getElementById("preferences-error").textContent = message;
+  } else {
+    statusEl.textContent = message;
+  }
+});
 window.logicviewDirectorySelected = (target, path) => {
-  if (!document.getElementById("preferences-dialog").open) return;
-  if (target === "preferences-firmware" || target === "preferences-scripts") document.getElementById(target).value = path;
+  const input = document.getElementById(target);
+  if (!input) return;
+  const preferences = target === "preferences-firmware" || target === "preferences-scripts";
+  if (preferences && !document.getElementById("preferences-dialog").open) return;
+  input.value = path;
+  if (target === "panel-export-dir" || target === "dialog-export-dir") {
+    syncExportChoice(target.startsWith("dialog-") ? "dialog" : "panel");
+  }
 };
 window.logicviewNativeDrop = (path, x, y) => {
   const target = document.elementFromPoint(x / window.devicePixelRatio, y / window.devicePixelRatio);
@@ -4761,20 +7137,61 @@ window.logicviewNativeDrop = (path, x, y) => {
     else document.getElementById("preferences-error").textContent = "Drop a folder on the directory field.";
     return;
   }
+  const row = target && target.closest && target.closest(".export-location");
+  if (row) {
+    const input = row.querySelector("input");
+    const folder = path.isDirectory ? path.value : parentDirectory(path.value);
+    if (!input || !folder) {
+      statusEl.textContent = "Drop a folder on the location field.";
+      return;
+    }
+    assignExportDirectory(input, folder);
+    return;
+  }
   if (target && target.closest(".wave-stage") && !path.isDirectory && isCaptureName(path.value)) openNativeCapture(path.value);
 };
 async function openNativeCapture(path) {
   try {
     const response = await fetch("/api/import-path", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
-    const json = await response.json();
+    const text = await response.text();
+    let json = {};
+    try { json = JSON.parse(text); } catch (_) { json = { error: text }; }
     if (!response.ok || !json.ok) throw new Error(json.error || "Could not open capture");
-    applyImportedCapture(json.data, path.split(/[\\/]/).pop());
+    await applyImportedCapture(json.data, path.split(/[\\/]/).pop());
   } catch (err) { statusEl.textContent = err.message; }
+}
+
+async function loadContributors() {
+  const list = document.getElementById("about-contributors");
+  if (!list) return;
+  try {
+    const response = await fetch("/api/contributors");
+    if (!response.ok) return;
+    const people = await response.json();
+    list.replaceChildren();
+    for (const person of people) {
+      const name = person && person.name ? String(person.name) : "";
+      const contribution = person && person.contribution ? String(person.contribution) : "";
+      if (!name) continue;
+      const item = document.createElement("li");
+      item.textContent = `${name} -- ${contribution}`;
+      list.appendChild(item);
+    }
+    const box = list.parentElement;
+    if (box) box.classList.toggle("is-still", list.scrollHeight <= box.clientHeight);
+  } catch (_) { /* the credits list stays empty when the file cannot be read */ }
 }
 
 async function boot() {
   await loadPreferences();
-  try { const response = await fetch("/api/mcp"); if (response.ok) paintMcp(await response.json()); } catch (_) { /* status is available from the flyout */ }
+  await loadContributors();
+  try {
+    const loaded = await Promise.race([
+      fetch("/api/mcp").then((response) => (response.ok ? response.json() : null)),
+      new Promise((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+    if (loaded) paintMcp(loaded);
+  } catch (_) { /* status is available from the flyout */ }
   await loadDecoderCatalog();
   await refreshSessions();
   const listed = await api({ cmd: "list_sessions" });
@@ -4799,6 +7216,13 @@ async function boot() {
 
 fillColorSwatches();
 bindCaptureDrop();
+document.getElementById("export-dialog-fields").innerHTML = exportFormHtml("dialog");
+bindExportForm("dialog");
+document.getElementById("export-dialog-cancel").addEventListener("click", closeExportDialog);
+document.getElementById("export-dialog-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  runExport("dialog");
+});
 document.getElementById("save-cancel").addEventListener("click", closeSaveDialog);
 document.getElementById("save-form").addEventListener("submit", (ev) => confirmSave(ev));
 document.getElementById("save-form").addEventListener("keydown", (ev) => {
@@ -4818,21 +7242,24 @@ document.getElementById("setup-file").addEventListener("change", (ev) => {
   if (file) openSetupFile(file);
 });
 document.getElementById("bus-cancel").addEventListener("click", closeBusDialog);
+for (const radio of document.querySelectorAll('input[name="group-type"]')) {
+  radio.addEventListener("change", syncGroupDialog);
+}
+document.getElementById("bus-msb-first").addEventListener("change", syncGroupDialog);
 document.getElementById("bus-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const channels = [...document.querySelectorAll("#bus-channels input:checked")].map((box) => Number(box.value));
-  if (channels.length < 2) {
-    statusEl.textContent = "A bus needs at least two channels";
-    return;
-  }
+  const type = document.querySelector('input[name="group-type"]:checked');
+  const radix = document.querySelector('input[name="bus-radix"]:checked');
+  const groupType = type ? type.value : "bus";
   const v = view();
-  const name = document.getElementById("bus-name").value.trim() || ("Bus " + v.nextBus);
-  v.buses.push({ id: v.nextBus, name, channels, analog: false });
-  v.nextBus += 1;
-  state.gutterSig = "";
-  closeBusDialog();
-  renderGutter();
-  drawWave();
+  const fallback = (groupType === "group" ? "Group " : "Bus ") + (editingGroupId || v.nextBus || 1);
+  const name = document.getElementById("bus-name").value.trim() || fallback;
+  const radixValue = radix ? radix.value : "hex";
+  const msbFirst = document.getElementById("bus-msb-first").checked;
+  const done = editingGroupId != null
+    ? applyGroupEdits(editingGroupId, groupType, name, radixValue, msbFirst)
+    : createChannelGroup(groupType, name, radixValue, msbFirst);
+  if (done) closeBusDialog();
 });
 
 document.getElementById("decode-config-cancel").addEventListener("click", closeDecodeConfig);

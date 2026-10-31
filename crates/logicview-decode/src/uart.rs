@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Annotation, Decoder, DecodeError, SampleSlice};
+use super::{Annotation, DecodeError, Decoder, SampleSlice};
 
 /// Stateful UART interpreter for idle-high serial data using a configured bit duration.
 #[derive(Clone, Debug)]

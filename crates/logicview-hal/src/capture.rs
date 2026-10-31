@@ -128,7 +128,11 @@ pub fn run_capture(
     let mut leader = pod.sample_leader();
     let initial_leader = leader;
     let mut scheduled = 0u64;
-    let data_transfer = if job.stream || job.continuous { STREAM_TRANSFER_BYTES } else { BUFFER_TRANSFER_BYTES };
+    let data_transfer = if job.stream || job.continuous {
+        STREAM_TRANSFER_BYTES
+    } else {
+        BUFFER_TRANSFER_BYTES
+    };
     let mut deadline = std::time::Instant::now() + job.header_wait;
 
     loop {
@@ -181,11 +185,16 @@ pub fn run_capture(
                 if header.is_none() {
                     if data.len() < LOGIC_HEADER_LEN {
                         failed = Some(HalError::Interrupted(format!(
-                            "header transfer was {} bytes", data.len()
+                            "header transfer was {} bytes",
+                            data.len()
                         )));
                         break;
                     }
-                    if data[..LOGIC_HEADER_LEN].iter().skip(4).all(|byte| *byte == 0x55) {
+                    if data[..LOGIC_HEADER_LEN]
+                        .iter()
+                        .skip(4)
+                        .all(|byte| *byte == 0x55)
+                    {
                         filler += 1;
                         if filler > 8 {
                             failed = Some(HalError::Interrupted("header fill stayed 0x55".into()));
@@ -205,9 +214,16 @@ pub fn run_capture(
                             deadline = std::time::Instant::now() + Duration::from_secs(2);
                         }
                         Err(err) => {
-                            let preview = data.iter().take(32).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
+                            let preview = data
+                                .iter()
+                                .take(32)
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             failed = Some(match err {
-                                ProtoError::BadCheckWord(word) => HalError::Message(format!("logic header check word was {word:#010x} in {preview}")),
+                                ProtoError::BadCheckWord(word) => HalError::Message(format!(
+                                    "logic header check word was {word:#010x} in {preview}"
+                                )),
                                 other => HalError::Message(format!("{other} in {preview}")),
                             });
                             break;
@@ -229,11 +245,12 @@ pub fn run_capture(
                         }
                         pending.drain(..whole);
                     }
-                    deadline = std::time::Instant::now() + if forced {
-                        Duration::from_millis(500)
-                    } else {
-                        Duration::from_secs(2)
-                    };
+                    deadline = std::time::Instant::now()
+                        + if forced {
+                            Duration::from_millis(500)
+                        } else {
+                            Duration::from_secs(2)
+                        };
                     if kept >= budget {
                         break;
                     }
@@ -253,11 +270,15 @@ pub fn run_capture(
                 let target = budget.saturating_add(initial_leader);
                 while ep.pending() < PIPE_DEPTH {
                     let size = next_transfer_size(target, scheduled, data_transfer, bulk);
-                    if size == 0 { break; }
+                    if size == 0 {
+                        break;
+                    }
                     ep.submit(Buffer::new(size));
                     scheduled = scheduled.saturating_add(size as u64);
                 }
-                if ep.pending() == 0 { break; }
+                if ep.pending() == 0 {
+                    break;
+                }
             }
             Some(done) if done.status.is_ok() => {
                 if header.is_some() {
@@ -309,7 +330,9 @@ pub fn run_capture(
 /// Limits the last USB request to the remaining budget, rounded to a packet.
 fn next_transfer_size(target: u64, scheduled: u64, max_size: usize, packet: usize) -> usize {
     let remaining = target.saturating_sub(scheduled);
-    if remaining == 0 { return 0; }
+    if remaining == 0 {
+        return 0;
+    }
     let wanted = remaining.min(max_size as u64) as usize;
     wanted.div_ceil(packet) * packet
 }
@@ -426,8 +449,14 @@ mod hw {
                 chunks += 1;
             }
             Ok(())
-        }).expect("capture and upload");
-        eprintln!("100 MHz 10 ms: {:?}, {} bytes in {} chunks", started.elapsed(), received, chunks);
+        })
+        .expect("capture and upload");
+        eprintln!(
+            "100 MHz 10 ms: {:?}, {} bytes in {} chunks",
+            started.elapsed(),
+            received,
+            chunks
+        );
         assert_eq!(report.sample_bytes, 500_000);
         assert_eq!(received, 500_000);
     }
@@ -623,16 +652,16 @@ mod hw {
             Ok(())
         })
         .expect("internal-test capture");
-        eprintln!(
-            "super internal {} bytes: {}",
-            bytes.len(),
-            pattern(&bytes)
-        );
+        eprintln!("super internal {} bytes: {}", bytes.len(), pattern(&bytes));
         if bytes.len() >= 16 {
             eprintln!("first {:02x?}", &bytes[..16]);
         }
         assert_eq!(report.header.unwrap().check_word, 0x5555_5555);
-        assert_eq!(bytes.len(), 1024, "8192 samples on one channel is 1024 bytes");
+        assert_eq!(
+            bytes.len(),
+            1024,
+            "8192 samples on one channel is 1024 bytes"
+        );
         assert!(bytes.iter().all(|byte| *byte == 0xAA), "{bytes:02x?}");
     }
 
@@ -689,8 +718,7 @@ mod hw {
         // The UI default: 1 MHz, every channel, trigger off. Divider 50
         // produced no header within 12 s. The planner's divider must return.
         let clock = crate::plan_u3_clock(1_000_000, u32::MAX, false).unwrap();
-        let divider =
-            logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
+        let divider = logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
         assert_eq!(divider & 0xffff, 100, "1 MHz low half");
         assert_eq!(divider >> 16, 0x0400, "pre-divider stage");
 
@@ -725,8 +753,7 @@ mod hw {
     fn u3pro32_one_megahertz_stream_returns_a_header() {
         let _pod = pod_lock();
         let clock = crate::plan_u3_clock(1_000_000, u32::MAX, true).unwrap();
-        let divider =
-            logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
+        let divider = logicview_proto::logic_divider(clock.hw_max_hz, 1_000_000, clock.pre_divider);
         let mut job = armed(65_536, ModeFlags::STREAM, divider);
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
@@ -796,7 +823,11 @@ mod hw {
             (100_000_000, 30, ModeFlags::STREAM),
             (250_000_000, 12, ModeFlags::STREAM),
             (500_000_000, 6, ModeFlags::STREAM | ModeFlags::HALF_RATE),
-            (1_000_000_000, 3, ModeFlags::STREAM | ModeFlags::QUARTER_RATE),
+            (
+                1_000_000_000,
+                3,
+                ModeFlags::STREAM | ModeFlags::QUARTER_RATE,
+            ),
         ] {
             match u3_stream(rate, channels, mode, 65_536) {
                 Ok(elapsed) => {
@@ -840,16 +871,19 @@ mod hw {
         decoded.channel_enable = mask;
         decoded.upper = Some([logicview_proto::UpperStage::default(); 16]);
         job.image = logicview_proto::encode_arm(&decoded).unwrap();
-        eprintln!(
-            "arm {channels}ch {rate_hz} Hz divider {:#010x}",
-            divider
-        );
+        eprintln!("arm {channels}ch {rate_hz} Hz divider {:#010x}", divider);
         let started = std::time::Instant::now();
         match run_capture(&job, |_| Ok(())) {
-            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => {
+                Ok(started.elapsed())
+            }
             Ok(report) => Err((
                 started.elapsed(),
-                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+                format!(
+                    "header {:?} bytes {}",
+                    report.header.is_some(),
+                    report.sample_bytes
+                ),
             )),
             Err(err) => Err((started.elapsed(), err.to_string())),
         }
@@ -867,7 +901,8 @@ mod hw {
         } else {
             (1u32 << channels) - 1
         };
-        let divider = logicview_proto::logic_divider(crate::U3_HW_CLOCK_HZ, rate_hz, crate::U3_PRE_DIVIDER);
+        let divider =
+            logicview_proto::logic_divider(crate::U3_HW_CLOCK_HZ, rate_hz, crate::U3_PRE_DIVIDER);
         let mut job = armed(samples, mode, divider);
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
@@ -883,10 +918,16 @@ mod hw {
         eprintln!("arm {channels}ch {rate_hz} Hz stream divider {divider:#010x} mode {mode:#06x}");
         let started = std::time::Instant::now();
         match run_capture(&job, |_| Ok(())) {
-            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => {
+                Ok(started.elapsed())
+            }
             Ok(report) => Err((
                 started.elapsed(),
-                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+                format!(
+                    "header {:?} bytes {}",
+                    report.header.is_some(),
+                    report.sample_bytes
+                ),
             )),
             Err(err) => Err((started.elapsed(), err.to_string())),
         }
@@ -965,7 +1006,10 @@ mod hw {
                 }
             }
         }
-        assert!(failed.is_empty(), "Plus modes that missed the reference: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "Plus modes that missed the reference: {failed:?}"
+        );
     }
 
     /// Builds a Plus test job for a selected sampling rate and channel mask.
@@ -978,7 +1022,10 @@ mod hw {
         let mask = (1u32 << channels) - 1;
         let plan = crate::plan_clock(rate_hz, mask, stream).expect("rate");
         let divider = logicview_proto::logic_divider(crate::HW_CLOCK_HZ, rate_hz, 1);
-        assert_eq!(plan.divider, divider, "pre-divider 1 keeps the divider in the low half");
+        assert_eq!(
+            plan.divider, divider,
+            "pre-divider 1 keeps the divider in the low half"
+        );
         let mut mode = 0u16;
         if stream {
             mode |= ModeFlags::STREAM;
@@ -1010,10 +1057,16 @@ mod hw {
         );
         let started = std::time::Instant::now();
         match run_capture(&job, |_| Ok(())) {
-            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => Ok(started.elapsed()),
+            Ok(report) if report.header.is_some() && report.sample_bytes > 0 => {
+                Ok(started.elapsed())
+            }
             Ok(report) => Err((
                 started.elapsed(),
-                format!("header {:?} bytes {}", report.header.is_some(), report.sample_bytes),
+                format!(
+                    "header {:?} bytes {}",
+                    report.header.is_some(),
+                    report.sample_bytes
+                ),
             )),
             Err(err) => Err((started.elapsed(), err.to_string())),
         }
@@ -1208,7 +1261,10 @@ mod leader {
         use super::next_transfer_size;
         assert_eq!(next_transfer_size(500_000, 0, 1024 * 1024, 512), 500_224);
         assert_eq!(next_transfer_size(500_000, 500_224, 1024 * 1024, 512), 0);
-        assert_eq!(next_transfer_size(2_000_000, 0, 1024 * 1024, 512), 1024 * 1024);
+        assert_eq!(
+            next_transfer_size(2_000_000, 0, 1024 * 1024, 512),
+            1024 * 1024
+        );
         assert_eq!(next_transfer_size(500_512, 0, 1024 * 1024, 512), 500_736);
     }
 

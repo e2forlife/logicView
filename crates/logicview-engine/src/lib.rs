@@ -100,6 +100,8 @@ pub struct ProfileInfo {
     /// Stream ceilings when the bound U3Pro32 enumerated at SuperSpeed.
     /// High-speed links keep [`Self::stream_rates`].
     pub super_stream_rates: Vec<RateBandInfo>,
+    /// Sample memory in bits. Buffered captures split this across enabled channels.
+    pub memory_bits: u64,
 }
 
 /// A discovered or bound device as presented to UI and automation clients.
@@ -350,6 +352,7 @@ impl Engine {
                 buffer_rates: rate_bands(profile.product_id, false, false),
                 stream_rates: rate_bands(profile.product_id, true, false),
                 super_stream_rates: rate_bands(profile.product_id, true, true),
+                memory_bits: logicview_hal::MEMORY_BITS,
             })
             .collect()
     }
@@ -446,9 +449,8 @@ impl Engine {
         if let Some(pid) = usb_product_id(device_id) {
             return self.attach_usb(id, device_id, pid).await;
         }
-        let pod = demo_pod(device_id).ok_or_else(|| {
-            EngineError::UnknownDevice(format!("unknown device {device_id}"))
-        })?;
+        let pod = demo_pod(device_id)
+            .ok_or_else(|| EngineError::UnknownDevice(format!("unknown device {device_id}")))?;
         let mut state = self.shared.state.lock().await;
         let id = self.resolve(&state, id)?;
         let slot = state.slot_mut(&id)?;
@@ -618,6 +620,29 @@ impl Engine {
         })
     }
 
+    /// Renames a session. Surrounding whitespace is removed, and a blank name is rejected.
+    pub async fn rename_session(&self, id: &str, name: &str) -> Result<SessionBrief, EngineError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(EngineError::Device("capture name is empty".into()));
+        }
+        let mut state = self.shared.state.lock().await;
+        let active_id = state.slots[state.active].id.clone();
+        let slot = state
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .ok_or_else(|| EngineError::UnknownSession(id.to_string()))?;
+        slot.name = name.to_string();
+        Ok(SessionBrief {
+            id: slot.id.clone(),
+            name: slot.name.clone(),
+            phase: slot.session.phase.as_str().to_string(),
+            sample_count: slot.session.store.len(),
+            active: slot.id == active_id,
+        })
+    }
+
     /// Selects the session used by commands that omit an explicit identifier.
     pub async fn select_session(&self, id: &str) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;
@@ -654,7 +679,15 @@ impl Engine {
             return Err(logicview_capture::CaptureError::Busy.into());
         }
         clamp_sample_rate(slot, &mut config);
-        planned_samples(&config)?;
+        let total = planned_samples(&config)?;
+        let ceiling = session_sample_ceiling(slot, &config);
+        if total > ceiling {
+            return Err(logicview_capture::CaptureError::TooLarge {
+                requested: total,
+                ceiling,
+            }
+            .into());
+        }
         logicview_capture::check_trigger(&config)?;
         slot.session.config = config;
         Ok(())
@@ -1613,6 +1646,7 @@ fn dsl_trigger_label(config: &SessionConfig, index: usize) -> String {
     match config.trigger_kind {
         TriggerKind::Rising => "rising".into(),
         TriggerKind::Falling => "falling".into(),
+        TriggerKind::Any => "any".into(),
         TriggerKind::High => "high".into(),
         TriggerKind::Low => "low".into(),
     }
@@ -1733,7 +1767,11 @@ fn refuse_usb_attach(slot: &Slot, pid: u16) -> Result<(), EngineError> {
             "two pods with the same product id cannot share one capture".into(),
         ));
     }
-    let usb = slot.devices.iter().filter(|device| device.kind == "usb").count();
+    let usb = slot
+        .devices
+        .iter()
+        .filter(|device| device.kind == "usb")
+        .count();
     if usb != 1 {
         return Err(EngineError::Device(
             "a capture stacks at most two USB pods".into(),
@@ -1771,9 +1809,8 @@ fn install_usb_catalog(slot: &mut Slot, devices: &[BoundDevice]) -> Result<(), E
     let mut colors = Vec::new();
     let mut origins = Vec::new();
     for device in devices {
-        let pid = usb_product_id(&device.id).ok_or_else(|| {
-            EngineError::UnknownDevice(format!("{} is not a USB pod", device.id))
-        })?;
+        let pid = usb_product_id(&device.id)
+            .ok_or_else(|| EngineError::UnknownDevice(format!("{} is not a USB pod", device.id)))?;
         let width = logicview_hal::logic_profile(pid)
             .map(|profile| usize::from(profile.channels))
             .unwrap_or(16);
@@ -1820,9 +1857,8 @@ fn pod_captures(
     let mut jobs = Vec::new();
     let stream = config.depth == DepthMode::Stream;
     for device in devices.iter().filter(|device| device.kind == "usb") {
-        let pid = usb_product_id(&device.id).ok_or_else(|| {
-            EngineError::Device(format!("{} is not a USB pod", device.id))
-        })?;
+        let pid = usb_product_id(&device.id)
+            .ok_or_else(|| EngineError::Device(format!("{} is not a USB pod", device.id)))?;
         let width = logicview_hal::logic_profile(pid)
             .map(|profile| usize::from(profile.channels))
             .unwrap_or(16);
@@ -1832,7 +1868,13 @@ fn pod_captures(
         if count == 0 {
             continue;
         }
-        let clock = clock_for(pid, config.sample_rate_hz, local, stream, device.super_speed)?;
+        let clock = clock_for(
+            pid,
+            config.sample_rate_hz,
+            local,
+            stream,
+            device.super_speed,
+        )?;
         let image = logicview_capture::device_arm(config, samples, local, &clock)?;
         let threshold = if pid == logicview_hal::U3PRO32_PID {
             Some(logicview_hal::u3_threshold_code(config.threshold_volts))
@@ -1866,7 +1908,8 @@ fn clock_for(
         EngineError::Capture(logicview_capture::CaptureError::Proto(err.to_string()))
     };
     if pid == logicview_hal::U3PRO32_PID {
-        let planned = logicview_hal::plan_u3_link(rate_hz, mask, stream, super_speed).map_err(map)?;
+        let planned =
+            logicview_hal::plan_u3_link(rate_hz, mask, stream, super_speed).map_err(map)?;
         Ok(HostClock {
             hw_max_hz: planned.hw_max_hz,
             half_rate_hz: Some(planned.half_rate_hz),
@@ -1910,6 +1953,48 @@ fn clamp_sample_rate(slot: &Slot, config: &mut SessionConfig) {
     let max = session_rate_ceiling(slot, config);
     if config.sample_rate_hz > max {
         config.sample_rate_hz = max;
+    }
+}
+
+/// Most samples this session can store for the current mode and enabled channels.
+///
+/// Stream and demo captures stay within [`logicview_capture::MAX_SAMPLES`].
+/// A buffered USB pod can use its sample memory, split across the channels
+/// enabled on that pod. Two pods are limited by the smaller share.
+fn session_sample_ceiling(slot: &Slot, config: &SessionConfig) -> u64 {
+    if config.depth == DepthMode::Stream {
+        return logicview_capture::MAX_SAMPLES;
+    }
+    let usb: Vec<&BoundDevice> = slot
+        .devices
+        .iter()
+        .filter(|device| device.kind == "usb")
+        .collect();
+    if usb.is_empty() {
+        return logicview_capture::MAX_SAMPLES;
+    }
+    let mut offset = 0usize;
+    let mut ceiling = u64::MAX;
+    for device in usb {
+        let Some(pid) = usb_product_id(&device.id) else {
+            continue;
+        };
+        let width = logicview_hal::logic_profile(pid)
+            .map(|profile| usize::from(profile.channels))
+            .unwrap_or(16);
+        let local = local_enable(config.channel_enable, offset, width);
+        offset += width;
+        let count = local.count_ones();
+        if count == 0 {
+            continue;
+        }
+        let share = logicview_hal::MEMORY_BITS / u64::from(count);
+        ceiling = ceiling.min(share);
+    }
+    if ceiling == u64::MAX {
+        logicview_capture::MAX_SAMPLES
+    } else {
+        ceiling
     }
 }
 

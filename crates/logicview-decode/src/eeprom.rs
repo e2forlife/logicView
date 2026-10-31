@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Annotation, Decoder, DecodeError, SampleSlice};
+use super::{Annotation, DecodeError, Decoder, SampleSlice};
 
 /// Interprets the supported 24xx-style EEPROM operations from I2C annotations.
 #[derive(Clone, Debug, Default)]
@@ -153,7 +153,14 @@ fn decode_transfers(rows: &[Annotation]) -> Vec<Annotation> {
                     format!("Write 0x{offset:02X} = 0x{bytes}"),
                     &[
                         ("address", format!("{offset:02X}")),
-                        ("data", payload.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join("-")),
+                        (
+                            "data",
+                            payload
+                                .iter()
+                                .map(|byte| format!("{byte:02X}"))
+                                .collect::<Vec<_>>()
+                                .join("-"),
+                        ),
                     ],
                 ));
                 pointer = Some(offset.wrapping_add(payload.len() as u8));
@@ -190,7 +197,13 @@ fn decode_transfers(rows: &[Annotation]) -> Vec<Annotation> {
 }
 
 /// Creates a higher-level EEPROM event for tables, search, and waveform annotations.
-fn eeprom_row(start: u64, end: u64, class: &str, text: String, pairs: &[(&str, String)]) -> Annotation {
+fn eeprom_row(
+    start: u64,
+    end: u64,
+    class: &str,
+    text: String,
+    pairs: &[(&str, String)],
+) -> Annotation {
     let mut fields = BTreeMap::new();
     for (key, value) in pairs {
         fields.insert((*key).to_string(), value.clone());
@@ -225,8 +238,10 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
         )

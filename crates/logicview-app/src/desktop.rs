@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
@@ -72,7 +72,14 @@ fn window_icon() -> Option<Icon> {
 
 /// Hosts the local UI in a native webview and keeps it alive until the window closes.
 fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
-    enum UiEvent { PickDirectory(String), Drop(std::path::PathBuf, i32, i32) }
+    enum UiEvent {
+        PickDirectory(String),
+        PickFile(String),
+        SaveFile(String),
+        Theme(String),
+        Close,
+        Drop(std::path::PathBuf, i32, i32),
+    }
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let ipc_proxy = event_loop.create_proxy();
     let drop_proxy = event_loop.create_proxy();
@@ -81,7 +88,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .with_visible(false)
         .with_inner_size(LogicalSize::new(1440.0, 900.0))
         .with_min_inner_size(LogicalSize::new(960.0, 640.0))
-        .with_theme(Some(tao::window::Theme::Dark));
+        .with_theme(preferred_window_theme(&logicview_config::load().theme));
     if let Some(icon) = window_icon() {
         builder = builder.with_window_icon(Some(icon));
     }
@@ -95,10 +102,31 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         .with_background_color((0x0c, 0x10, 0x16, 0xff))
         .with_clipboard(true)
         .with_ipc_handler(move |request| {
-            if let Some(target) = request.body().strip_prefix("pick-directory:") {
-                if target == "preferences-firmware" || target == "preferences-scripts" {
+            let body = request.body();
+            if let Some(target) = body.strip_prefix("pick-directory:") {
+                if matches!(
+                    target,
+                    "preferences-firmware"
+                        | "preferences-scripts"
+                        | "panel-export-dir"
+                        | "dialog-export-dir"
+                ) {
                     let _ = ipc_proxy.send_event(UiEvent::PickDirectory(target.to_string()));
                 }
+            } else if let Some(kind) = body.strip_prefix("pick-file:") {
+                if matches!(kind, "load" | "import") {
+                    let _ = ipc_proxy.send_event(UiEvent::PickFile(kind.to_string()));
+                }
+            } else if let Some(kind) = body.strip_prefix("save-file:") {
+                if kind == "lvcap" {
+                    let _ = ipc_proxy.send_event(UiEvent::SaveFile(kind.to_string()));
+                }
+            } else if let Some(theme) = body.strip_prefix("theme:") {
+                if matches!(theme, "light" | "dark" | "system") {
+                    let _ = ipc_proxy.send_event(UiEvent::Theme(theme.to_string()));
+                }
+            } else if body == "close" {
+                let _ = ipc_proxy.send_event(UiEvent::Close);
             }
         })
         .with_drag_drop_handler(move |event| {
@@ -127,9 +155,15 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
             .map_err(|err| format!("could not open the LogicView window: {err}"))?
     };
 
+    let quote = splash_quote::pick();
+    let splash_height = if quote.is_some() {
+        splash_quote::SPLASH_HEIGHT
+    } else {
+        splash_quote::LOGO_HEIGHT
+    };
     let mut splash_builder = WindowBuilder::new()
         .with_title("LogicView")
-        .with_inner_size(LogicalSize::new(780.0, 260.0))
+        .with_inner_size(LogicalSize::new(splash_quote::LOGO_WIDTH, splash_height))
         .with_decorations(false)
         .with_transparent(!cfg!(windows))
         .with_always_on_top(true)
@@ -146,7 +180,8 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         use tao::platform::unix::WindowBuilderExtUnix;
         splash_builder = splash_builder.with_skip_taskbar(true);
     }
-    let splash = splash_builder.build(&event_loop)
+    let splash = splash_builder
+        .build(&event_loop)
         .map_err(|err| format!("could not open the startup splash: {err}"))?;
     if let Some(monitor) = splash.current_monitor() {
         let origin = monitor.position();
@@ -157,31 +192,32 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
         splash.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
     }
     #[cfg(not(windows))]
-    let html = format!(r#"<!doctype html><html><head><style>
-        html,body {{ margin:0; width:100%; height:100%; overflow:hidden; background:transparent; }}
-        img {{ width:100%; height:100%; object-fit:contain; }}
-        </style></head><body><img src="{origin}/assets/AppLogo.png" alt="LogicView"></body></html>"#);
+    let html = splash_quote::webview_html(origin, quote.as_ref());
     #[cfg(not(windows))]
     let splash_builder = WebViewBuilder::new()
         .with_html(html)
         .with_transparent(true)
         .with_background_color((0, 0, 0, 0));
     #[cfg(all(not(windows), not(target_os = "linux")))]
-    let splash_view = splash_builder.build(&splash)
+    let splash_view = splash_builder
+        .build(&splash)
         .map_err(|err| format!("could not display the startup splash: {err}"))?;
     #[cfg(target_os = "linux")]
     let splash_view = {
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
-        let vbox = splash.default_vbox().ok_or_else(|| "startup splash has no GTK container".to_string())?;
-        splash_builder.build_gtk(vbox)
+        let vbox = splash
+            .default_vbox()
+            .ok_or_else(|| "startup splash has no GTK container".to_string())?;
+        splash_builder
+            .build_gtk(vbox)
             .map_err(|err| format!("could not display the startup splash: {err}"))?
     };
     #[cfg(windows)]
-    let splash_view = layered_splash::show(&splash)?;
+    let splash_view = layered_splash::show(&splash, quote)?;
     #[cfg(not(windows))]
     splash.set_visible(true);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + splash_quote::splash_duration();
     let mut splash = Some((splash_view, splash));
 
     event_loop.run(move |event, _, control_flow| {
@@ -201,6 +237,62 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                         let path = serde_json::to_string(&path.to_string_lossy()).unwrap_or_default();
                         let _ = webview.evaluate_script(&format!("window.logicviewDirectorySelected({target}, {path})"));
                     }
+                }
+                UiEvent::PickFile(kind) => {
+                    let dialog = match kind.as_str() {
+                        "load" => rfd::FileDialog::new()
+                            .set_title("Load saved capture")
+                            .add_filter("LogicView capture", &["lvcap"]),
+                        _ => rfd::FileDialog::new()
+                            .set_title("Import capture")
+                            .add_filter("Capture", &["lvcap", "dsl"]),
+                    };
+                    let chosen = dialog.pick_file();
+                    let kind_js = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into());
+                    let path_js = chosen
+                        .as_ref()
+                        .map(|path| {
+                            serde_json::to_string(&path.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "null".into())
+                        })
+                        .unwrap_or_else(|| "null".into());
+                    let _ = webview.evaluate_script(&format!(
+                        "if (window.logicviewFileSelected) window.logicviewFileSelected({kind_js}, {path_js})"
+                    ));
+                }
+                UiEvent::SaveFile(kind) => {
+                    let chosen = rfd::FileDialog::new()
+                        .set_title("Save capture")
+                        .set_file_name("capture.lvcap")
+                        .add_filter("LogicView capture", &["lvcap"])
+                        .save_file()
+                        .map(|path| {
+                            if path
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("lvcap"))
+                            {
+                                path
+                            } else {
+                                path.with_extension("lvcap")
+                            }
+                        });
+                    let kind_js = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into());
+                    let path_js = chosen
+                        .as_ref()
+                        .map(|path| {
+                            serde_json::to_string(&path.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| "null".into())
+                        })
+                        .unwrap_or_else(|| "null".into());
+                    let _ = webview.evaluate_script(&format!(
+                        "if (window.logicviewSaveSelected) window.logicviewSaveSelected({kind_js}, {path_js})"
+                    ));
+                }
+                UiEvent::Theme(choice) => {
+                    window.set_theme(preferred_window_theme(choice));
+                }
+                UiEvent::Close => {
+                    *control_flow = ControlFlow::Exit;
                 }
                 UiEvent::Drop(path, x, y) => {
                     let path = serde_json::json!({"value": path.to_string_lossy(), "isDirectory": path.is_dir()});
@@ -239,6 +331,17 @@ pub fn report_error(message: &str) {
     }
 }
 
+/// Maps a saved theme choice onto the native window caption.
+///
+/// `system` leaves the choice unset so the caption follows the operating system.
+pub(crate) fn preferred_window_theme(choice: &str) -> Option<tao::window::Theme> {
+    match choice {
+        "light" => Some(tao::window::Theme::Light),
+        "dark" => Some(tao::window::Theme::Dark),
+        _ => None,
+    }
+}
+
 /// The window may follow links inside the app, blank pages, and download blobs.
 /// Other destinations stay out of the window.
 pub(crate) fn allows_navigation(origin: &str, url: &str) -> bool {
@@ -256,7 +359,21 @@ pub(crate) fn allows_navigation(origin: &str, url: &str) -> bool {
 mod tests {
     //! Checks desktop navigation rules without starting a native window.
 
-    use super::allows_navigation;
+    use super::{allows_navigation, preferred_window_theme};
+
+    #[test]
+    fn window_caption_follows_the_saved_theme() {
+        assert_eq!(
+            preferred_window_theme("light"),
+            Some(tao::window::Theme::Light)
+        );
+        assert_eq!(
+            preferred_window_theme("dark"),
+            Some(tao::window::Theme::Dark)
+        );
+        assert_eq!(preferred_window_theme("system"), None);
+        assert_eq!(preferred_window_theme("other"), None);
+    }
 
     /// Checks that the webview accepts application pages and downloads while rejecting external
     /// origins.
@@ -280,6 +397,9 @@ mod tests {
         assert!(!allows_navigation(origin, "http://127.0.0.1:4173.example/"));
     }
 }
+
+#[path = "splash_quote.rs"]
+mod splash_quote;
 
 #[cfg(windows)]
 #[path = "splash_windows.rs"]

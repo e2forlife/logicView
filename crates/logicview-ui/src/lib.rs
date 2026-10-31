@@ -45,8 +45,14 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
+const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
+const PREFS_LOGO: &[u8] = include_bytes!("../assets/PrefsLogo.png");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
+const RUN_STREAM_ICON: &str = include_str!("../assets/keyboard_double_arrow_right.svg");
+const RUN_REPEAT_ICON: &str = include_str!("../assets/directory_sync.svg");
 const E2_LOGO: &[u8] = include_bytes!("../assets/E2logo.png");
+const LOGIC_DEVICE: &[u8] = include_bytes!("../assets/logicDevice.png");
+const CONTRIBUTORS_TOML: &str = include_str!("../../../contrib.toml");
 
 /// Shares the same engine across all HTTP and WebSocket handlers.
 #[derive(Clone)]
@@ -78,10 +84,26 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
         .route("/assets/settings.svg", get(settings_icon))
+        .route(
+            "/assets/keyboard_double_arrow_right.svg",
+            get(run_stream_icon),
+        )
+        .route("/assets/directory_sync.svg", get(run_repeat_icon))
         .route("/assets/AppLogo.png", get(app_logo))
+        .route("/assets/ExportFileLogo.png", get(export_logo))
+        .route("/assets/PrefsLogo.png", get(prefs_logo))
         .route("/assets/E2logo.png", get(e2_logo))
-        .route("/api/preferences", get(get_preferences).post(save_preferences))
-        .route("/api/mcp", get(mcp_server::status).post(mcp_server::configure))
+        .route("/assets/logicDevice.png", get(logic_device))
+        .route("/api/contributors", get(contributors_json))
+        .route(
+            "/api/preferences",
+            get(get_preferences).post(save_preferences),
+        )
+        .route("/api/export-dir", post(save_export_dir))
+        .route(
+            "/api/mcp",
+            get(mcp_server::status).post(mcp_server::configure),
+        )
         .route("/api/health", get(health))
         .route("/api/command", post(command))
         .route("/api/events", get(events))
@@ -90,6 +112,8 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/api/export/dsl", get(export_dsl))
         .route("/api/export/csv", get(export_csv))
         .route("/api/export/xlsx", get(export_xlsx))
+        .route("/api/export-to", post(export_to))
+        .route("/api/save-as", post(save_as))
         .route(
             "/api/import",
             post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
@@ -123,7 +147,9 @@ pub async fn serve_listener(
     let local = listener.local_addr()?;
     tracing::info!(%local, "LogicView UI listening");
     let control = mcp_server::Control::default();
-    if let Err(err) = control.restore(engine.clone()).await { tracing::warn!("MCP server: {err}"); }
+    if let Err(err) = control.restore(engine.clone()).await {
+        tracing::warn!("MCP server: {err}");
+    }
     axum::serve(listener, router_with_control(engine, control)).await?;
     Ok(())
 }
@@ -136,10 +162,28 @@ async fn get_preferences() -> Json<logicview_config::Preferences> {
     Json(prefs)
 }
 
-async fn save_preferences(Json(mut prefs): Json<logicview_config::Preferences>) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
+async fn save_preferences(
+    Json(mut prefs): Json<logicview_config::Preferences>,
+) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
     let current = logicview_config::load();
     prefs.mcp_enabled = current.mcp_enabled;
     prefs.mcp_port = current.mcp_port;
+    prefs.export_dir = current.export_dir;
+    logicview_config::save(&prefs).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(prefs))
+}
+
+#[derive(Deserialize)]
+struct ExportDirBody {
+    directory: String,
+}
+
+/// Remembers the export folder without changing the other preferences.
+async fn save_export_dir(
+    Json(input): Json<ExportDirBody>,
+) -> Result<Json<logicview_config::Preferences>, (StatusCode, String)> {
+    let mut prefs = logicview_config::load();
+    prefs.export_dir = input.directory;
     logicview_config::save(&prefs).map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     Ok(Json(prefs))
 }
@@ -154,14 +198,88 @@ async fn app_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], APP_LOGO)
 }
 
+/// Serves the export dialog artwork.
+async fn export_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EXPORT_LOGO)
+}
+
+/// Serves the Preferences dialog header artwork.
+async fn prefs_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], PREFS_LOGO)
+}
+
 /// Serves the locally embedded Material Symbols settings icon.
 async fn settings_icon() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/svg+xml")], SETTINGS_ICON)
 }
 
+/// Serves the stream-mode run icon, Keyboard Double Arrow Right.
+async fn run_stream_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], RUN_STREAM_ICON)
+}
+
+/// Serves the repeat and loop run icon, Directory Sync.
+async fn run_repeat_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], RUN_REPEAT_ICON)
+}
+
 /// Serves the embedded E2 artwork for the About dialog.
 async fn e2_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], E2_LOGO)
+}
+
+/// Serves the pod photograph used in the device chip and device pane.
+async fn logic_device() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], LOGIC_DEVICE)
+}
+
+/// One person shown in the About dialog as `name -- contribution`.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct Contributor {
+    name: String,
+    contribution: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ContributorFile {
+    #[serde(default)]
+    contributors: Vec<Contributor>,
+}
+
+/// Loads credits from an external file when one is present, otherwise the copy packaged with the app.
+fn contributors() -> &'static [Contributor] {
+    static LIST: std::sync::OnceLock<Vec<Contributor>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let explicit = std::env::var_os("LOGICVIEW_CONTRIB").map(std::path::PathBuf::from);
+        let candidates = explicit
+            .into_iter()
+            .chain([std::path::PathBuf::from("contrib.toml")])
+            .chain(
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|dir| dir.join("contrib.toml"))),
+            );
+        for path in candidates {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                match toml::from_str::<ContributorFile>(&contents) {
+                    Ok(file) if !file.contributors.is_empty() => return file.contributors,
+                    Ok(_) => eprintln!("{} contains no contributors", path.display()),
+                    Err(err) => eprintln!("Invalid contributors {}: {err}", path.display()),
+                }
+            }
+        }
+        toml::from_str::<ContributorFile>(CONTRIBUTORS_TOML)
+            .expect("bundled contributors are valid")
+            .contributors
+    })
+}
+
+/// Serves the About-dialog credits read from the packaged contributor list.
+async fn contributors_json() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(contributors().to_vec()),
+    )
 }
 
 /// Serves the embedded styles used by the waveform workspace.
@@ -237,16 +355,43 @@ struct ImportQuery {
 }
 
 #[derive(Deserialize)]
-struct ImportPath { path: std::path::PathBuf }
-async fn import_path(State(app): State<AppState>, Json(input): Json<ImportPath>) -> Result<Json<Value>, (StatusCode, String)> {
-    let name = input.path.file_name().and_then(|s| s.to_str()).ok_or((StatusCode::BAD_REQUEST, "Invalid file name".into()))?;
-    if !["lvcap", "dsl"].iter().any(|ext| input.path.extension().is_some_and(|value| value.eq_ignore_ascii_case(ext))) {
-        return Err((StatusCode::BAD_REQUEST, "Expected a .lvcap or .dsl file".into()));
+struct ImportPath {
+    path: std::path::PathBuf,
+}
+async fn import_path(
+    State(app): State<AppState>,
+    Json(input): Json<ImportPath>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let name = input
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid file name".into()))?;
+    if !["lvcap", "dsl"].iter().any(|ext| {
+        input
+            .path
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Expected a .lvcap or .dsl file".into(),
+        ));
     }
-    let metadata = std::fs::metadata(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 { return Err((StatusCode::BAD_REQUEST, "Invalid or oversized capture file".into())); }
+    let metadata =
+        std::fs::metadata(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid or oversized capture file".into(),
+        ));
+    }
     let bytes = std::fs::read(&input.path).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let result = app.engine.import_capture(None, name, &bytes).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let result = app
+        .engine
+        .import_capture(None, name, &bytes)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(json!({"ok": true, "data": result})))
 }
 
@@ -256,10 +401,7 @@ async fn import_capture(
     Query(query): Query<ImportQuery>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let status = app
-        .engine
-        .import_capture(None, &query.name, &body)
-        .await?;
+    let status = app.engine.import_capture(None, &query.name, &body).await?;
     Ok(Json(json!({"ok": true, "data": status})))
 }
 
@@ -310,6 +452,167 @@ async fn export_csv(State(app): State<AppState>) -> Result<Response, ApiError> {
         file.rows,
         file.total,
     ))
+}
+
+/// Folder, file name, and format for a capture written by the export form.
+#[derive(Deserialize)]
+struct ExportTo {
+    kind: String,
+    directory: std::path::PathBuf,
+    filename: String,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Builds the requested export and saves it under the chosen folder.
+async fn export_to(
+    State(app): State<AppState>,
+    Json(input): Json<ExportTo>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let meta = std::fs::metadata(&input.directory).map_err(|err| export_error(err.to_string()))?;
+    if !meta.is_dir() {
+        return Err(export_error("Choose an existing folder"));
+    }
+    let (ext, bytes, rows, total) = match input.kind.as_str() {
+        "csv" => {
+            let file = app
+                .engine
+                .export_samples_csv(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".csv", file.body, Some(file.rows), Some(file.total))
+        }
+        "xlsx" => {
+            let file = app
+                .engine
+                .export_samples_xlsx(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".xlsx", file.body, Some(file.rows), Some(file.total))
+        }
+        "lvcap" => {
+            let status = app
+                .engine
+                .status(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            if status.sample_count == 0 {
+                return Err(export_error("nothing captured yet"));
+            }
+            let bytes = app
+                .engine
+                .export_zip(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".lvcap", bytes, None, None)
+        }
+        "dsl" => {
+            let bytes = app
+                .engine
+                .export_dsl(None)
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".dsl", bytes, None, None)
+        }
+        "annotations" => {
+            let text = app
+                .engine
+                .export_annotations(None, "csv", input.query.as_deref())
+                .await
+                .map_err(|err| export_error(err.to_string()))?;
+            (".csv", text.into_bytes(), None, None)
+        }
+        _ => return Err(export_error("Unknown export type")),
+    };
+    let name = safe_export_name(&input.filename, ext)?;
+    let path = input.directory.join(&name);
+    if path.file_name().and_then(|value| value.to_str()) != Some(name.as_str()) {
+        return Err(export_error("Enter a file name without a folder"));
+    }
+    std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "path": path.to_string_lossy(),
+        "rows": rows,
+        "total": total,
+    })))
+}
+
+/// Full path chosen in the system save dialog.
+#[derive(Deserialize)]
+struct SaveAs {
+    path: std::path::PathBuf,
+}
+
+/// Writes the current capture to the file chosen in the system save dialog.
+async fn save_as(
+    State(app): State<AppState>,
+    Json(input): Json<SaveAs>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !input.path.is_absolute() {
+        return Err(export_error("Choose a file"));
+    }
+    let path = if input
+        .path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lvcap"))
+    {
+        input.path
+    } else {
+        input.path.with_extension("lvcap")
+    };
+    let parent = path.parent().filter(|dir| dir.is_dir()).ok_or_else(|| {
+        export_error("Choose a folder that exists")
+    })?;
+    if path.file_name().is_none() || parent.as_os_str().is_empty() {
+        return Err(export_error("Choose a file"));
+    }
+    if path.exists() && !path.is_file() {
+        return Err(export_error("Choose a file"));
+    }
+    let status = app
+        .engine
+        .status(None)
+        .await
+        .map_err(|err| export_error(err.to_string()))?;
+    if status.sample_count == 0 {
+        return Err(export_error("nothing captured yet"));
+    }
+    let bytes = app
+        .engine
+        .export_zip(None)
+        .await
+        .map_err(|err| export_error(err.to_string()))?;
+    std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "path": path.to_string_lossy(),
+    })))
+}
+
+/// Rejects a file name that would escape the chosen folder, and adds the format extension.
+fn safe_export_name(raw: &str, ext: &str) -> Result<String, (StatusCode, Json<Value>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains(['/', '\\', '\0'])
+    {
+        return Err(export_error("Enter a file name without a folder"));
+    }
+    if trimmed.to_ascii_lowercase().ends_with(ext) {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("{trimmed}{ext}"))
+    }
+}
+
+/// Reports an export problem as JSON the page can show in the status line.
+fn export_error(message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok": false, "error": message.into()})),
+    )
 }
 
 /// Downloads individual capture samples as an Excel workbook.
@@ -460,6 +763,9 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             Ok(json!({"sessions": sessions, "active": active}))
         }
         Command::CreateSession { name } => Ok(json!(engine.create_session(name).await?)),
+        Command::RenameSession { id, name } => {
+            Ok(json!(engine.rename_session(&id, &name).await?))
+        }
         Command::SelectSession { id } => {
             engine.select_session(&id).await?;
             Ok(json!({"id": id}))
@@ -468,6 +774,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             session,
             sample_rate_hz,
             duration_ms,
+            duration_ns,
             realtime,
             trigger_enabled,
             trigger_percent,
@@ -491,6 +798,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                     SessionConfig {
                         sample_rate_hz,
                         duration_ms,
+                        duration_ns,
                         realtime,
                         trigger_enabled,
                         trigger_percent,
@@ -515,6 +823,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                         trigger_channel,
                         trigger_kind: match trigger_kind.as_str() {
                             "falling" => TriggerKind::Falling,
+                            "any" | "either" => TriggerKind::Any,
                             "high" => TriggerKind::High,
                             "low" => TriggerKind::Low,
                             _ => TriggerKind::Rising,
@@ -954,6 +1263,10 @@ enum Command {
     CreateSession {
         name: Option<String>,
     },
+    RenameSession {
+        id: String,
+        name: String,
+    },
     SelectSession {
         id: String,
     },
@@ -961,6 +1274,8 @@ enum Command {
         session: Option<String>,
         sample_rate_hz: u64,
         duration_ms: u64,
+        #[serde(default)]
+        duration_ns: u64,
         #[serde(default)]
         realtime: bool,
         #[serde(default)]
@@ -1204,27 +1519,126 @@ mod tests {
             .await
             .unwrap();
         assert!(res.status().is_success());
-        let logo = app.clone()
-            .oneshot(Request::builder().uri("/assets/AppLogo.png").body(Body::empty()).unwrap())
-            .await.unwrap();
+        let logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/AppLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(logo.status(), StatusCode::OK);
         assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
         let logo_bytes = logo.into_body().collect().await.unwrap().to_bytes();
         assert!(logo_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-        let e2_logo = app.clone()
-            .oneshot(Request::builder().uri("/assets/E2logo.png").body(Body::empty()).unwrap())
-            .await.unwrap();
+        let export_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/ExportFileLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(export_logo.status(), StatusCode::OK);
+        assert_eq!(export_logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(export_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let prefs_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/PrefsLogo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefs_logo.status(), StatusCode::OK);
+        assert_eq!(prefs_logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(prefs_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let e2_logo = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/E2logo.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(e2_logo.status(), StatusCode::OK);
         assert_eq!(e2_logo.headers()[header::CONTENT_TYPE], "image/png");
-        assert!(e2_logo.into_body().collect().await.unwrap().to_bytes().starts_with(b"\x89PNG\r\n\x1a\n"));
-        let settings = app.clone()
-            .oneshot(Request::builder().uri("/assets/settings.svg").body(Body::empty()).unwrap())
-            .await.unwrap();
+        assert!(e2_logo
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let device_icon = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/logicDevice.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(device_icon.status(), StatusCode::OK);
+        assert_eq!(device_icon.headers()[header::CONTENT_TYPE], "image/png");
+        assert!(device_icon
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .starts_with(b"\x89PNG\r\n\x1a\n"));
+        let settings = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/settings.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(settings.status(), StatusCode::OK);
         assert_eq!(settings.headers()[header::CONTENT_TYPE], "image/svg+xml");
         let svg = settings.into_body().collect().await.unwrap().to_bytes();
         assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+        for uri in [
+            "/assets/keyboard_double_arrow_right.svg",
+            "/assets/directory_sync.svg",
+        ] {
+            let icon = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(icon.status(), StatusCode::OK);
+            assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/svg+xml");
+            let bytes = icon.into_body().collect().await.unwrap().to_bytes();
+            assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+        }
         let page = app
+            .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -1237,6 +1651,33 @@ mod tests {
         assert!(html.contains("id=\"device-select\""));
         assert!(html.contains("id=\"device-name\""));
         assert!(html.contains("id=\"cursor-mode\""));
+        assert!(html.contains("id=\"export-dialog\""));
+        assert!(html.contains("ExportFileLogo.png"));
+        assert!(html.contains("PrefsLogo.png"));
+        assert!(html.contains("logicDevice.png"));
+        assert!(html.contains("id=\"trig-kind\""));
+        assert!(html.contains("id=\"trig-channel\""));
+        assert!(html.contains("id=\"trig-pre\""));
+        assert!(html.contains("class=\"tool-divider\""));
+        assert!(html.contains("about-copy-app"));
+        assert!(html.contains("about-copy-e2"));
+        assert!(html.contains("passionate about engineering"));
+        assert!(html.contains("id=\"about-contributors\""));
+        let credits = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/contributors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(credits.status(), StatusCode::OK);
+        let credits_body = credits.into_body().collect().await.unwrap().to_bytes();
+        let credits_json: Value = serde_json::from_slice(&credits_body).unwrap();
+        assert_eq!(credits_json[0]["name"], "Chuck");
+        assert!(credits_json[0]["contribution"].as_str().unwrap().len() > 0);
         assert!(!html.contains("DreamSourceLab"));
         assert!(!html.contains(">Instant<"));
         assert!(!html.contains("Use Demo"));
@@ -1292,6 +1733,12 @@ mod tests {
         let app = router(Engine::new());
         let created = post(&app, json!({"cmd": "create_session", "name": "Capture 2"})).await;
         assert_eq!(created["id"], "ses-2");
+        let renamed = post(
+            &app,
+            json!({"cmd": "rename_session", "id": "ses-2", "name": "  Bus capture  "}),
+        )
+        .await;
+        assert_eq!(renamed["name"], "Bus capture");
         let listed = post(&app, json!({"cmd": "list_sessions"})).await;
         assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(listed["active"], "ses-2");
@@ -1677,6 +2124,165 @@ mod tests {
         assert!(xlsx.windows(6).any(|window| window == b"time_s"));
         assert!(xlsx.windows(3).any(|window| window == b"CLK"));
         assert!(xlsx.windows(4).any(|window| window == b"SINE"));
+    }
+
+    /// Writes a capture into a chosen folder and rejects a path that is not a folder.
+    #[tokio::test]
+    async fn export_to_writes_the_chosen_folder() {
+        let app = router(Engine::new());
+        let missing = std::env::temp_dir().join("logicview-export-missing");
+        let _ = std::fs::remove_dir_all(&missing);
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": missing,
+                            "filename": "Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+
+        let dir = std::env::temp_dir().join(format!("logicview-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": dir,
+                            "filename": "../Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::BAD_REQUEST);
+
+        let saved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export-to")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "csv",
+                            "directory": &dir,
+                            "filename": "Capture(1)"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(saved.status().is_success());
+        let body = saved.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        let written = std::fs::read(dir.join("Capture(1).csv")).unwrap();
+        assert!(written.starts_with(b"time_s"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a capture to the absolute path chosen by the system save dialog.
+    #[tokio::test]
+    async fn save_as_writes_the_chosen_file() {
+        let app = router(Engine::new());
+        let relative = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/save-as")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"path": "capture.lvcap"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(relative.status(), StatusCode::BAD_REQUEST);
+
+        post(
+            &app,
+            json!({
+                "cmd": "configure",
+                "sample_rate_hz": 1_000_000,
+                "duration_ms": 16,
+                "realtime": false
+            }),
+        )
+        .await;
+        post(&app, json!({"cmd": "start"})).await;
+        let mut status = json!({});
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            status = post(&app, json!({"cmd": "status"})).await;
+            if status["phase"] == "stopped" {
+                break;
+            }
+        }
+        assert_eq!(status["phase"], "stopped");
+
+        let path = std::env::temp_dir().join(format!("logicview-save-as-{}.lvcap", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let saved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/save-as")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({"path": path})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(saved.status().is_success());
+        let written = std::fs::read(&path).unwrap();
+        assert!(written.starts_with(b"PK"));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Checks that the UI listener stays on the local host.

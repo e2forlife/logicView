@@ -19,8 +19,7 @@ fn main() {
         .into_rgba8();
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let window = resize(&source, WINDOW_PX);
-    std::fs::write(out_dir.join("window-icon.rgba"), window.as_raw())
-        .expect("write window icon");
+    std::fs::write(out_dir.join("window-icon.rgba"), window.as_raw()).expect("write window icon");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_exe_icon(&source, &out_dir);

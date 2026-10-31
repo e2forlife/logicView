@@ -19,6 +19,9 @@ use crate::DEMO_HW_MAX_RATE;
 /// Hard stop so a bad duration cannot allocate without bound.
 pub const MAX_SAMPLES: u64 = 16_000_000;
 
+/// Largest buffered record one channel can hold. Matches `logicview_hal::MEMORY_BITS`.
+pub const MAX_BUFFER_SAMPLES: u64 = 256 * 1024 * 1024;
+
 /// Samples produced per demo poll. A multiple of the 64-sample atom.
 pub const DEMO_CHUNK_SAMPLES: u64 = 65_536;
 
@@ -82,6 +85,11 @@ pub enum TriggerKind {
     #[default]
     Rising,
     Falling,
+    /// Either transition. The demo source marks the first edge in either
+    /// direction. The arm image uses the edge bit with a low post-edge level,
+    /// the same bits as a falling edge on the measured pod. A distinct
+    /// either-edge record has not been checked on hardware.
+    Any,
     High,
     Low,
 }
@@ -123,8 +131,10 @@ pub struct HostClock {
 pub struct SessionConfig {
     /// Requested samples per second, validated against the selected hardware limits.
     pub sample_rate_hz: u64,
-    /// Requested record duration used to plan a bounded sample count.
+    /// Requested record length in milliseconds. Ignored when [`Self::duration_ns`] is set.
     pub duration_ms: u64,
+    /// Requested record length in nanoseconds. Zero keeps [`Self::duration_ms`].
+    pub duration_ns: u64,
     /// Paces demo delivery for live playback instead of generating the record as fast as possible.
     pub realtime: bool,
     /// Enables trigger settings for normal capture; instant capture bypasses them.
@@ -166,6 +176,7 @@ impl Default for SessionConfig {
         Self {
             sample_rate_hz: 1_000_000,
             duration_ms: 2_000,
+            duration_ns: 0,
             realtime: false,
             trigger_enabled: false,
             trigger_percent: 10.0,
@@ -189,7 +200,7 @@ impl Default for SessionConfig {
 /// Edges that arm the capture, in order.
 ///
 /// A non-empty `trigger_steps` list wins. Otherwise a rising or falling
-/// `trigger_kind` is one step. High and low stay a single level stage.
+/// `trigger_kind` is one step. High, low, and either-edge stay a single stage.
 pub fn active_edge_steps(config: &SessionConfig) -> Vec<TriggerStep> {
     if !config.trigger_steps.is_empty() {
         return config.trigger_steps.clone();
@@ -203,7 +214,7 @@ pub fn active_edge_steps(config: &SessionConfig) -> Vec<TriggerStep> {
             channel: config.trigger_channel,
             rising: false,
         }],
-        TriggerKind::High | TriggerKind::Low => Vec::new(),
+        TriggerKind::Any | TriggerKind::High | TriggerKind::Low => Vec::new(),
     }
 }
 
@@ -371,6 +382,23 @@ impl Session {
         {
             return;
         }
+        if self.config.trigger_steps.is_empty() && self.config.trigger_kind == TriggerKind::Any {
+            let channel = self.config.trigger_channel as usize;
+            let len = self.store.len();
+            if channel >= self.store.channel_count() || len < 2 {
+                return;
+            }
+            let mut previous = self.store.level(channel, 0).unwrap_or(false);
+            for sample in 1..len {
+                let level = self.store.level(channel, sample).unwrap_or(previous);
+                if level != previous {
+                    self.trigger_sample = Some(sample);
+                    return;
+                }
+                previous = level;
+            }
+            return;
+        }
         let steps = active_edge_steps(&self.config);
         if steps.is_empty() {
             return;
@@ -456,6 +484,17 @@ impl Session {
         self.analog.truncate(self.store.len() as usize);
         self.locate_edge_trigger();
         if self.resolve_edges && self.config.trigger_enabled && !self.instant {
+            if self.config.trigger_steps.is_empty()
+                && self.config.trigger_kind == TriggerKind::Any
+                && self.trigger_sample.is_none()
+            {
+                let channel = self.config.trigger_channel as usize;
+                if channel >= self.store.channel_count() {
+                    self.warn("trigger names a channel this capture does not have");
+                } else {
+                    self.warn("trigger edge was not seen in the captured samples");
+                }
+            }
             let steps = active_edge_steps(&self.config);
             if !steps.is_empty() && self.trigger_sample.is_none() {
                 if steps
@@ -674,7 +713,7 @@ fn build_arm(
             let bit = 1u32 << (channel % 16);
             let (value, edge) = match config.trigger_kind {
                 TriggerKind::Rising => (bit, bit),
-                TriggerKind::Falling => (0, bit),
+                TriggerKind::Falling | TriggerKind::Any => (0, bit),
                 TriggerKind::High => (bit, 0),
                 TriggerKind::Low => (0, 0),
             };
@@ -685,7 +724,11 @@ fn build_arm(
                 stages[0].edge = edge;
             } else {
                 let mut extended = [UpperStage::default(); 16];
-                extended[0] = UpperStage { mask: bit, value, edge };
+                extended[0] = UpperStage {
+                    mask: bit,
+                    value,
+                    edge,
+                };
                 upper = Some(extended);
             }
             0
@@ -703,7 +746,11 @@ fn build_arm(
             // The demo path proves the sequence by searching samples; the
             // pod image is written and has not been run on hardware.
             let count = apply_edge_stages(&steps, &mut stages, &mut upper)?;
-            if clock.ext_record { count - 1 } else { count }
+            if clock.ext_record {
+                count - 1
+            } else {
+                count
+            }
         } else {
             let channel = config.trigger_channel.min(31);
             let bit = 1u32 << (channel % 16);
@@ -711,7 +758,7 @@ fn build_arm(
                 TriggerKind::High => (bit, 0),
                 TriggerKind::Low => (0, 0),
                 TriggerKind::Rising => (bit, bit),
-                TriggerKind::Falling => (0, bit),
+                TriggerKind::Falling | TriggerKind::Any => (0, bit),
             };
             if channel < 16 {
                 stages[0] = Stage {
@@ -756,22 +803,33 @@ fn build_arm(
 }
 
 /// How many samples a config will store, after atom alignment.
+///
+/// A set [`SessionConfig::duration_ns`] wins over milliseconds. Stream captures
+/// stop at [`MAX_SAMPLES`]. Buffer captures may fill one channel of pod memory.
 pub fn planned_samples(config: &SessionConfig) -> Result<u64, CaptureError> {
     if config.sample_rate_hz == 0 {
         return Err(CaptureError::BadRate);
     }
-    if config.duration_ms == 0 {
+    let nanos = if config.duration_ns > 0 {
+        config.duration_ns
+    } else if config.duration_ms > 0 {
+        config.duration_ms.saturating_mul(1_000_000)
+    } else {
         return Err(CaptureError::BadDuration);
-    }
-    let mut total = config.sample_rate_hz.saturating_mul(config.duration_ms) / 1000;
+    };
+    let mut total = config.sample_rate_hz.saturating_mul(nanos) / 1_000_000_000;
     total -= total % 64;
     if total == 0 {
         return Err(CaptureError::BadDuration);
     }
-    if total > MAX_SAMPLES {
+    let ceiling = match config.depth {
+        DepthMode::Stream => MAX_SAMPLES,
+        DepthMode::Buffer => MAX_BUFFER_SAMPLES,
+    };
+    if total > ceiling {
         return Err(CaptureError::TooLarge {
             requested: total,
-            ceiling: MAX_SAMPLES,
+            ceiling,
         });
     }
     Ok(total)
@@ -895,6 +953,40 @@ mod tests {
         assert_eq!(armed.stages[1].count, 1);
     }
 
+    /// Either-edge stays one stage. The demo source locates the transition itself.
+    #[test]
+    fn an_either_edge_is_a_single_stage() {
+        let config = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            trigger_enabled: true,
+            trigger_channel: 2,
+            trigger_kind: TriggerKind::Any,
+            ..SessionConfig::default()
+        };
+        let bytes = build_arm(
+            &config,
+            262_144,
+            false,
+            0xFFFF,
+            &HostClock {
+                hw_max_hz: 100_000_000,
+                half_rate_hz: None,
+                quarter_rate_hz: None,
+                pre_divider: 1,
+                ext_record: false,
+            },
+        )
+        .unwrap();
+        let armed = decode_arm(&bytes).unwrap();
+        assert!(armed.mode.contains(ModeFlags::TRIGGER_ENABLE));
+        assert!(!armed.mode.contains(ModeFlags::SERIAL_TRIGGER));
+        assert_eq!(armed.stage_count, 1);
+        assert_eq!(armed.stages[0].mask, 1 << 2);
+        assert_eq!(armed.stages[0].edge, 1 << 2);
+        assert!(active_edge_steps(&config).is_empty());
+    }
+
     /// Checks that staged clocks and extended trigger records are selected for the wider device.
     #[test]
     fn u3_pre_divider_stage_sits_in_the_high_half() {
@@ -926,11 +1018,20 @@ mod tests {
 
     #[test]
     fn u3_simple_edge_uses_reference_trigger_record_for_both_banks() {
-        let clock = HostClock { hw_max_hz: 500_000_000, half_rate_hz: None,
-            quarter_rate_hz: None, pre_divider: 5, ext_record: true };
+        let clock = HostClock {
+            hw_max_hz: 500_000_000,
+            half_rate_hz: None,
+            quarter_rate_hz: None,
+            pre_divider: 5,
+            ext_record: true,
+        };
         for channel in [3, 19] {
-            let config = SessionConfig { trigger_enabled: true, trigger_channel: channel,
-                trigger_kind: TriggerKind::Rising, ..SessionConfig::default() };
+            let config = SessionConfig {
+                trigger_enabled: true,
+                trigger_channel: channel,
+                trigger_kind: TriggerKind::Rising,
+                ..SessionConfig::default()
+            };
             let bytes = build_arm(&config, 64_000, false, u32::MAX, &clock).unwrap();
             let arm = decode_arm(&bytes).unwrap();
             assert!(!arm.mode.contains(ModeFlags::SERIAL_TRIGGER));
@@ -971,6 +1072,44 @@ mod tests {
         assert!(!armed.mode.contains(ModeFlags::SLOW_ACQUISITION));
         assert!(!armed.mode.contains(ModeFlags::HALF_RATE));
         assert!(armed.upper.is_some());
+    }
+
+    /// Nanoseconds override milliseconds, and a buffer may fill one channel of memory.
+    #[test]
+    fn duration_ns_plans_short_captures_and_buffer_can_fill_memory() {
+        let short = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            duration_ns: 64_000,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&short).unwrap(), 64);
+
+        let millis = SessionConfig {
+            sample_rate_hz: 1_000_000,
+            duration_ms: 10,
+            duration_ns: 0,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&millis).unwrap(), 9_984);
+
+        let full = SessionConfig {
+            sample_rate_hz: MAX_BUFFER_SAMPLES,
+            duration_ms: 0,
+            duration_ns: 1_000_000_000,
+            depth: DepthMode::Buffer,
+            ..SessionConfig::default()
+        };
+        assert_eq!(planned_samples(&full).unwrap(), MAX_BUFFER_SAMPLES);
+
+        let stream = SessionConfig {
+            depth: DepthMode::Stream,
+            ..full.clone()
+        };
+        match planned_samples(&stream) {
+            Err(CaptureError::TooLarge { ceiling, .. }) => assert_eq!(ceiling, MAX_SAMPLES),
+            other => panic!("expected a stream ceiling, got {other:?}"),
+        }
     }
 
     /// Checks that unsupported trigger depth is rejected before arming.

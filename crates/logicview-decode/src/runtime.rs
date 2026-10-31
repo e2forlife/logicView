@@ -45,15 +45,30 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
     }
     annotations.extend(decoder.finish());
     let packets = if request.protocol == "spi" {
-        let mut packets: Vec<_> = annotations.iter().filter(|row| row.class == "word").map(|row| {
-            let byte = |name: &str| row.fields.get(name).and_then(|s| u64::from_str_radix(s, 16).ok());
-            super::ProtocolPacket { start_sample: row.start_sample, end_sample: row.end_sample,
-                kind: "DATA".into(), data: serde_json::json!({ "mosi": byte("mosi"), "miso": byte("miso") }) }
-        }).collect();
+        let mut packets: Vec<_> = annotations
+            .iter()
+            .filter(|row| row.class == "word")
+            .map(|row| {
+                let byte = |name: &str| {
+                    row.fields
+                        .get(name)
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                };
+                super::ProtocolPacket {
+                    start_sample: row.start_sample,
+                    end_sample: row.end_sample,
+                    kind: "DATA".into(),
+                    data: serde_json::json!({ "mosi": byte("mosi"), "miso": byte("miso") }),
+                }
+            })
+            .collect();
         if let Some((_, bytes)) = request.channels.iter().find(|(name, _)| *name == "cs") {
             let start = request.region.start.min(end);
             if start < end {
-                let active_high = request.options.iter().any(|(key, value)| key == "cs" && value == "high");
+                let active_high = request
+                    .options
+                    .iter()
+                    .any(|(key, value)| key == "cs" && value == "high");
                 let mut previous = logicview_analysis::bit_at(bytes, start);
                 for sample in start + 1..end {
                     let current = logicview_analysis::bit_at(bytes, sample);
@@ -67,7 +82,9 @@ pub fn run(request: &DecodeRequest<'_>, cancel: &AtomicBool) -> Result<DecodeOut
         }
         packets.sort_by_key(|packet| packet.end_sample);
         packets
-    } else { Vec::new() };
+    } else {
+        Vec::new()
+    };
     Ok(DecodeOutput::new(annotations, packets, false))
 }
 
@@ -224,8 +241,10 @@ mod tests {
                 channels: &channels,
                 options: &[],
                 region: 0..len,
-                sample_len: len, sample_rate_hz: None,
-                lower: &[], lower_packets: &[],
+                sample_len: len,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &[],
             },
             &AtomicBool::new(true),
         )
@@ -241,7 +260,11 @@ mod tests {
             ann("address", "Write 0x50", &[("raw", "A0"), ("address", "50")]),
             ann("data", "Data 0x10", &[("data", "10")]),
             ann("data", "Data 0x5A", &[("data", "5A")]),
-            ann("word", "MOSI 0xA5 MISO 0x3C", &[("mosi", "A5"), ("miso", "3C")]),
+            ann(
+                "word",
+                "MOSI 0xA5 MISO 0x3C",
+                &[("mosi", "A5"), ("miso", "3C")],
+            ),
         ];
         let hit = search_annotations(&rows, "A0-10-5A");
         assert_eq!(hit, vec![0, 1, 2]);

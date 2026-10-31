@@ -153,7 +153,17 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
     words.push(H_TRIGGER);
     // Extended U3Pro32 records use one bits for ignored comparator inputs.
     // Retain the previously measured Plus encoding for legacy records.
-    push_groups(&mut words, |stage| if config.upper.is_some() { !stage.mask } else { stage.mask }, &config.stages);
+    push_groups(
+        &mut words,
+        |stage| {
+            if config.upper.is_some() {
+                !stage.mask
+            } else {
+                stage.mask
+            }
+        },
+        &config.stages,
+    );
     push_groups(&mut words, |stage| stage.value, &config.stages);
     push_groups(&mut words, |stage| stage.edge, &config.stages);
     for stage in &config.stages {
@@ -177,7 +187,10 @@ pub fn encode_arm(config: &ArmConfig) -> Result<Vec<u8>, ProtoError> {
         words.push(UPPER_ALIGN);
         push_u32(&mut words, CLOSE_SYNC);
     }
-    Ok(words.into_iter().flat_map(|word| word.to_le_bytes()).collect())
+    Ok(words
+        .into_iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect())
 }
 
 /// Reads capture and trigger settings from an arm record for inspection and tests.
@@ -240,8 +253,12 @@ pub fn decode_arm(bytes: &[u8]) -> Result<ArmConfig, ProtoError> {
                 edge: edge[i],
             };
         }
-        for stage in &mut config.stages { stage.mask = !stage.mask; }
-        for stage in &mut upper { stage.mask = !stage.mask; }
+        for stage in &mut config.stages {
+            stage.mask = !stage.mask;
+        }
+        for stage in &mut upper {
+            stage.mask = !stage.mask;
+        }
         config.upper = Some(upper);
     }
     if reader.i != bytes.len() {
@@ -306,7 +323,10 @@ struct Reader<'a> {
 impl Reader<'_> {
     /// Reads the next arm-record word, reporting incomplete device data as an error.
     fn u16(&mut self) -> Result<u16, ProtoError> {
-        let slice = self.bytes.get(self.i..self.i + 2).ok_or(ProtoError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.i..self.i + 2)
+            .ok_or(ProtoError::Truncated)?;
         self.i += 2;
         Ok(u16::from_le_bytes([slice[0], slice[1]]))
     }
@@ -428,7 +448,10 @@ mod tests {
     /// Checks the codec against an independently written device-record fixture.
     #[test]
     fn arm_record_matches_the_hand_written_vector() {
-        let expected: Vec<u8> = hand_words().into_iter().flat_map(|w| w.to_le_bytes()).collect();
+        let expected: Vec<u8> = hand_words()
+            .into_iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let encoded = encode_arm(&canonical()).unwrap();
         assert_eq!(encoded, expected);
         assert_eq!(encoded.len(), 372);
@@ -437,7 +460,11 @@ mod tests {
 
     #[test]
     fn thirty_two_channels_use_the_five_bit_global_count() {
-        let config = ArmConfig { channel_count: 32, stage_count: 2, ..ArmConfig::default() };
+        let config = ArmConfig {
+            channel_count: 32,
+            stage_count: 2,
+            ..ArmConfig::default()
+        };
         let encoded = encode_arm(&config).unwrap();
         // Global header follows sync, mode, divider, count, and position.
         assert_eq!(u16::from_le_bytes([encoded[28], encoded[29]]), 2);

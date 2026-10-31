@@ -159,15 +159,18 @@ pub trait Decoder: Send {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ChannelDesc {
     pub id: String,
-    #[serde(default)] pub name: String,
-    #[serde(default)] pub desc: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub desc: String,
 }
 
 /// One annotation class. `id` is the value stored on each annotation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct AnnotationClass {
     pub id: String,
-    #[serde(default)] pub desc: String,
+    #[serde(default)]
+    pub desc: String,
 }
 
 /// A display row that groups annotation classes by their index in `annotation_classes`.
@@ -182,7 +185,8 @@ pub struct AnnotationRowGroup {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct BinaryFormat {
     pub id: String,
-    #[serde(default)] pub desc: String,
+    #[serde(default)]
+    pub desc: String,
 }
 
 /// Describes a decoder's channel roles, options, and output classes for discovery by clients.
@@ -194,22 +198,38 @@ pub struct DecoderSchema {
     pub id: String,
     pub name: String,
     pub channels: Vec<String>,
-    #[serde(default)] pub optional_channels: Vec<String>,
-    #[serde(default)] pub stack_on: Option<String>,
-    #[serde(default)] pub classes: Vec<String>,
-    #[serde(default)] pub options: Vec<DecoderOption>,
-    #[serde(default)] pub api_version: u32,
-    #[serde(default)] pub longname: String,
-    #[serde(default)] pub desc: String,
-    #[serde(default)] pub license: String,
-    #[serde(default)] pub inputs: Vec<String>,
-    #[serde(default)] pub outputs: Vec<String>,
-    #[serde(default)] pub tags: Vec<String>,
-    #[serde(default)] pub channel_details: Vec<ChannelDesc>,
-    #[serde(default)] pub optional_channel_details: Vec<ChannelDesc>,
-    #[serde(default)] pub annotation_classes: Vec<AnnotationClass>,
-    #[serde(default)] pub annotation_rows: Vec<AnnotationRowGroup>,
-    #[serde(default)] pub binary: Vec<BinaryFormat>,
+    #[serde(default)]
+    pub optional_channels: Vec<String>,
+    #[serde(default)]
+    pub stack_on: Option<String>,
+    #[serde(default)]
+    pub classes: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<DecoderOption>,
+    #[serde(default)]
+    pub api_version: u32,
+    #[serde(default)]
+    pub longname: String,
+    #[serde(default)]
+    pub desc: String,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub channel_details: Vec<ChannelDesc>,
+    #[serde(default)]
+    pub optional_channel_details: Vec<ChannelDesc>,
+    #[serde(default)]
+    pub annotation_classes: Vec<AnnotationClass>,
+    #[serde(default)]
+    pub annotation_rows: Vec<AnnotationRowGroup>,
+    #[serde(default)]
+    pub binary: Vec<BinaryFormat>,
 }
 
 /// A script-configurable setting. Values are transported as strings.
@@ -218,36 +238,90 @@ pub struct DecoderOption {
     pub id: String,
     pub name: String,
     pub default: String,
-    #[serde(default)] pub values: Vec<String>,
+    #[serde(default)]
+    pub values: Vec<String>,
     /// Longer description. `name` remains the label used by the settings dialog.
-    #[serde(default)] pub desc: String,
+    #[serde(default)]
+    pub desc: String,
 }
 
 /// Lists built-in and external scripted decoders.
 pub fn catalog() -> Vec<DecoderSchema> {
     let mut entries = vec![
         schema("uart", "UART", &["rx"], None, &["data", "frame", "error"]),
-        schema("i2c", "I2C", &["scl", "sda"], None, &["start", "address", "data", "ack", "nack", "stop"]),
-        schema("spi", "SPI", &["sck", "mosi", "miso", "cs"], None, &["word", "select"]),
-        schema("eeprom24", "EEPROM 24xx", &[], Some("i2c"), &["write", "read", "address"]),
+        schema(
+            "i2c",
+            "I2C",
+            &["scl", "sda"],
+            None,
+            &["start", "address", "data", "ack", "nack", "stop"],
+        ),
+        schema(
+            "spi",
+            "SPI",
+            &["sck", "mosi", "miso", "cs"],
+            None,
+            &["word", "select"],
+        ),
+        schema(
+            "eeprom24",
+            "EEPROM 24xx",
+            &[],
+            Some("i2c"),
+            &["write", "read", "address"],
+        ),
     ];
     for entry in script::catalog() {
-        if !entries.iter().any(|existing| existing.id == entry.id) { entries.push(entry); }
+        if !entries.iter().any(|existing| existing.id == entry.id) {
+            entries.push(entry);
+        }
     }
     entries
 }
-fn schema(id: &str, name: &str, channels: &[&str], stack: Option<&str>, classes: &[&str]) -> DecoderSchema {
+fn schema(
+    id: &str,
+    name: &str,
+    channels: &[&str],
+    stack: Option<&str>,
+    classes: &[&str],
+) -> DecoderSchema {
     let channels: Vec<String> = channels.iter().map(|v| (*v).into()).collect();
     let classes: Vec<String> = classes.iter().map(|v| (*v).into()).collect();
-    let details = |ids: &[String]| ids.iter().map(|id| ChannelDesc { id: id.clone(), name: id.clone(), desc: String::new() }).collect();
+    let details = |ids: &[String]| {
+        ids.iter()
+            .map(|id| ChannelDesc {
+                id: id.clone(),
+                name: id.clone(),
+                desc: String::new(),
+            })
+            .collect()
+    };
     DecoderSchema {
-        id: id.into(), name: name.into(), optional_channels: channels.clone(),
-        channel_details: details(&channels), optional_channel_details: details(&channels), channels,
+        id: id.into(),
+        name: name.into(),
+        optional_channels: channels.clone(),
+        channel_details: details(&channels),
+        optional_channel_details: details(&channels),
+        channels,
         stack_on: stack.map(str::to_string),
-        inputs: vec![stack.unwrap_or("logic").into()], outputs: vec![id.into()],
-        annotation_classes: classes.iter().map(|id| AnnotationClass { id: id.clone(), desc: String::new() }).collect(),
-        classes, options: Vec::new(), api_version: 1, longname: String::new(), desc: String::new(),
-        license: String::new(), tags: Vec::new(), annotation_rows: Vec::new(), binary: Vec::new(),
+        inputs: vec![stack.unwrap_or("logic").into()],
+        outputs: vec![id.into()],
+        annotation_classes: classes
+            .iter()
+            .map(|id| AnnotationClass {
+                id: id.clone(),
+                desc: String::new(),
+            })
+            .collect(),
+        classes,
+        options: Vec::new(),
+        api_version: 1,
+        longname: String::new(),
+        desc: String::new(),
+        license: String::new(),
+        tags: Vec::new(),
+        annotation_rows: Vec::new(),
+        binary: Vec::new(),
     }
 }
 
@@ -338,8 +412,18 @@ pub struct DecodeOutput {
 
 impl DecodeOutput {
     /// A finished pass that did not emit binary or metadata.
-    pub fn new(annotations: Vec<Annotation>, packets: Vec<ProtocolPacket>, cancelled: bool) -> Self {
-        Self { annotations, packets, binary: Vec::new(), meta: Vec::new(), cancelled }
+    pub fn new(
+        annotations: Vec<Annotation>,
+        packets: Vec<ProtocolPacket>,
+        cancelled: bool,
+    ) -> Self {
+        Self {
+            annotations,
+            packets,
+            binary: Vec::new(),
+            meta: Vec::new(),
+            cancelled,
+        }
     }
 }
 

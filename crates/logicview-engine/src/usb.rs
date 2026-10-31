@@ -370,13 +370,7 @@ pub(crate) async fn drive_dual(
                 match result {
                     Ok(report) => {
                         if report.overflow {
-                            warn(
-                                &shared,
-                                &id,
-                                generation,
-                                "sample memory overflowed".into(),
-                            )
-                            .await;
+                            warn(&shared, &id, generation, "sample memory overflowed".into()).await;
                         }
                         if let Some(header) = report.header {
                             if let Some(text) =
@@ -408,14 +402,7 @@ pub(crate) async fn drive_dual(
         equalize(&shared, &id, generation).await;
     }
     let aborted = stop.load(Ordering::Relaxed);
-    settle(
-        &shared,
-        &id,
-        generation,
-        failed,
-        discard && aborted,
-    )
-    .await;
+    settle(&shared, &id, generation, failed, discard && aborted).await;
 }
 
 /// Unpacks one pod's atoms into its channel range.
