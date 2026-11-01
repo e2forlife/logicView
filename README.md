@@ -122,7 +122,12 @@ scripts/package-release.sh
 scripts/run-debug.sh
 ```
 
-The Linux packaging script writes `dist/logicview-<version>-linux-x86_64.tar.gz` with the binary, `profiles.toml`, example decoders, UI assets, and the udev rule. Extract the archive and run `./logicview`.
+The Linux packaging script writes both:
+
+- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, example decoders, UI assets, and the udev rule. Extract and run `./logicview`.
+- `dist/logicview-<version>-x86_64.AppImage` — the same payload as a single executable file. Mark it executable and run it (`chmod +x … && ./logicview-…-x86_64.AppImage`).
+
+The AppImage is a thin bundle: it still needs host WebKitGTK 4.1 and GTK 3 (`libwebkit2gtk-4.1-0` and GTK 3 on Debian/Ubuntu), the same runtime libraries as a normal desktop build. It downloads `appimagetool` into `dist/.appimage-tools` on first use (override with `LOGICVIEW_APPIMAGE_TOOL_DIR` / `LOGICVIEW_APPIMAGETOOL_URL`).
 
 ### MCP server
 

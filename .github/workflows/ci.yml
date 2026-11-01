@@ -22,7 +22,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logicview-linux-x86_64
-          path: dist/logicview-*-linux-x86_64.tar.gz
+          path: |
+            dist/logicview-*-linux-x86_64.tar.gz
+            dist/logicview-*-x86_64.AppImage
           if-no-files-found: error
       - name: check Windows release build
         run: |

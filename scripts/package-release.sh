@@ -25,8 +25,14 @@ fi
 
 STAGE="dist/logicview-${VERSION}"
 ARCHIVE="dist/logicview-${VERSION}-linux-x86_64.tar.gz"
-rm -rf "${STAGE}" "${ARCHIVE}"
-mkdir -p "${STAGE}/assets" "${STAGE}/examples/decoders"
+APPDIR="dist/LogicView.AppDir"
+APPIMAGE="dist/logicview-${VERSION}-x86_64.AppImage"
+TOOL_DIR="${LOGICVIEW_APPIMAGE_TOOL_DIR:-dist/.appimage-tools}"
+APPIMAGETOOL="${TOOL_DIR}/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_URL="${LOGICVIEW_APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage}"
+
+rm -rf "${STAGE}" "${ARCHIVE}" "${APPDIR}" "${APPIMAGE}"
+mkdir -p "${STAGE}/assets" "${STAGE}/examples/decoders" dist
 
 cp -f "${BINARY}" "${STAGE}/logicview"
 chmod +x "${STAGE}/logicview"
@@ -44,7 +50,69 @@ if [[ -f contrib/udev/99-logicview.rules ]]; then
   cp -f contrib/udev/99-logicview.rules "${STAGE}/contrib/udev/99-logicview.rules"
 fi
 
-mkdir -p dist
 tar -C dist -czf "${ARCHIVE}" "logicview-${VERSION}"
-
 echo "Release package: $(pwd)/${ARCHIVE}"
+
+echo "Building LogicView AppImage..."
+mkdir -p "${APPDIR}/usr/bin" "${TOOL_DIR}"
+
+# Same relative layout as the tarball, beside the executable, for profile and script discovery.
+cp -a "${STAGE}/." "${APPDIR}/usr/bin/"
+chmod +x "${APPDIR}/usr/bin/logicview"
+
+cat > "${APPDIR}/logicview.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=LogicView
+Comment=Capture and explore logic analyzer signals
+Exec=logicview
+Icon=logicview
+Categories=Development;Electronics;
+Terminal=false
+StartupNotify=true
+EOF
+
+python3 - "${APPDIR}/logicview.png" <<'PY'
+from pathlib import Path
+import sys
+from PIL import Image
+
+dest = Path(sys.argv[1])
+src = Path("crates/logicview-ui/assets/icon.png")
+image = Image.open(src).convert("RGBA")
+image = image.resize((256, 256), Image.Resampling.LANCZOS)
+image.save(dest)
+PY
+
+cat > "${APPDIR}/AppRun" <<'EOF'
+#!/bin/sh
+# Thin AppImage: runs the bundled binary against host WebKitGTK / GTK.
+# Install runtime packages as documented in README.md (libwebkit2gtk-4.1-0, GTK 3).
+HERE="$(dirname "$(readlink -f "$0")")"
+export PATH="${HERE}/usr/bin:${PATH}"
+cd "${HERE}/usr/bin" || exit 1
+exec "${HERE}/usr/bin/logicview" "$@"
+EOF
+chmod +x "${APPDIR}/AppRun"
+
+if [[ ! -f "${APPIMAGETOOL}" ]]; then
+  echo "Downloading appimagetool..."
+  curl -fsSL -o "${APPIMAGETOOL}" "${APPIMAGETOOL_URL}"
+fi
+chmod +x "${APPIMAGETOOL}"
+APPIMAGETOOL="$(cd "$(dirname "${APPIMAGETOOL}")" && pwd)/$(basename "${APPIMAGETOOL}")"
+
+# Avoid FUSE on CI and locked-down hosts.
+export APPIMAGE_EXTRACT_AND_RUN=1
+export ARCH=x86_64
+(
+  cd dist
+  "${APPIMAGETOOL}" "$(basename "${APPDIR}")" "$(basename "${APPIMAGE}")"
+)
+
+if [[ ! -f "${APPIMAGE}" ]]; then
+  echo "Missing ${APPIMAGE}" >&2
+  exit 1
+fi
+chmod +x "${APPIMAGE}"
+echo "Release package: $(pwd)/${APPIMAGE}"

@@ -26,7 +26,7 @@ Research is welcome. Contributors may study published specifications, device man
 4. Open a pull request describing the problem, the change, how it was tested, and any remaining limitations. Link related issues and include screenshots for visible interface changes when useful.
 5. Respond constructively to review and keep discussion respectful and welcoming.
 
-The CI configuration runs the workspace tests on Ubuntu, packages a Linux release tarball, checks a Windows release build, and rejects firmware and bitstream blobs. Linux development of the desktop app requires WebKitGTK 4.1, GTK 3, and pkg-config development packages:
+The CI configuration runs the workspace tests on Ubuntu, packages a Linux release tarball and AppImage, checks a Windows release build, and rejects firmware and bitstream blobs. Linux development of the desktop app requires WebKitGTK 4.1, GTK 3, and pkg-config development packages:
 
 ```sh
 sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config
