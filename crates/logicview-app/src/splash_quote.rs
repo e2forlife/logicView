@@ -96,7 +96,7 @@ struct QuoteFile {
     quotes: Vec<Quote>,
 }
 
-/// Quote text, then ` - `, then the reference. `reference_start` is the first bold character.
+/// Quote text, then a newline and dash, then the bold reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Message {
     pub text: String,
@@ -105,7 +105,7 @@ pub(super) struct Message {
 
 impl Message {
     fn new(quote: &str, reference: &str) -> Self {
-        let text = format!("{quote} - {reference}");
+        let text = format!("{quote}\n- {reference}");
         let reference_start = quote.chars().count() + 3;
         Self {
             text,
@@ -283,6 +283,9 @@ pub(super) fn wrap_message(
     let mut lines = Vec::new();
     let mut current = TextLine::default();
     for token in tokens(message) {
+        if token.gap.contains('\n') && !current.spans.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
         let mut offset = 0usize;
         for (piece_index, piece) in pieces(&token.text, token.bold, max_width, &mut measure)
             .into_iter()
@@ -402,6 +405,10 @@ pub(super) fn webview_html(origin: &str, message: Option<&Message>) -> String {
     let slot = FADE_IN_MS as f64 / count as f64;
     let mut letters = String::new();
     for (index, ch) in message.text.chars().enumerate() {
+        if ch == '\n' {
+            letters.push_str("<br>");
+            continue;
+        }
         let class = if message.is_bold(index) {
             "ch ref"
         } else {
@@ -424,7 +431,7 @@ pub(super) fn webview_html(origin: &str, message: Option<&Message>) -> String {
             background:rgba(0,0,0,0.67); border-radius:8px; color:#fff;
             font:{font:.0}px/1.35 "Segoe UI",sans-serif; overflow-wrap:break-word;
         }}
-        .ref {{ font-weight:700; }}
+        .ref {{ font-weight:800; }}
         .ch {{ opacity:0; animation:quote-in {slot:.2}ms linear forwards; }}
         @keyframes quote-in {{ from {{ opacity:0; }} to {{ opacity:1; }} }}
         </style></head><body>
@@ -468,7 +475,7 @@ mod tests {
         let message = Message::new(&quotes[0].quote, &quotes[0].reference);
         assert_eq!(
             message.text,
-            "Test everything; hold fast to what is good. - 1 Thessolonians 5:21"
+            "Test everything; hold fast to what is good.\n- 1 Thessolonians 5:21"
         );
         assert!(message.is_bold(message.reference_start));
         assert!(!message.is_bold(message.reference_start - 1));
@@ -567,6 +574,15 @@ mod tests {
     }
 
     #[test]
+    fn reference_starts_on_a_new_line_even_when_the_quote_fits() {
+        let message = Message::new("Short quote.", "Reference");
+        let lines = wrap_message(&message, 1000.0, |text, _| text.chars().count() as f32);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].text, "Short quote.");
+        assert_eq!(lines[1].spans.iter().map(|span| span.text.as_str()).collect::<String>(), "- Reference");
+    }
+
+    #[test]
     fn placement_starts_beside_the_handle_and_under_the_lettering() {
         let anchor = APP_LOGO_ANCHOR;
         let place = QuotePlacement::from_anchor(&anchor);
@@ -612,10 +628,11 @@ mod tests {
     fn webview_html_fades_the_reference_in_bold() {
         let message = Message::new("Be quick.", "Sirach 5:11");
         let html = webview_html("http://127.0.0.1:9", Some(&message));
-        assert!(html.contains("font-weight:700"));
+        assert!(html.contains("font-weight:800"));
+        assert!(html.contains("<br>"));
         assert!(html.contains("animation:quote-in"));
         assert!(html.contains("rgba(0,0,0,0.67)"));
-        assert_eq!(html.matches("<span ").count(), message.char_count());
+        assert_eq!(html.matches("<span ").count(), message.char_count() - 1);
         let reference_chars = message.char_count() - message.reference_start;
         assert_eq!(html.matches("class=\"ch ref\"").count(), reference_chars);
         let plain = webview_html("http://127.0.0.1:9", None);

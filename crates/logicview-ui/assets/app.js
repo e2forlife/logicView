@@ -825,15 +825,32 @@ function paintStatus() {
 }
 
 let sessionRename = null;
+let pendingCloseSession = null;
 
 function renderTabs() {
   if (sessionRename) return;
   tabsEl.replaceChildren();
   for (const session of state.sessions) {
-    const button = document.createElement("button");
-    button.type = "button";
+    const button = document.createElement("div");
+    button.setAttribute("role", "button");
+    button.tabIndex = 0;
+    button.addEventListener("keydown", (ev) => {
+      if (ev.target === button && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); selectSession(session.id); }
+    });
     button.className = "tab" + (session.id === state.active ? " active" : "");
-    button.textContent = session.name;
+    const label = document.createElement("span");
+    label.textContent = session.name;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "tab-close";
+    close.setAttribute("aria-label", `Close ${session.name}`);
+    close.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      pendingCloseSession = session.id;
+      document.getElementById("close-capture-dialog").showModal();
+    });
+    close.addEventListener("dblclick", (ev) => ev.stopPropagation());
+    button.append(label, close);
     button.title = "Double-click to rename";
     button.addEventListener("click", (ev) => {
       if (ev.detail > 1) return;
@@ -2742,6 +2759,21 @@ async function selectSession(id) {
   await loadAnnotations();
   if (state.tab === "cursors" || state.tab === "measure") selectTab(state.tab);
 }
+
+document.getElementById("close-capture-no").addEventListener("click", () => document.getElementById("close-capture-dialog").close());
+document.getElementById("close-capture-dialog").addEventListener("close", () => { pendingCloseSession = null; });
+document.getElementById("close-capture-yes").addEventListener("click", async () => {
+  const id = pendingCloseSession;
+  document.getElementById("close-capture-dialog").close();
+  if (!id) return;
+  try {
+    const result = await api({ cmd: "close_session", id });
+    delete views[id];
+    await selectSession(result.active);
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+});
 
 async function addSession() {
   const created = await api({ cmd: "create_session" });
@@ -5960,7 +5992,7 @@ function bindSplitters() {
 const MENUS = {
   file: [
     { label: "New Capture", shortcut: "Ctrl+N", run: () => addSession() },
-    { label: "Load Saved Capture", shortcut: "Ctrl+O", run: () => loadSavedCapture() },
+    { label: "Load Capture", shortcut: "Ctrl+O", run: () => loadSavedCapture() },
     { label: "Save Capture As…", shortcut: "Ctrl+Shift+S", run: () => saveCaptureExport("lvcap") },
     { separator: true },
     { label: "Save setup…", run: () => saveSetup() },
@@ -6320,7 +6352,7 @@ function runMenuShortcut(chord) {
 }
 
 window.addEventListener("keydown", (ev) => {
-  if (document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open || document.getElementById("export-dialog").open) return;
+  if (document.getElementById("close-capture-dialog").open || document.getElementById("about-dialog").open || document.getElementById("preferences-dialog").open || document.getElementById("export-dialog").open) return;
   if (ev.target.matches("input, select, textarea")) return;
   const chord = menuChord(ev);
   if (chord && runMenuShortcut(chord)) {

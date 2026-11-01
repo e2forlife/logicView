@@ -15,3 +15,9 @@ Material Symbols by Google
 Source: https://github.com/google/material-design-icons/tree/master/symbols/web/directory_sync/materialsymbolsoutlined
 Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
 The icon is distributed unchanged.
+
+Material Symbols Cancel icon
+Material Symbols by Google
+Source: https://github.com/google/material-design-icons/tree/master/symbols/web/cancel/materialsymbolsoutlined
+Licensed under the Apache License, Version 2.0; see MATERIAL-SYMBOLS-LICENSE.txt.
+The icon is distributed unchanged.

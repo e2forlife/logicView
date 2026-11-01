@@ -282,6 +282,7 @@ struct Slot {
     catalog_colors: Vec<String>,
     catalog_origins: Vec<ChannelOrigin>,
     pub(crate) devices: Vec<BoundDevice>,
+    capture_devices_before_file: Vec<BoundDevice>,
     pub(crate) decoders: Vec<DecoderInst>,
     pub(crate) annotations: Vec<AnnotationRow>,
     next_decoder: u64,
@@ -600,7 +601,7 @@ impl Engine {
         (sessions, active)
     }
 
-    /// Creates and selects a new demo session, enforcing the workspace session limit.
+    /// Creates and selects a new session using the active session?s pods.
     pub async fn create_session(&self, name: Option<String>) -> Result<SessionBrief, EngineError> {
         let mut state = self.shared.state.lock().await;
         if state.slots.len() >= MAX_SESSIONS {
@@ -610,7 +611,8 @@ impl Engine {
         state.next_id += 1;
         let id = format!("ses-{id_num}");
         let label = name.unwrap_or_else(|| format!("Capture {id_num}"));
-        state.slots.push(Slot::demo(&id, &label));
+        let slot = Slot::with_devices(&id, &label, state.slots[state.active].capture_devices())?;
+        state.slots.push(slot);
         state.active = state.slots.len() - 1;
         Ok(SessionBrief {
             id,
@@ -642,6 +644,36 @@ impl Engine {
             sample_count: slot.session.store.len(),
             active: slot.id == active_id,
         })
+    }
+
+    /// Closes a session, stopping its worker and keeping one session available.
+    pub async fn close_session(&self, id: &str) -> Result<String, EngineError> {
+        let mut state = self.shared.state.lock().await;
+        let index = state
+            .slots
+            .iter()
+            .position(|slot| slot.id == id)
+            .ok_or_else(|| EngineError::UnknownSession(id.to_string()))?;
+        if let Some(run) = state.running.remove(id) {
+            run.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let replacement_devices = state.slots[index].capture_devices().to_vec();
+        state.slots.remove(index);
+        if state.slots.is_empty() {
+            let number = state.next_id;
+            state.next_id += 1;
+            state.slots.push(Slot::with_devices(
+                &format!("ses-{number}"),
+                &format!("Capture {number}"),
+                &replacement_devices,
+            )?);
+            state.active = 0;
+        } else if index < state.active {
+            state.active -= 1;
+        } else if index == state.active {
+            state.active = index.min(state.slots.len() - 1);
+        }
+        Ok(state.slots[state.active].id.clone())
     }
 
     /// Selects the session used by commands that omit an explicit identifier.
@@ -1428,6 +1460,9 @@ impl Engine {
             .map(|channel| channel.color.clone())
             .collect();
         slot.session.config.channel_enable = 0;
+        if slot.devices.iter().all(|device| device.kind != "file") {
+            slot.capture_devices_before_file = slot.devices.clone();
+        }
         slot.devices = vec![BoundDevice {
             id: "file".into(),
             name: "File".into(),
@@ -1526,6 +1561,7 @@ impl Slot {
             catalog_colors: Vec::new(),
             catalog_origins: Vec::new(),
             devices: Vec::new(),
+            capture_devices_before_file: Vec::new(),
             decoders: Vec::new(),
             annotations: Vec::new(),
             next_decoder: 1,
@@ -1536,6 +1572,27 @@ impl Slot {
         };
         let _ = install_demo_ids(&mut slot, &["demo".to_string()]);
         slot
+    }
+
+    /// Returns the pod selection retained when a capture was loaded from a file.
+    fn capture_devices(&self) -> &[BoundDevice] {
+        if self.devices.iter().any(|device| device.kind == "file") {
+            &self.capture_devices_before_file
+        } else {
+            &self.devices
+        }
+    }
+
+    /// Builds an empty session with the same pod catalog as an existing session.
+    fn with_devices(id: &str, name: &str, devices: &[BoundDevice]) -> Result<Self, EngineError> {
+        let mut slot = Self::demo(id, name);
+        if devices.iter().all(|device| device.kind == "demo") {
+            let ids: Vec<String> = devices.iter().map(|device| device.id.clone()).collect();
+            install_demo_ids(&mut slot, &ids)?;
+        } else {
+            install_usb_catalog(&mut slot, devices)?;
+        }
+        Ok(slot)
     }
 
     /// Combines channel labels and device origins into the client-facing channel list.

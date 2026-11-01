@@ -47,6 +47,7 @@ const APP_JS: &str = include_str!("../assets/app.js");
 const APP_LOGO: &[u8] = include_bytes!("../assets/AppLogo.png");
 const EXPORT_LOGO: &[u8] = include_bytes!("../assets/ExportFileLogo.png");
 const PREFS_LOGO: &[u8] = include_bytes!("../assets/PrefsLogo.png");
+const CANCEL_ICON: &str = include_str!("../assets/cancel.svg");
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const RUN_STREAM_ICON: &str = include_str!("../assets/keyboard_double_arrow_right.svg");
 const RUN_REPEAT_ICON: &str = include_str!("../assets/directory_sync.svg");
@@ -83,6 +84,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/", get(index))
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
+        .route("/assets/cancel.svg", get(cancel_icon))
         .route("/assets/settings.svg", get(settings_icon))
         .route(
             "/assets/keyboard_double_arrow_right.svg",
@@ -206,6 +208,11 @@ async fn export_logo() -> impl IntoResponse {
 /// Serves the Preferences dialog header artwork.
 async fn prefs_logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], PREFS_LOGO)
+}
+
+/// Serves the locally embedded Material Symbols cancel icon.
+async fn cancel_icon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], CANCEL_ICON)
 }
 
 /// Serves the locally embedded Material Symbols settings icon.
@@ -766,6 +773,10 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
         Command::RenameSession { id, name } => {
             Ok(json!(engine.rename_session(&id, &name).await?))
         }
+        Command::CloseSession { id } => {
+            let active = engine.close_session(&id).await?;
+            Ok(json!({"active": active}))
+        }
         Command::SelectSession { id } => {
             engine.select_session(&id).await?;
             Ok(json!({"id": id}))
@@ -1267,6 +1278,9 @@ enum Command {
         id: String,
         name: String,
     },
+    CloseSession {
+        id: String,
+    },
     SelectSession {
         id: String,
     },
@@ -1624,6 +1638,7 @@ mod tests {
         let svg = settings.into_body().collect().await.unwrap().to_bytes();
         assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
         for uri in [
+            "/assets/cancel.svg",
             "/assets/keyboard_double_arrow_right.svg",
             "/assets/directory_sync.svg",
         ] {
@@ -1724,6 +1739,16 @@ mod tests {
             count < 5_000_000,
             "stop ends the demo before the full five seconds"
         );
+    }
+
+    #[tokio::test]
+    async fn close_session_command_selects_remaining_capture() {
+        let app = router(Engine::new());
+        post(&app, json!({"cmd": "create_session"})).await;
+        let result = post(&app, json!({"cmd": "close_session", "id": "ses-2"})).await;
+        assert_eq!(result["active"], "ses-1");
+        let listed = post(&app, json!({"cmd": "list_sessions"})).await;
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
     }
 
     /// Checks that session selection keeps measurements and waveform queries tied to the correct

@@ -63,7 +63,7 @@ pub(super) fn show(reference: &Window, quote: Option<Message>) -> Result<Overlay
 
 fn paint_quote(ctx: &mut PaintCtx, frame: FrameInfo, place: QuotePlacement, message: &Message) {
     let regular = Font::ui(splash_quote::QUOTE_FONT_PX);
-    let bold = regular.with_weight(700);
+    let bold = regular.with_weight(800);
     let lines = splash_quote::wrap_message(message, place.wrap_width(), |text, is_bold| {
         let font = if is_bold { bold } else { regular };
         ctx.measure_text(text, font).width

@@ -228,6 +228,13 @@
     <p class="mcp-note">Port changes apply after disabling and re-enabling the server.</p>
     <p id="mcp-error" class="mcp-error" role="alert"></p>
   </section>
+  <dialog id="close-capture-dialog" class="close-capture-dialog" aria-labelledby="close-capture-title">
+    <h2 id="close-capture-title">Close capture without saving?</h2>
+    <div class="close-capture-actions">
+      <button type="button" id="close-capture-yes">Yes</button>
+      <button type="button" id="close-capture-no" autofocus>No</button>
+    </div>
+  </dialog>
   <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-dialog-title">
     <form id="export-dialog-form">
       <img class="export-logo" src="/assets/ExportFileLogo.png" alt="">

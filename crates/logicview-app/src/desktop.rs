@@ -241,7 +241,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                 UiEvent::PickFile(kind) => {
                     let dialog = match kind.as_str() {
                         "load" => rfd::FileDialog::new()
-                            .set_title("Load saved capture")
+                            .set_title("Load capture")
                             .add_filter("LogicView capture", &["lvcap"]),
                         _ => rfd::FileDialog::new()
                             .set_title("Import capture")

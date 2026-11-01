@@ -1073,3 +1073,56 @@ async fn rename_session_trims_and_rejects_blank() {
     let (sessions, _) = engine.list_sessions().await;
     assert_eq!(sessions[0].name, "Logic");
 }
+
+/// Closing sessions preserves the selected capture and replaces the final session.
+#[tokio::test]
+async fn close_session_preserves_workspace_selection() {
+    let engine = Engine::new();
+    engine.create_session(None).await.unwrap();
+    engine.create_session(None).await.unwrap();
+    assert_eq!(engine.close_session("ses-1").await.unwrap(), "ses-3");
+    assert_eq!(engine.close_session("ses-3").await.unwrap(), "ses-2");
+    assert!(engine.close_session("ses-3").await.is_err());
+    let replacement = engine.close_session("ses-2").await.unwrap();
+    assert_eq!(replacement, "ses-4");
+    let (sessions, active) = engine.list_sessions().await;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(active, replacement);
+}
+
+/// New sessions inherit the active pod catalog without inheriting captured data.
+#[tokio::test]
+async fn new_session_inherits_active_pods() {
+    let engine = Engine::new();
+    engine.connect("demo:spi").await.unwrap();
+    engine.attach_device(None, "demo").await.unwrap();
+    let created = engine.create_session(None).await.unwrap();
+    let status = engine.status(Some(&created.id)).await.unwrap();
+    assert_eq!(status.devices.iter().map(|device| device.id.as_str()).collect::<Vec<_>>(), vec!["demo:spi", "demo"]);
+    assert_eq!(status.sample_count, 0);
+    {
+        let mut state = engine.shared.state.lock().await;
+        let active = state.active;
+        install_usb_catalog(&mut state.slots[active], &[bound_usb("usb:2a0e:0020", "DSLogic Plus"), bound_usb("usb:2a0e:002c", "DSLogic U3Pro32")]).unwrap();
+    }
+    let created = engine.create_session(None).await.unwrap();
+    let status = engine.status(Some(&created.id)).await.unwrap();
+    assert_eq!(status.devices.iter().map(|device| device.id.as_str()).collect::<Vec<_>>(), vec!["usb:2a0e:0020", "usb:2a0e:002c"]);
+    assert_eq!(status.probes.len(), 48);
+    assert_eq!(status.sample_count, 0);
+}
+
+#[tokio::test]
+async fn new_session_from_file_uses_previous_pods() {
+    let engine = Engine::new();
+    engine.connect("demo:spi").await.unwrap();
+    {
+        let mut state = engine.shared.state.lock().await;
+        let slot = &mut state.slots[0];
+        slot.capture_devices_before_file = slot.devices.clone();
+        slot.devices = vec![BoundDevice { id: "file".into(), name: "File".into(), kind: "file".into(), super_speed: false }];
+    }
+    let created = engine.create_session(None).await.unwrap();
+    let status = engine.status(Some(&created.id)).await.unwrap();
+    assert_eq!(status.devices[0].id, "demo:spi");
+}
