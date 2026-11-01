@@ -57,6 +57,8 @@ scripts/install-udev.sh
 
 Confirm the node is writable (mode `0666` or an ACL for your user), for example `ls -l /dev/bus/usb/*/*` after replug. Without the rule, selecting a detected pod fails and the session stays on Demo — listing only needs sysfs, opening needs read-write access. Hardware checks are operator-run (`cargo test -p logicview-hal -- --ignored`) and are not assumed by CI.
 
+For more Linux pod symptoms (permissions, firmware paths, AppImage runtime libraries, capture fill noise, MCP), see the [Linux troubleshooting guide](docs/linux-troubleshooting.md).
+
 ## Preferences and extensions
 
 Use the gear in the upper right to set the firmware directory, Lua decoder script directory, and light, dark, or system theme. Preferences persist across launches. A blank firmware directory uses the standard search locations; `LOGICVIEW_FIRMWARE_DIR` takes precedence. On Windows preferences are stored in `%APPDATA%\LogicView\preferences.json`; on Linux they use `XDG_CONFIG_HOME` or `~/.config/LogicView`.
