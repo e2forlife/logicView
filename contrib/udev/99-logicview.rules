@@ -1,0 +1,5 @@
+# LogicView: allow unprivileged access to DreamSourceLab USB devices (vendor 2a0e).
+# Install:
+#   sudo cp contrib/udev/99-logicview.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="2a0e", MODE="0660", GROUP="plugdev", TAG+="uaccess"

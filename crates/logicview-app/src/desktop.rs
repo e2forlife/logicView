@@ -316,19 +316,13 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
 /// Displays a startup failure through logging and the platform's available user interface.
 pub fn report_error(message: &str) {
     tracing::error!("{message}");
-    #[cfg(windows)]
-    {
-        let _choice = rfd::MessageDialog::new()
-            .set_title("LogicView")
-            .set_level(rfd::MessageLevel::Error)
-            .set_description(message)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
-    }
-    #[cfg(any(not(windows), debug_assertions))]
-    {
-        let _ = writeln!(std::io::stderr(), "logicview: {message}");
-    }
+    let _ = writeln!(std::io::stderr(), "logicview: {message}");
+    let _choice = rfd::MessageDialog::new()
+        .set_title("LogicView")
+        .set_level(rfd::MessageLevel::Error)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// Maps a saved theme choice onto the native window caption.

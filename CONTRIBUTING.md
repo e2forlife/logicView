@@ -26,7 +26,13 @@ Research is welcome. Contributors may study published specifications, device man
 4. Open a pull request describing the problem, the change, how it was tested, and any remaining limitations. Link related issues and include screenshots for visible interface changes when useful.
 5. Respond constructively to review and keep discussion respectful and welcoming.
 
-The CI configuration also checks a Windows release build and rejects firmware and bitstream blobs. Linux development of the desktop app requires WebKitGTK 4.1, GTK 3, and pkg-config development packages.
+The CI configuration runs the workspace tests on Ubuntu, packages a Linux release tarball, checks a Windows release build, and rejects firmware and bitstream blobs. Linux development of the desktop app requires WebKitGTK 4.1, GTK 3, and pkg-config development packages:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config
+```
+
+Runtime hosts need `libwebkit2gtk-4.1-0` and GTK 3. For USB capture without root, install the udev rules from [`contrib/udev/99-logicview.rules`](contrib/udev/99-logicview.rules).
 
 ## Hardware testing
 
@@ -36,7 +42,7 @@ The current logic analyzer hardware tests are ignored by default and require a c
 cargo test -p logicview-hal -- --ignored
 ```
 
-The Plus USB path loads the user-supplied `DSLogicPlus.bin` from `LOGICVIEW_FIRMWARE_DIR` only if the FPGA done bit is clear. Do not commit that file. Describe the exact model, connection, test conditions, and results when reporting hardware behavior; a result from one device does not establish support for every model.
+These checks are operator-run on the host OS where the pod is attached; CI does not exercise hardware. Report the operating system along with the model, connection, test conditions, and results. The Plus USB path loads the user-supplied `DSLogicPlus.bin` from `LOGICVIEW_FIRMWARE_DIR` (or the documented conventional search locations) only if the FPGA done bit is clear. Do not commit that file. A result from one device does not establish support for every model.
 
 ## Licensing
 
