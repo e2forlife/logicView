@@ -10,6 +10,15 @@ use crate::error::CaptureError;
 
 const WINDOWS: [u64; 4] = [64, 4_096, 262_144, 16_777_216];
 
+/// Counts how many trailing packed bytes are SRAM-style alternating fill.
+fn trailing_fill_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .rev()
+        .take_while(|byte| matches!(*byte, 0x55 | 0xAA))
+        .count()
+}
+
 /// Compact transition information used to draw a logic interval at reduced resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Summary {
@@ -369,25 +378,42 @@ impl LogicStore {
         }
     }
 
-    /// Remove a suffix where every channel flips on every sample.
+    /// Remove a suffix where every channel is alternating upload fill.
     ///
     /// A full-buffer upload can end in alternating fill (`0x55` / `0xAA` on
     /// every channel at once). Drawn, that is a burst of edges after an
     /// otherwise clean capture. It is not the stored signal: a clock on one
     /// wire does not qualify, because the other channels stay still. The
     /// kept prefix is the signal. Returns how many samples were dropped.
+    ///
+    /// Single-channel captures are trimmed too: the previous `width < 2` guard
+    /// left one-wire Linux buffer captures with the device fill attached.
     pub fn drop_shared_nyquist_tail(&mut self) -> u64 {
+        // Uneven channel lengths make level comparisons unreliable; keep a
+        // shared end before looking for fill.
+        self.trim_to_shortest();
         let len = self.len();
         let width = self.channel_count();
-        if width < 2 || len < 128 {
+        if width == 0 || len < 128 {
             return 0;
         }
+
+        // Prefer packed-byte detection: trailing bytes that are only 0x55/0xAA
+        // on every channel are the SRAM fill pattern, including one-wire pods.
+        if let Some(dropped) = self.drop_trailing_fill_bytes() {
+            return dropped;
+        }
+
         let mut index = len - 1;
         let mut flips = 0u64;
         let mut start = len;
         while index > 0 {
-            let flipped = (0..width)
-                .all(|channel| self.level(channel, index) != self.level(channel, index - 1));
+            let flipped = (0..width).all(|channel| {
+                match (self.level(channel, index), self.level(channel, index - 1)) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                }
+            });
             if !flipped {
                 break;
             }
@@ -404,6 +430,40 @@ impl LogicStore {
         }
         self.truncate(keep);
         len - keep
+    }
+
+    /// Drops a trailing run of `0x55`/`0xAA` bytes shared by every channel.
+    ///
+    /// Returns `None` when the suffix is too short or would leave no signal.
+    fn drop_trailing_fill_bytes(&mut self) -> Option<u64> {
+        let width = self.channel_count();
+        if width == 0 {
+            return None;
+        }
+        let fill_bytes = self
+            .channels
+            .iter()
+            .map(|channel| trailing_fill_bytes(&channel.bytes))
+            .min()?;
+        // At least 64 samples (8 bytes) of fill, and at least 64 samples kept.
+        if fill_bytes < 8 {
+            return None;
+        }
+        let total_bytes = self.channels[0].bytes.len();
+        if total_bytes <= fill_bytes {
+            return None;
+        }
+        let keep_bytes = total_bytes - fill_bytes;
+        if keep_bytes < 8 {
+            return None;
+        }
+        let len = self.len();
+        let keep = (keep_bytes as u64) * 8;
+        if keep >= len || keep < 64 {
+            return None;
+        }
+        self.truncate(keep);
+        Some(len - keep)
     }
 
     /// Drop samples from the front so at most `samples` remain.
@@ -772,6 +832,29 @@ mod tests {
         let cols = store.tile(0, 480.0, 32, 1.0).unwrap();
         assert!(cols.iter().any(|column| column.last));
         assert!(cols.iter().all(|column| !column.toggled));
+    }
+
+    /// One-wire buffer captures still drop trailing 0x55/0xAA SRAM fill.
+    #[test]
+    fn a_single_channel_oscillation_tail_is_dropped() {
+        let signal = 256u64;
+        let fill = 128u64;
+        let mut store = LogicStore::new(1);
+        push_levels(&mut store, 0, signal, |sample| sample % 16 >= 8);
+        push_levels(&mut store, 0, fill, |sample| sample % 2 == 0);
+        assert_eq!(store.len(), signal + fill);
+        assert_eq!(store.drop_shared_nyquist_tail(), fill);
+        assert_eq!(store.len(), signal);
+        assert_eq!(store.level(0, signal - 1), Some(true));
+    }
+
+    /// An entire record of Nyquist toggle is kept so a real fast clock survives.
+    #[test]
+    fn a_pure_nyquist_record_is_not_treated_as_fill() {
+        let mut store = LogicStore::new(1);
+        push_levels(&mut store, 0, 512, |sample| sample % 2 == 0);
+        assert_eq!(store.drop_shared_nyquist_tail(), 0);
+        assert_eq!(store.len(), 512);
     }
 
     /// Checks that viewport columns beyond recorded data stay empty without invented transitions.
