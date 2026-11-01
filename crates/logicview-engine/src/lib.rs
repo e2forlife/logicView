@@ -432,7 +432,7 @@ impl Engine {
                 (1u32 << profile.channels) - 1
             };
             self.use_pod_channels(mask, id, &profile.name, super_speed)
-                .await;
+                .await?;
             return Ok(info);
         }
         Err(EngineError::UnknownDevice(format!(
@@ -1491,35 +1491,39 @@ impl Engine {
         device_id: &str,
         device_name: &str,
         super_speed: bool,
-    ) {
+    ) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;
         let active = state.active;
-        if let Some(slot) = state.slots.get_mut(active) {
-            if slot.session.phase.is_active() {
-                return;
-            }
-            let (names, colors) = pod_channel_style(mask);
-            slot.devices = vec![BoundDevice {
-                id: device_id.into(),
-                name: device_name.into(),
-                kind: "usb".into(),
-                super_speed,
-            }];
-            slot.origins = names
-                .iter()
-                .map(|_| ChannelOrigin {
-                    device_id: device_id.into(),
-                    device_name: device_name.into(),
-                })
-                .collect();
-            slot.channel_names = names;
-            slot.channel_colors = colors;
-            remember_catalog(slot);
-            slot.session.config.channel_enable = 0;
-            slot.decoders.clear();
-            slot.annotations.clear();
-            slot.session.store = LogicStore::new(mask.count_ones() as usize);
+        let Some(slot) = state.slots.get_mut(active) else {
+            return Err(EngineError::UnknownSession("active".into()));
+        };
+        if slot.session.phase.is_active() {
+            return Err(EngineError::Device(
+                "stop the capture before selecting a different device".into(),
+            ));
         }
+        let (names, colors) = pod_channel_style(mask);
+        slot.devices = vec![BoundDevice {
+            id: device_id.into(),
+            name: device_name.into(),
+            kind: "usb".into(),
+            super_speed,
+        }];
+        slot.origins = names
+            .iter()
+            .map(|_| ChannelOrigin {
+                device_id: device_id.into(),
+                device_name: device_name.into(),
+            })
+            .collect();
+        slot.channel_names = names;
+        slot.channel_colors = colors;
+        remember_catalog(slot);
+        slot.session.config.channel_enable = 0;
+        slot.decoders.clear();
+        slot.annotations.clear();
+        slot.session.store = LogicStore::new(mask.count_ones() as usize);
+        Ok(())
     }
 
     /// Resolves an optional session identifier, falling back to the selected session.

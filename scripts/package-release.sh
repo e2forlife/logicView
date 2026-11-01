@@ -46,8 +46,10 @@ fi
 cp -a crates/logicview-ui/assets/. "${STAGE}/assets/"
 
 if [[ -f contrib/udev/99-logicview.rules ]]; then
-  mkdir -p "${STAGE}/contrib/udev"
+  mkdir -p "${STAGE}/contrib/udev" "${STAGE}/scripts"
   cp -f contrib/udev/99-logicview.rules "${STAGE}/contrib/udev/99-logicview.rules"
+  cp -f scripts/install-udev.sh "${STAGE}/scripts/install-udev.sh"
+  chmod +x "${STAGE}/scripts/install-udev.sh"
 fi
 
 tar -C dist -czf "${ARCHIVE}" "logicview-${VERSION}"

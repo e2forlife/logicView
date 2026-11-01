@@ -4030,6 +4030,7 @@ async function applyDeviceChoice(value) {
         if (!profile || !profile.hardware_tested) {
           const device = state.deviceList.find((item) => item.id === id);
           window.alert(`${profile?.name || device?.name || id}: support has not been tested in hardware.`);
+          return;
         }
       }
     }
@@ -4044,6 +4045,11 @@ async function applyDeviceChoice(value) {
   } catch (err) {
     statusEl.textContent = err.message;
     syncDeviceSelect();
+    // USB open failures used to look like the chip "snapped back" to Demo with
+    // only a status-line hint. Surface the reason in a dialog.
+    if (ids.some((id) => id.startsWith("usb:"))) {
+      window.alert(err.message || "Could not open the selected USB device.");
+    }
   }
 }
 
@@ -7292,7 +7298,12 @@ async function boot() {
   const pod = state.deviceList.find((device) => device.kind === "usb" && profiles.some((profile) => profile.id === device.id && profile.hardware_tested));
   if (pod && !(state.devices || []).some((device) => device.id === pod.id)) {
     try { await useDevice(pod.id); }
-    catch (err) { statusEl.textContent = `Could not open ${pod.name}: ${err.message}`; }
+    catch (err) {
+      const message = `Could not open ${pod.name}: ${err.message}`;
+      statusEl.textContent = message;
+      // Keep Demo selected, but explain why auto-connect did not stick.
+      window.alert(message);
+    }
   }
   connectSocket();
   drawWave();

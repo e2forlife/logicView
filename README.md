@@ -42,14 +42,20 @@ For supported hardware, firmware and FPGA bitstreams are not included in the rep
 
 ### Linux USB permissions
 
-On Linux, unprivileged access to DreamSourceLab USB devices needs a udev rule:
+On Linux, DreamSourceLab pods can show as **Detected** from sysfs before the process can open them. Selecting a pod needs read-write access to `/dev/bus/usb/...`. Install the udev rule, then unplug and replug the analyzer:
 
 ```sh
 sudo cp contrib/udev/99-logicview.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-If your distribution uses the `plugdev` group, add your user to it and re-login. Hardware checks are operator-run (`cargo test -p logicview-hal -- --ignored`) and are not assumed by CI.
+Or run the helper script from a source checkout or extracted release package:
+
+```sh
+scripts/install-udev.sh
+```
+
+Confirm the node is writable (mode `0666` or an ACL for your user), for example `ls -l /dev/bus/usb/*/*` after replug. Without the rule, selecting a detected pod fails and the session stays on Demo — listing only needs sysfs, opening needs read-write access. Hardware checks are operator-run (`cargo test -p logicview-hal -- --ignored`) and are not assumed by CI.
 
 ## Preferences and extensions
 

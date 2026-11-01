@@ -165,12 +165,12 @@ impl Pod {
         let device = info
             .open()
             .wait()
-            .map_err(|err| HalError::Usb(err.to_string()))?;
+            .map_err(|err| usb_access_error("open", &err.to_string()))?;
         let speed = device.speed();
         let interface = device
             .claim_interface(0)
             .wait()
-            .map_err(|err| HalError::Usb(err.to_string()))?;
+            .map_err(|err| usb_access_error("claim", &err.to_string()))?;
         let mut pod = Self {
             interface,
             firmware_major: 0,
@@ -613,6 +613,33 @@ fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
     })
 }
 
+/// Maps raw USB open/claim failures onto an actionable message for the operator.
+///
+/// On Linux a pod can appear in the device list from sysfs while `/dev/bus/usb`
+/// is still read-only. Permission errors then look like "cannot select" the pod.
+fn usb_access_error(action: &str, detail: &str) -> HalError {
+    let lower = detail.to_ascii_lowercase();
+    let permission = lower.contains("permission")
+        || lower.contains("access denied")
+        || lower.contains("eacces")
+        || lower.contains("os error 13");
+    if permission {
+        #[cfg(target_os = "linux")]
+        {
+            return HalError::Usb(format!(
+                "could not {action} the USB device ({detail}). Install contrib/udev/99-logicview.rules, reload udev, and replug the analyzer so /dev/bus/usb allows read-write access"
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return HalError::Usb(format!(
+                "could not {action} the USB device ({detail}). Close other apps using the analyzer and try again"
+            ));
+        }
+    }
+    HalError::Usb(format!("could not {action} the USB device: {detail}"))
+}
+
 /// Lists conventional external locations that may contain the required FPGA image.
 fn candidate_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -744,6 +771,18 @@ mod tests {
         assert_eq!(dirs[0].parent().unwrap().file_name().unwrap(), "DSView");
         assert!(dirs[1].parent().unwrap().ends_with("DSView"));
         assert!(dsview_res_dirs(Some(""), None).is_empty());
+    }
+
+    /// Permission failures while opening a listed pod point at the udev rule on Linux.
+    #[test]
+    fn usb_permission_errors_explain_how_to_fix_access() {
+        let err = super::usb_access_error("open", "Permission denied (os error 13)");
+        let text = err.to_string();
+        assert!(text.contains("could not open the USB device"));
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("99-logicview.rules"));
+        let other = super::usb_access_error("claim", "device busy");
+        assert!(other.to_string().contains("could not claim the USB device: device busy"));
     }
 
     /// Checks XDG and system firmware directories used on Linux and other Unix hosts.
