@@ -105,6 +105,8 @@ let hoverTimer = null;
 let pointer = null;
 let zoomAnchor = null;
 let zoomAnchorTimer = null;
+const touchPoints = new Map();
+let pinch = null;
 
 function view() {
   const id = state.active || "pending";
@@ -1544,7 +1546,21 @@ function drawRuler() {
     ctx.fillStyle = "#9aa6b8";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "center";
-    ctx.textBaseline = "top";
+    ctx.textBaseline = "middle";
+    // Short subdivisions make the scale readable between labeled divisions.
+    const minorStep = step / 5;
+    const firstMinor = Math.ceil(startSec / minorStep);
+    const lastMinor = Math.floor((startSec + span) / minorStep);
+    if (minorStep / span * w >= 4) {
+      ctx.strokeStyle = "#3a4658";
+      ctx.beginPath();
+      for (let i = firstMinor; i <= lastMinor; i++) {
+        const x = ((i * minorStep * state.rate + triggerOrigin()) - v.start) / v.spp;
+        ctx.moveTo(x + 0.5, h - 4);
+        ctx.lineTo(x + 0.5, h);
+      }
+      ctx.stroke();
+    }
     let lastLabel = -Infinity;
     for (let t = first; t < startSec + span + step * 0.01; t += step) {
       const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
@@ -1555,7 +1571,7 @@ function drawRuler() {
       ctx.lineTo(x + 0.5, h);
       ctx.stroke();
       if (x - lastLabel < 72) continue;
-      ctx.fillText(formatRulerTick(t, step), x, 3);
+      ctx.fillText(formatRulerTick(t, step), x, (h - 7) / 2);
       lastLabel = x;
     }
   }
@@ -2790,7 +2806,7 @@ async function runCapture() {
   state.error = null;
   paintStatus();
   try {
-    view().userNavigated = false;
+    view().userNavigated = true;
     state.captureStarted = performance.now();
     state.planned = samplesForDuration(settings.durationNs, settings.rate);
     const status = await api({
@@ -3989,9 +4005,13 @@ function placeDeviceSubmenu() {
   row.classList.toggle("flip", rect.right + 196 > window.innerWidth);
 }
 
-async function loadDeviceChoices() {
+let deviceScanInFlight = false;
+async function refreshDeviceList() {
+  if (deviceScanInFlight) return;
+  deviceScanInFlight = true;
   try {
     const devices = await api({ cmd: "list_devices" });
+    const changed = JSON.stringify(devices) !== JSON.stringify(state.deviceList);
     state.deviceList = devices;
     const hardware = devices.filter((device) => device.kind !== "demo");
     const plugged = document.getElementById("plugged-in");
@@ -4001,6 +4021,15 @@ async function loadDeviceChoices() {
         : "No DreamSourceLab pod is plugged in.";
     }
     syncDeviceSelect();
+    const menu = document.getElementById("device-menu");
+    if (changed && menu && !menu.classList.contains("hidden")) renderDeviceMenu();
+  } catch (_) { /* Keep the last successful scan until the next retry. */ }
+  finally { deviceScanInFlight = false; }
+}
+
+async function loadDeviceChoices() {
+  await refreshDeviceList();
+  try {
     api({ cmd: "list_profiles" }).then((profiles) => {
       state.profiles = profiles;
       const note = document.getElementById("profile-note");
@@ -5516,7 +5545,8 @@ wave.addEventListener("wheel", (ev) => {
   zoomAnchorTimer = setTimeout(() => {
     zoomAnchor = null;
   }, 300);
-  stepZoom(ev.deltaY > 0, zoomAnchor);
+  if (ev.ctrlKey) zoomAt(zoomAnchor.sample, zoomAnchor.x, Math.exp(ev.deltaY * 0.01));
+  else stepZoom(ev.deltaY > 0, zoomAnchor);
 }, { passive: false });
 
 function currentTimebaseIndex() {
@@ -5542,12 +5572,13 @@ function stepZoom(out, anchor) {
 function zoomAt(sample, x, factor) {
   const v = view();
   const width = Math.max(1, wave.clientWidth);
-  const minSpp = 1 / 32;
+  const minSpp = TIME_DIVS[0] * Math.max(1, state.rate) / Math.max(40, width / 10);
   const maxSpp = state.total > 0 ? state.total / width : minSpp;
   const before = v.spp;
   v.spp = Math.min(maxSpp, Math.max(minSpp, before * factor));
-  if (v.spp === before) return;
-  v.start = sample - x * v.spp;
+  const start = sample - x * v.spp;
+  if (v.spp === before && v.start === start) return;
+  v.start = start;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
@@ -5558,6 +5589,17 @@ function zoomAt(sample, x, factor) {
 }
 
 wave.addEventListener("pointerdown", (ev) => {
+  if (ev.pointerType === "touch") {
+    if (state.total <= 0) return;
+    touchPoints.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    wave.setPointerCapture(ev.pointerId);
+    if (touchPoints.size === 2) {
+      const [a, b] = [...touchPoints.values()];
+      const x = (a.x + b.x) / 2 - wave.getBoundingClientRect().left;
+      pinch = { distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), sample: view().start + x * view().spp };
+    }
+    return;
+  }
   if (ev.button !== 0) return;
   if (state.total <= 0) return;
   const rect = wave.getBoundingClientRect();
@@ -5614,6 +5656,18 @@ function scheduleViewPaint() {
 }
 
 wave.addEventListener("pointermove", (ev) => {
+  if (ev.pointerType === "touch") {
+    if (!touchPoints.has(ev.pointerId)) return;
+    touchPoints.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (pinch && touchPoints.size === 2) {
+      const [a, b] = [...touchPoints.values()];
+      const distance = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+      const x = (a.x + b.x) / 2 - wave.getBoundingClientRect().left;
+      zoomAt(pinch.sample, x, pinch.distance / distance);
+      pinch.distance = distance;
+    }
+    return;
+  }
   const rect = wave.getBoundingClientRect();
   state.hoverX = ev.clientX - rect.left;
   if (pointer && pointer.kind === "pan") {
@@ -5656,7 +5710,17 @@ wave.addEventListener("pointermove", (ev) => {
   drawWave();
 });
 
+function endWaveTouch(ev) {
+  touchPoints.delete(ev.pointerId);
+  pinch = null;
+}
+wave.addEventListener("pointercancel", (ev) => {
+  if (ev.pointerType === "touch") endWaveTouch(ev);
+  else pointer = null;
+});
+
 wave.addEventListener("pointerup", async (ev) => {
+  if (ev.pointerType === "touch") { endWaveTouch(ev); return; }
   const active = pointer;
   pointer = null;
   if (!active) return;
@@ -6270,8 +6334,12 @@ document.addEventListener("click", (ev) => {
   if (!ev.target.closest("#device-acq-menu")) closeDeviceAcqMenu();
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
   if (!ev.target.closest("#run-menu") && !ev.target.closest("#run")) closeRunMenu();
-  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
 });
+
+// Run before other controls can stop the click from reaching document.
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
+}, true);
 
 let menuDismissTimer = 0;
 let menuDismissGroup = "";
@@ -6419,6 +6487,8 @@ window.addEventListener("resize", () => {
   drawRuler();
   refreshOverview();
 });
+
+setInterval(refreshDeviceList, 2000);
 
 setInterval(async () => {
   if (!isLive(state.phase) || !state.active) return;
