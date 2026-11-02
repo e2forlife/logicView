@@ -132,10 +132,10 @@ scripts/run-debug.sh
 
 The Linux packaging script writes both:
 
-- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, example decoders, UI assets, and the udev rule. Extract and run `./logicview`.
-- `dist/logicview-<version>-x86_64.AppImage` — the same payload as a single executable file. Mark it executable and run it (`chmod +x … && ./logicview-…-x86_64.AppImage`).
+- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, example decoders, UI assets, the application icon and desktop entry, and the udev rule. Extract and run `./logicview`. `scripts/install-desktop.sh` installs the icon and menu entry for your user.
+- `dist/logicview-<version>-x86_64.AppImage` — the same payload as a single executable file, with the application icon embedded for file managers. Mark it executable and run it (`chmod +x … && ./logicview-…-x86_64.AppImage`).
 
-The AppImage is a thin bundle: it still needs host WebKitGTK 4.1 and GTK 3 (`libwebkit2gtk-4.1-0` and GTK 3 on Debian/Ubuntu), the same runtime libraries as a normal desktop build. It downloads `appimagetool` into `dist/.appimage-tools` on first use (override with `LOGICVIEW_APPIMAGE_TOOL_DIR` / `LOGICVIEW_APPIMAGETOOL_URL`).
+The AppImage is a thin bundle: it still needs host WebKitGTK 4.1 and GTK 3 (`libwebkit2gtk-4.1-0` and GTK 3 on Debian/Ubuntu), the same runtime libraries as a normal desktop build. It downloads `appimagetool` into `dist/.appimage-tools` on first use (override with `LOGICVIEW_APPIMAGE_TOOL_DIR` / `LOGICVIEW_APPIMAGETOOL_URL`). Packaging also needs `squashfs-tools`. The image is gzip-compressed so file managers can read its icon, and the script installs a per-user AppImage thumbnailer for desktops that do not ship one.
 
 ### MCP server
 

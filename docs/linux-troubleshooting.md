@@ -134,7 +134,7 @@ Produces:
 - `dist/logicview-<version>-linux-x86_64.tar.gz`
 - `dist/logicview-<version>-x86_64.AppImage`
 
-Release packages include `contrib/udev/99-logicview.rules` and `scripts/install-udev.sh`. Installing the AppImage or extracting the tarball does **not** install udev rules automatically; run the helper once per machine.
+Release packages include the application icon, a desktop entry, `contrib/udev/99-logicview.rules`, and `scripts/install-udev.sh`. `scripts/install-desktop.sh` installs the menu entry, icon, and AppImage thumbnailer for your user. Installing the AppImage or extracting the tarball does **not** install udev rules or the desktop entry automatically.
 
 ## Hardware tests (optional)
 

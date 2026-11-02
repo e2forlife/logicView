@@ -1,4 +1,4 @@
-//! Turns `icon.png` into the window icon and, on Windows, the executable icon.
+//! Turns `icon.png` into the window icon, the Linux package icons, and, on Windows, the executable icon.
 
 use std::env;
 use std::fs::File;
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 const WINDOW_PX: u32 = 256;
 const EXE_SIZES: [u32; 5] = [16, 32, 48, 64, 256];
+const PACKAGE_ICON_SIZES: [u32; 4] = [48, 64, 128, 256];
 
 /// Prepares icon assets during the application build and embeds Windows executable resources.
 fn main() {
@@ -20,9 +21,20 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let window = resize(&source, WINDOW_PX);
     std::fs::write(out_dir.join("window-icon.rgba"), window.as_raw()).expect("write window icon");
+    write_package_icons(&source, &out_dir);
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_exe_icon(&source, &out_dir);
+    }
+}
+
+/// Writes the PNG sizes installed into the Linux tarball and AppImage icon theme.
+fn write_package_icons(source: &image::RgbaImage, out_dir: &Path) {
+    for size in PACKAGE_ICON_SIZES {
+        let icon = resize(source, size);
+        let path = out_dir.join(format!("icon-{size}.png"));
+        icon.save(&path)
+            .unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
     }
 }
 

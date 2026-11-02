@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""AppImage icon helper.
+
+File managers show an AppImage's folder icon by reading `.DirIcon` from the
+squashfs image. This tool recompresses a freshly built AppImage with gzip so
+those readers can open it, installs a per-user thumbnailer, and writes the
+thumbnail image itself.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+import zlib
+from pathlib import Path
+
+SQUASHFS_BLOCKS = {4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576}
+GZIP_COMPRESSION = 1
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def elf_runtime_end(blob: bytes) -> int:
+    """Return the byte offset where the AppImage runtime ELF ends."""
+    if blob[:4] != b"\x7fELF" or blob[4] != 2:
+        raise SystemExit("AppImage runtime is not a 64-bit ELF")
+    end = struct.unpack_from("<Q", blob, 40)[0]
+    section_size = struct.unpack_from("<H", blob, 58)[0]
+    section_count = struct.unpack_from("<H", blob, 60)[0]
+    end += section_size * section_count
+    program_off = struct.unpack_from("<Q", blob, 32)[0]
+    program_size = struct.unpack_from("<H", blob, 54)[0]
+    program_count = struct.unpack_from("<H", blob, 56)[0]
+    for index in range(program_count):
+        header = program_off + index * program_size
+        kind, _flags, offset, _vaddr, _paddr, filesz, _memsz, _align = struct.unpack_from(
+            "<IIQQQQQQ", blob, header
+        )
+        if kind == 1:
+            end = max(end, offset + filesz)
+    return end
+
+
+def is_squashfs(blob: bytes, offset: int) -> bool:
+    if offset < 0 or offset + 32 > len(blob) or blob[offset : offset + 4] != b"hsqs":
+        return False
+    block = struct.unpack_from("<I", blob, offset + 12)[0]
+    major, minor = struct.unpack_from("<HH", blob, offset + 28)
+    return major == 4 and minor == 0 and block in SQUASHFS_BLOCKS
+
+
+def squashfs_offset(blob: bytes) -> int:
+    """Find the squashfs image that follows the AppImage runtime."""
+    end = elf_runtime_end(blob)
+    if is_squashfs(blob, end):
+        return end
+    start = 0
+    while True:
+        index = blob.find(b"hsqs", start)
+        if index < 0:
+            break
+        if is_squashfs(blob, index):
+            return index
+        start = index + 1
+    raise SystemExit("AppImage does not contain a squashfs image")
+
+
+def elf_section(blob: bytes, name: str) -> tuple[int, int] | None:
+    """Return the file offset and size of a named ELF section."""
+    section_off = struct.unpack_from("<Q", blob, 40)[0]
+    section_size = struct.unpack_from("<H", blob, 58)[0]
+    section_count = struct.unpack_from("<H", blob, 60)[0]
+    name_index = struct.unpack_from("<H", blob, 62)[0]
+    if section_count == 0 or name_index >= section_count:
+        return None
+
+    def header(index: int) -> tuple[int, ...]:
+        return struct.unpack_from("<IIQQQQIIQQ", blob, section_off + index * section_size)
+
+    names_off, names_size = header(name_index)[4], header(name_index)[5]
+    names = blob[names_off : names_off + names_size]
+    target = name.encode()
+    for index in range(section_count):
+        fields = header(index)
+        label = names[fields[0] : names.find(b"\x00", fields[0])]
+        if label == target:
+            return fields[4], fields[5]
+    return None
+
+
+def md5_with_span_zeroed(blob: bytes, offset: int, length: int) -> bytes:
+    data = bytearray(blob)
+    data[offset : offset + length] = b"\x00" * length
+    return hashlib.md5(data).digest()
+
+
+def extract_member(image: Path, offset: int, name: str) -> bytes:
+    try:
+        return subprocess.check_output(
+            ["unsquashfs", "-cat", "-o", str(offset), str(image), name],
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return b""
+
+
+def diricon(image: Path) -> bytes:
+    offset = squashfs_offset(image.read_bytes())
+    png = extract_member(image, offset, ".DirIcon")
+    if png.startswith(PNG_MAGIC):
+        return png
+    png = extract_member(image, offset, "logicview.png")
+    if png.startswith(PNG_MAGIC):
+        return png
+    raise SystemExit(f"{image} has no PNG .DirIcon")
+
+
+def recompress_gzip(appimage: Path, appdir: Path) -> None:
+    """Replace the zstd payload with gzip while keeping the AppImage runtime."""
+    original = appimage.read_bytes()
+    offset = squashfs_offset(original)
+    runtime = original[:offset]
+    digest = elf_section(original, ".digest_md5")
+    digest_width = None
+    if digest is not None:
+        section_off, section_len = digest
+        for width in (section_len, 16):
+            if md5_with_span_zeroed(original, section_off, width) == original[section_off : section_off + 16]:
+                digest_width = width
+                break
+
+    blank = appimage.with_suffix(appimage.suffix + ".repack")
+    blank.write_bytes(b"\x00" * offset)
+    try:
+        subprocess.check_call(
+            [
+                "mksquashfs",
+                str(appdir),
+                str(blank),
+                "-offset",
+                str(offset),
+                "-comp",
+                "gzip",
+                "-all-root",
+                "-noappend",
+                "-no-progress",
+            ],
+            stdout=subprocess.DEVNULL,
+        )
+        repacked = bytearray(blank.read_bytes())
+    finally:
+        blank.unlink(missing_ok=True)
+
+    if not is_squashfs(repacked, offset):
+        raise SystemExit("repacked AppImage is missing its squashfs image")
+    repacked[:offset] = runtime
+    if digest is not None and digest_width is not None:
+        section_off, _section_len = digest
+        repacked[section_off : section_off + 16] = md5_with_span_zeroed(repacked, section_off, digest_width)
+        print("Updated the AppImage digest for the gzip image")
+    else:
+        print("Left the AppImage runtime digest unchanged")
+    compression = struct.unpack_from("<H", repacked, offset + 20)[0]
+    if compression != GZIP_COMPRESSION:
+        raise SystemExit(f"expected gzip squashfs, found compression id {compression}")
+    appimage.write_bytes(repacked)
+    os.chmod(appimage, 0o755)
+    png = diricon(appimage)
+    width, height = struct.unpack_from(">II", png, 16)
+    if (width, height) != (256, 256):
+        raise SystemExit(f".DirIcon is {width}x{height}, expected 256x256")
+    print(f"AppImage icon: {width}x{height} PNG in a gzip image")
+
+
+def scaled_png(png: bytes, size: int) -> bytes:
+    try:
+        import gi
+
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+
+        loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+        loader.write(png)
+        loader.close()
+        pixbuf = loader.get_pixbuf()
+        if pixbuf is None:
+            return png
+        if pixbuf.get_width() != size or pixbuf.get_height() != size:
+            pixbuf = pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        data = pixbuf.save_to_bufferv("png", [], [])
+        return bytes(data[1] if isinstance(data, tuple) else data)
+    except Exception:
+        return png
+
+
+def text_chunk(key: str, value: str) -> bytes:
+    payload = key.encode("latin-1") + b"\x00" + value.encode("latin-1")
+    tag = b"tEXt"
+    return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+
+
+def with_thumbnail_metadata(png: bytes, uri: str, mtime: int) -> bytes:
+    marker = png.rfind(b"\x00\x00\x00\x00IEND")
+    if marker < 0:
+        return png
+    meta = text_chunk("Thumb::URI", uri) + text_chunk("Thumb::MTime", str(mtime))
+    return png[:marker] + meta + png[marker:]
+
+
+def write_thumbnail(image: Path, dest: Path, size: int) -> None:
+    png = scaled_png(diricon(image), size)
+    if not png.startswith(PNG_MAGIC):
+        raise SystemExit("thumbnail is not a PNG")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(png)
+
+
+def seed_cache(image: Path) -> None:
+    resolved = image.resolve()
+    uri = resolved.as_uri()
+    digest = hashlib.md5(uri.encode("utf-8")).hexdigest()
+    mtime = int(resolved.stat().st_mtime)
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "thumbnails"
+    for folder, size in (("normal", 128), ("large", 256)):
+        dest = cache / folder / f"{digest}.png"
+        png = with_thumbnail_metadata(scaled_png(diricon(resolved), size), uri, mtime)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(png)
+        print(f"Thumbnail: {dest}")
+    fail_root = cache / "fail"
+    if fail_root.is_dir():
+        for stale in fail_root.glob(f"**/{digest}.png"):
+            stale.unlink()
+
+
+def install_thumbnailer(icon: Path | None) -> Path:
+    dest_dir = Path.home() / ".local" / "share" / "logicview"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    installed = dest_dir / "appimage-thumbnailer"
+    installed.write_bytes(Path(__file__).read_bytes())
+    installed.chmod(0o755)
+    if icon is not None:
+        (dest_dir / "logicview.png").write_bytes(icon.read_bytes())
+    entry_dir = Path.home() / ".local" / "share" / "thumbnailers"
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    entry = entry_dir / "logicview-appimage.thumbnailer"
+    entry.write_text(
+        "\n".join(
+            [
+                "[Thumbnailer Entry]",
+                f"TryExec={installed}",
+                f"Exec={installed} %i %o %s",
+                "MimeType=application/vnd.appimage;application/x-iso9660-appimage;",
+                "",
+            ]
+        )
+    )
+    print(f"Installed AppImage thumbnailer: {entry}")
+    return dest_dir / "logicview.png"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args:
+        raise SystemExit("usage: appimage-thumbnailer INPUT OUTPUT [SIZE]")
+    if args[0] == "--recompress":
+        if len(args) != 3:
+            raise SystemExit("usage: appimage-thumbnailer --recompress APPIMAGE APPDIR")
+        recompress_gzip(Path(args[1]), Path(args[2]))
+        return
+    if args[0] == "--seed":
+        if len(args) != 2:
+            raise SystemExit("usage: appimage-thumbnailer --seed APPIMAGE")
+        seed_cache(Path(args[1]))
+        return
+    if args[0] == "--install":
+        icon = Path(args[1]) if len(args) > 1 else None
+        install_thumbnailer(icon)
+        return
+    if len(args) < 2:
+        raise SystemExit("usage: appimage-thumbnailer INPUT OUTPUT [SIZE]")
+    size = int(args[2]) if len(args) > 2 else 256
+    write_thumbnail(Path(args[0]), Path(args[1]), size)
+
+
+if __name__ == "__main__":
+    main()
