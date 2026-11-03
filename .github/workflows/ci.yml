@@ -39,3 +39,11 @@ jobs:
             echo "$found"
             exit 1
           fi
+
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build Windows release
+        run: cargo build --release -p logicview-app

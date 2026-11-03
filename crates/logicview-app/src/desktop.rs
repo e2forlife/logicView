@@ -3,7 +3,6 @@
 //! The window is the application. The page it loads is the loopback server
 //! started in this process; nothing asks the user to open a browser.
 
-#[cfg(any(not(windows), debug_assertions))]
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::mpsc;
