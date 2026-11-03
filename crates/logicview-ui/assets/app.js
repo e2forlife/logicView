@@ -1005,6 +1005,13 @@ function memberMatches(member, item) {
 }
 
 let channelDrag = null;
+let suppressChannelClick = false;
+document.addEventListener("click", (ev) => {
+  if (!suppressChannelClick || !gutter.contains(ev.target)) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  suppressChannelClick = false;
+}, true);
 
 function channelKeyAt(clientY) {
   const nodes = [...gutter.querySelectorAll(".ch")];
@@ -1033,10 +1040,13 @@ function finishChannelDrag() {
   const drag = channelDrag;
   channelDrag = null;
   highlightChannel(null);
-  if (!drag.moved) selectOnly(drag.key);
+  if (drag.moved) {
+    suppressChannelClick = true;
+    setTimeout(() => { suppressChannelClick = false; }, 0);
+  } else if (drag.selectOnClick) selectOnly(drag.key);
 }
 
-function startChannelDrag(key, startY) {
+function startChannelDrag(key, startY, selectOnClick = true) {
   if (channelDrag) finishChannelDrag();
   const move = (e) => {
     if (!channelDrag) return;
@@ -1058,7 +1068,7 @@ function startChannelDrag(key, startY) {
     }
     finishChannelDrag();
   };
-  channelDrag = { key, startY, moved: false, move, up };
+  channelDrag = { key, startY, moved: false, move, up, selectOnClick };
   window.addEventListener("mousemove", move);
   window.addEventListener("mouseup", up);
   window.addEventListener("pointermove", move);
@@ -1185,6 +1195,21 @@ function foldSpacer() {
   return spacer;
 }
 
+// A container header is followed by its visible descendants until the next
+// row at the same or shallower depth. Folded groups therefore frame one row.
+function groupRanges(layout) {
+  const ranges = [];
+  for (let i = 0; i < layout.length; i++) {
+    const row = layout[i].row;
+    if (!row.header || !row.bus || row.bus.decode || (row.kind !== "group" && row.kind !== "bus")) continue;
+    const depth = row.depth || 0;
+    let end = i;
+    while (end + 1 < layout.length && (layout[end + 1].row.depth || 0) > depth) end++;
+    ranges.push({ start: i, end });
+  }
+  return ranges;
+}
+
 function renderGutter() {
   const metrics = rowMetrics();
   const selected = new Set(ensureSelection().selection);
@@ -1192,13 +1217,17 @@ function renderGutter() {
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
-  for (const item of metrics.layout) {
+  const ranges = groupRanges(metrics.layout);
+  for (const [index, item] of metrics.layout.entries()) {
     const row = item.row;
     const folded = rowFolded(row);
     const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
     el.className = "ch" + (row.child ? " child" : "") + (selected.has(row.key) ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
+    if (ranges.some((range) => range.start <= index && index <= range.end)) el.classList.add("group-frame");
+    if (ranges.some((range) => range.start === index)) el.classList.add("group-frame-top");
+    if (ranges.some((range) => range.end === index)) el.classList.add("group-frame-bottom");
     if ((row.depth || 0) > 1) el.style.setProperty("--nest", ((row.depth - 1) * 14) + "px");
     el.style.height = item.height + "px";
     el.style.flex = "none";
@@ -1209,9 +1238,13 @@ function renderGutter() {
     el.style.setProperty("--channel-color", shown);
     bar.style.background = shown;
     bar.title = "Channel color";
+    if (row.kind === "logic" && signalName(row) !== row.name) {
+      bar.textContent = String(originalChannelNumber(row));
+      bar.classList.add("numbered");
+      bar.title = `Channel ${bar.textContent} color`;
+    }
     bar.addEventListener("mousedown", (ev) => {
       ev.preventDefault();
-      ev.stopPropagation();
     });
     bar.addEventListener("click", (ev) => {
       ev.preventDefault();
@@ -1222,9 +1255,8 @@ function renderGutter() {
     name.className = "name";
     name.textContent = signalName(row);
 
-    if (row.kind === "logic") {
+    if (row.kind === "logic" || ((row.kind === "group" || row.kind === "bus") && row.bus && !row.bus.decode)) {
       name.title = "Double-click to rename";
-      name.addEventListener("mousedown", (ev) => ev.stopPropagation());
       name.addEventListener("dblclick", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
@@ -1263,13 +1295,14 @@ function renderGutter() {
     if (foldable) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
-      if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
-      if (ev.shiftKey || ev.ctrlKey || ev.metaKey) {
+      if (ev.button !== 0 || ev.target.closest(".row-resize, input")) return;
+      const interactive = ev.target.closest("button, .bar");
+      if (!interactive && (ev.shiftKey || ev.ctrlKey || ev.metaKey)) {
         ev.preventDefault();
         applySelection(row.key, ev);
         return;
       }
-      startChannelDrag(row.key, ev.clientY);
+      startChannelDrag(row.key, ev.clientY, !interactive && !ev.target.closest(".name"));
     });
     el.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
@@ -1293,11 +1326,19 @@ function signalName(row) {
   return (names && names[row.key]) || row.name;
 }
 
+function originalChannelNumber(row) {
+  const probes = state.probes || [];
+  const probe = probeForRow(row);
+  if (probe) return localProbeIndex(probes, probe);
+  const physical = /(?:^|\s)D(\d+)$/i.exec(row.name || "");
+  return physical ? Number(physical[1]) : row.channel;
+}
+
 function startRename(row, nameEl) {
   const input = document.createElement("input");
   input.className = "rename";
   input.value = signalName(row);
-  input.setAttribute("aria-label", "Signal name");
+  input.setAttribute("aria-label", row.kind === "logic" ? "Signal name" : "Group name");
   nameEl.replaceWith(input);
   input.focus();
   input.select();
@@ -1308,11 +1349,17 @@ function startRename(row, nameEl) {
     if (commit) {
       const next = input.value.trim();
       const names = view().names || (view().names = {});
-      if (!next || next === row.name) delete names[row.key];
+      if (row.kind !== "logic" && row.bus && !row.bus.decode) {
+        if (next) {
+          row.bus.name = next;
+          delete names[row.key];
+        }
+      } else if (!next || next === row.name) delete names[row.key];
       else names[row.key] = next;
     }
     state.gutterSig = "";
     renderGutter();
+    if (row.kind !== "logic") drawWave();
   };
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
@@ -1607,6 +1654,7 @@ function wavePalette() {
       bgAlt: "#e6dcc8",
       ink: "#243140",
       grid: "rgba(36, 49, 64, 0.12)",
+      groupBorder: "#526275",
       timeGrid: "rgba(36, 72, 110, 0.18)",
       logicGuide: "rgba(36, 49, 64, 0.16)",
       analogGuide: "rgba(36, 49, 64, 0.22)",
@@ -1622,6 +1670,7 @@ function wavePalette() {
     bgAlt: "#141b24",
     ink: "#d5deea",
     grid: "rgba(255,255,255,0.045)",
+    groupBorder: "#718198",
     timeGrid: "rgba(86, 140, 190, 0.16)",
     logicGuide: "rgba(140, 170, 200, 0.14)",
     analogGuide: "rgba(140, 170, 200, 0.18)",
@@ -1700,6 +1749,7 @@ function drawWave() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("Click Run to capture data", w / 2, h / 2);
+    drawGroupBorders(ctx, w, layout, palette);
     return;
   }
   drawGrid(ctx, w, h, layout, palette);
@@ -1736,6 +1786,7 @@ function drawWave() {
     ctx.fillText("H", 8, top + pad);
     ctx.fillText("L", 8, top + item.height - pad);
   }
+  drawGroupBorders(ctx, w, layout, palette);
   drawMeasureSpan(ctx, w, h);
   drawHoverBoundaries(ctx, w, layout);
   drawMarkerLines(ctx, h);
@@ -1760,6 +1811,24 @@ function drawWave() {
     ctx.lineTo(state.hoverX + 0.5, h);
     ctx.stroke();
   }
+}
+
+function drawGroupBorders(ctx, width, layout, palette) {
+  ctx.save();
+  ctx.strokeStyle = palette.groupBorder;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const range of groupRanges(layout)) {
+    const top = layout[range.start].top;
+    const last = layout[range.end];
+    const bottom = last.top + last.height;
+    ctx.moveTo(0, top + 1);
+    ctx.lineTo(width, top + 1);
+    ctx.moveTo(0, bottom - 1);
+    ctx.lineTo(width, bottom - 1);
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 // Temporary dimension lines connect the exact boundaries used by the hover values.
@@ -5123,16 +5192,30 @@ function channelSpecByIndex(index) {
   return channel ? channelSpec(channel) : String(index);
 }
 
-function saveSetup() {
-  openSaveDialog({
-    title: "Save setup",
-    note: "Channel layout, colors, cursors, and decoders. This file does not include samples.",
-    filename: "setup.lvsetup",
-    ext: ".lvsetup",
-    mime: "application/json",
-    picker: { description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] } },
-    produce: () => JSON.stringify(setupDocument(), null, 2),
-  });
+async function saveSetup() {
+  const setup = setupDocument();
+  try {
+    if (window.ipc) {
+      const path = await pickSaveFile("setup");
+      if (!path) { statusEl.textContent = "save cancelled"; return; }
+      const response = await fetch("/api/save-setup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, setup }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok || !json.ok) throw new Error(json.error || "save failed");
+      statusEl.textContent = "saved " + (json.path || path);
+      return;
+    }
+    const blob = new Blob([JSON.stringify(setup, null, 2)], { type: "application/json" });
+    const wrote = await writeChosenFile("setup.lvsetup", blob, {
+      description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] },
+    });
+    statusEl.textContent = wrote === "cancel" ? "save cancelled" : "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  }
 }
 
 async function openSetupFile(file) {
@@ -5892,7 +5975,10 @@ async function decodedHoverBounds(row, sample, session, sequence) {
     if (sequence !== state.hoverSequence || session !== state.active || pointer) return null;
     for (const item of page) {
       if (FRAME_CLASS.has(item.class)) continue;
-      if (row.lane && (!item.fields || item.fields[row.lane] == null)) continue;
+      if (row.lane) {
+        const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+        if (decoder ? !laneAnnotations([item], row.lane, decoder).length : !item.fields || item.fields[row.lane] == null) continue;
+      }
       if (!current) {
         if (item.start_sample <= sample && sample < item.end_sample) current = item;
         else if (item.start_sample > sample) return null;

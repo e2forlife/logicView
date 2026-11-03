@@ -983,6 +983,29 @@ mod tests {
     }
 
     #[test]
+    fn translated_uart_exposes_data_lane_and_decodes_a_byte() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/1-uart.lua");
+        let lua = lua().unwrap();
+        let schema = metadata(&lua, &module(&lua, &path).unwrap()).unwrap();
+        assert_eq!(schema.lanes[0].channel, "rxtx");
+        assert_eq!(schema.lanes[0].classes, ["data"]);
+        let mut bits = vec![1; 30];
+        for bit in [0u8, 1, 0, 1, 0, 0, 1, 0, 1, 1] {
+            bits.extend(std::iter::repeat_n(bit, 10));
+        }
+        bits.extend([1; 30]);
+        let samples = bits.len() as u64;
+        let data = pack_bits(&bits);
+        let channels = [("rxtx", data.as_slice())];
+        let request = DecodeRequest { protocol: "1:uart", channels: &channels, options: &[],
+            region: 0..samples, sample_len: samples, sample_rate_hz: Some(1_152_000),
+            lower: &[], lower_packets: &[] };
+        let output = run_paths(&request, &AtomicBool::new(false), vec![path]).unwrap();
+        assert!(output.annotations.iter().any(|row| row.class == "data" && row.text == "A5" && row.fields.get("value").map(String::as_str) == Some("A5")), "{:?}", output.annotations);
+        assert!(output.annotations.iter().any(|row| row.class == "data-bits"));
+    }
+
+    #[test]
     fn translated_i2c_decodes_on_sda_after_long_idle() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
         let (scl, sda, len) = crate::i2c::fixture_eeprom_bits();

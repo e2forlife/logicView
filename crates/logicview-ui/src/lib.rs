@@ -116,6 +116,7 @@ fn router_with_control(engine: Engine, mcp: mcp_server::Control) -> Router {
         .route("/api/export/xlsx", get(export_xlsx))
         .route("/api/export-to", post(export_to))
         .route("/api/save-as", post(save_as))
+        .route("/api/save-setup", post(save_setup))
         .route(
             "/api/import",
             post(import_capture).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
@@ -543,6 +544,30 @@ async fn export_to(
         "rows": rows,
         "total": total,
     })))
+}
+
+/// Setup data and the absolute destination chosen in the system dialog.
+#[derive(Deserialize)]
+struct SaveSetup {
+    path: std::path::PathBuf,
+    setup: Value,
+}
+
+async fn save_setup(Json(input): Json<SaveSetup>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = input.path;
+    if !path.is_absolute()
+        || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lvsetup") || ext.eq_ignore_ascii_case("json"))
+        || !path.parent().is_some_and(|parent| parent.is_dir())
+        || (path.exists() && !path.is_file())
+    {
+        return Err(export_error("Choose a setup file in an existing folder"));
+    }
+    if input.setup.get("kind").and_then(Value::as_str) != Some("logicview-setup") {
+        return Err(export_error("Invalid setup data"));
+    }
+    let bytes = serde_json::to_vec_pretty(&input.setup).map_err(|err| export_error(err.to_string()))?;
+    std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
+    Ok(Json(json!({ "ok": true, "path": path.to_string_lossy() })))
 }
 
 /// Full path chosen in the system save dialog.
@@ -2308,6 +2333,25 @@ mod tests {
         let written = std::fs::read(&path).unwrap();
         assert!(written.starts_with(b"PK"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn save_setup_writes_selected_file_and_rejects_relative_paths() {
+        let app = router(Engine::new());
+        let setup = json!({"kind": "logicview-setup", "version": 1, "names": {"logic:0": "Clock"}});
+        let request = |path: &std::path::Path| {
+            Request::builder().method("POST").uri("/api/save-setup")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({"path": path, "setup": setup})).unwrap())).unwrap()
+        };
+        let relative = app.clone().oneshot(request(std::path::Path::new("setup.lvsetup"))).await.unwrap();
+        assert_eq!(relative.status(), StatusCode::BAD_REQUEST);
+        let path = std::env::temp_dir().join(format!("logicview-setup-test-{}.lvsetup", std::process::id()));
+        let saved = app.oneshot(request(&path)).await.unwrap();
+        assert!(saved.status().is_success());
+        let data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(data, setup);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Checks that the UI listener stays on the local host.

@@ -118,7 +118,7 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                     let _ = ipc_proxy.send_event(UiEvent::PickFile(kind.to_string()));
                 }
             } else if let Some(kind) = body.strip_prefix("save-file:") {
-                if kind == "lvcap" {
+                if matches!(kind, "lvcap" | "setup") {
                     let _ = ipc_proxy.send_event(UiEvent::SaveFile(kind.to_string()));
                 }
             } else if let Some(theme) = body.strip_prefix("theme:") {
@@ -261,19 +261,22 @@ fn open_window(start_url: &str, origin: &str) -> Result<(), String> {
                     ));
                 }
                 UiEvent::SaveFile(kind) => {
+                    let (title, name, label, extensions, default_ext): (&str, &str, &str, &[&str], &str) =
+                        if kind == "setup" {
+                            ("Save setup", "setup.lvsetup", "LogicView setup", &["lvsetup", "json"], "lvsetup")
+                        } else {
+                            ("Save capture", "capture.lvcap", "LogicView capture", &["lvcap"], "lvcap")
+                        };
                     let chosen = rfd::FileDialog::new()
-                        .set_title("Save capture")
-                        .set_file_name("capture.lvcap")
-                        .add_filter("LogicView capture", &["lvcap"])
+                        .set_title(title)
+                        .set_file_name(name)
+                        .add_filter(label, extensions)
                         .save_file()
                         .map(|path| {
-                            if path
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("lvcap"))
-                            {
+                            if path.extension().is_some_and(|ext| extensions.iter().any(|allowed| ext.eq_ignore_ascii_case(allowed))) {
                                 path
                             } else {
-                                path.with_extension("lvcap")
+                                path.with_extension(default_ext)
                             }
                         });
                     let kind_js = serde_json::to_string(kind).unwrap_or_else(|_| "\"\"".into());
