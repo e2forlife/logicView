@@ -252,7 +252,7 @@ pub fn run_session(
             Value::Function(function) => function,
             _ => return Err(runtime("decode must be a function")),
         };
-        if schema.stack_on.is_some() {
+        let result = if schema.stack_on.is_some() {
             let data = lua.create_table()?;
             let mut slot = 1;
             for packet in request
@@ -271,6 +271,14 @@ pub fn run_session(
             decode.call((module.clone(), start, end, data))
         } else {
             decode.call((module.clone(),))
+        };
+        match result {
+            Err(err) if is_marker(&err, END_OF_STREAM) && end > start => {
+                module.set("last_samplenum", end - 1)?;
+                call_if_present(module, "end_", (module.clone(),))?;
+                Ok(Value::Nil)
+            }
+            other => other,
         }
     });
     let mut state = session.into_inner();
@@ -613,7 +621,7 @@ impl<'a> Session<'a> {
             .checked_add(1)
             .ok_or_else(|| runtime("put range is invalid"))?;
         if start < self.start || end > self.end {
-            return Err(runtime("put range is outside the decoded region"));
+            return Err(runtime(format!("put range {start}..{end} is outside decoded region {}..{}", self.start, self.end)));
         }
         Ok((start, end))
     }

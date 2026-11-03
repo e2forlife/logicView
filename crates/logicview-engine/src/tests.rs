@@ -1126,3 +1126,16 @@ async fn new_session_from_file_uses_previous_pods() {
     let status = engine.status(Some(&created.id)).await.unwrap();
     assert_eq!(status.devices[0].id, "demo:spi");
 }
+
+#[test]
+fn usb_trigger_wait_has_no_deadline_but_instant_and_untriggered_are_bounded() {
+    let mut config = SessionConfig::default();
+    config.trigger_enabled = true;
+    assert_eq!(crate::usb_header_wait(&config, StartMode::Normal, 1_000_000), None);
+    assert!(crate::usb_header_wait(&config, StartMode::Instant, 1_000_000).is_some());
+    config.trigger_enabled = false;
+    assert!(crate::usb_header_wait(&config, StartMode::Normal, 1_000_000).is_some());
+    config.depth = DepthMode::Stream;
+    config.trigger_enabled = true;
+    assert_eq!(crate::usb_header_wait(&config, StartMode::Normal, 1_000_000), None);
+}

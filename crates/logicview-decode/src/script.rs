@@ -983,6 +983,84 @@ mod tests {
     }
 
     #[test]
+    fn translated_ws2812_emits_one_complete_color() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/rgb_led_ws281x.lua");
+        let lua = lua().unwrap();
+        let schema = metadata(&lua, &module(&lua, &path).unwrap()).unwrap();
+        assert_eq!(schema.lanes[0].channel, "din");
+        assert_eq!(schema.lanes[0].classes, ["byte"]);
+        assert_eq!(schema.lanes[0].value_field.as_deref(), Some("value"));
+        let mut bits = vec![0; 600];
+        for bit in (0..24).rev().map(|n| (0x12_34_56u32 >> n) & 1) {
+            let high = if bit == 1 { 8 } else { 4 };
+            bits.extend(std::iter::repeat_n(1, high));
+            bits.extend(std::iter::repeat_n(0, 12 - high));
+        }
+        bits.extend([0; 600]);
+        bits.extend([1; 10]);
+        let samples = bits.len() as u64;
+        let packed = pack_bits(&bits);
+        let channels = [("din", packed.as_slice())];
+        let request = DecodeRequest { protocol: "rgb_led_ws281x", channels: &channels, options: &[],
+            region: 0..samples, sample_len: samples, sample_rate_hz: Some(10_000_000),
+            lower: &[], lower_packets: &[] };
+        let output = run_paths(&request, &AtomicBool::new(false), vec![path.clone()]).unwrap();
+        let colors: Vec<_> = output.annotations.iter().filter(|row| row.class == "rgb").collect();
+        assert_eq!(colors.len(), 1, "{:?}", colors);
+        assert_eq!(colors[0].text, "GRB#123456");
+        assert_eq!(colors[0].fields.get("value").map(String::as_str), Some("123456"));
+        let bytes: Vec<_> = output.annotations.iter().filter(|row| row.class == "byte").collect();
+        assert_eq!(bytes.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(), ["12", "34", "56"]);
+        assert_eq!(bytes.iter().map(|row| (row.start_sample, row.end_sample)).collect::<Vec<_>>(), [(600, 696), (696, 792), (792, 888)]);
+        let mut rgbw_bits = vec![0; 600];
+        for bit in (0..32).rev().map(|n| (0x00_12_34_56u32 >> n) & 1) {
+            let high = if bit == 1 { 8 } else { 4 };
+            rgbw_bits.extend(std::iter::repeat_n(1, high));
+            rgbw_bits.extend(std::iter::repeat_n(0, 12 - high));
+        }
+        rgbw_bits.extend([0; 600]);
+        rgbw_bits.extend([1; 10]);
+        let len = rgbw_bits.len() as u64;
+        let bytes = pack_bits(&rgbw_bits);
+        let channels = [("din", bytes.as_slice())];
+        let options = [("default_color_order".into(), "GRBW".into()), ("view_color_order".into(), "GRBW".into())];
+        let request = DecodeRequest { channels: &channels, options: &options, region: 0..len, sample_len: len, ..request };
+        let output = run_paths(&request, &AtomicBool::new(false), vec![path]).unwrap();
+        let colors: Vec<_> = output.annotations.iter().filter(|row| row.class == "rgb").collect();
+        assert_eq!(colors.len(), 1);
+        assert_eq!(colors[0].text, "GRBW#00123456");
+        assert_eq!(colors[0].fields.get("value").map(String::as_str), Some("00123456"));
+        let bytes: Vec<_> = output.annotations.iter().filter(|row| row.class == "byte").map(|row| row.text.as_str()).collect();
+        assert_eq!(bytes, ["00", "12", "34", "56"]);
+    }
+
+    #[test]
+    fn translated_ws2812_finishes_last_bit_without_another_edge() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/rgb_led_ws281x.lua");
+        for value in [0x12_34_55u32, 0x12_34_56u32] {
+            let mut bits = vec![0; 600];
+            for bit in (0..24).rev().map(|n| (value >> n) & 1) {
+                let high = if bit == 1 { 6 } else { 3 };
+                bits.extend(std::iter::repeat_n(1, high));
+                bits.extend(std::iter::repeat_n(0, 10 - high));
+            }
+            bits.extend([0; 200]); // End in reset: no following rising edge.
+            let len = bits.len() as u64;
+            let data = pack_bits(&bits);
+            let channels = [("din", data.as_slice())];
+            let request = DecodeRequest { protocol: "rgb_led_ws281x", channels: &channels, options: &[],
+                region: 0..len, sample_len: len, sample_rate_hz: Some(10_000_000),
+                lower: &[], lower_packets: &[] };
+            let output = run_paths(&request, &AtomicBool::new(false), vec![path.clone()]).unwrap();
+            let bytes: Vec<_> = output.annotations.iter().filter(|row| row.class == "byte").collect();
+            assert_eq!(bytes.len(), 3, "{value:06X}");
+            assert_eq!(bytes[2].text, format!("{:02X}", value & 0xff));
+            assert_eq!((bytes[2].start_sample, bytes[2].end_sample), (760, 840));
+            assert_eq!(output.annotations.iter().filter(|row| row.class == "rgb").count(), 1);
+        }
+    }
+
+    #[test]
     fn translated_uart_exposes_data_lane_and_decodes_a_byte() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders/1-uart.lua");
         let lua = lua().unwrap();

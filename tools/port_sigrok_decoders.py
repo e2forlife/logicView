@@ -214,6 +214,16 @@ def metadata_table(cls) -> str:
         fields[-1] = 'binary = ' + literal([_text_row(item) for item in (getattr(cls, 'binary', None) or [])] + [["rxtx-all", "RX/TX combined dump"]])
         lanes = [{"id": "rxtx", "name": "RX/TX", "channel": "rxtx", "channels": ["rxtx"], "classes": ["data"], "value_field": "value"}]
         fields.append(f"lanes = {literal(lanes)}")
+    if cls.id == "rgb_led_ws281x":
+        for i, field in enumerate(fields):
+            if field.startswith("annotations = "):
+                annotations = [_text_row(item) for item in (getattr(cls, "annotations", None) or [])]
+                fields[i] = "annotations = " + literal(annotations + [["byte", "Byte"]])
+            elif field.startswith("annotation_rows = "):
+                rows = [_row(item) for item in (getattr(cls, "annotation_rows", None) or [])]
+                fields[i] = "annotation_rows = " + literal(rows + [["byte", "Bytes", [3]]])
+        lanes = [{"id": "color", "name": "RGB LED", "channel": "din", "channels": ["din"], "classes": ["byte"], "value_field": "value"}]
+        fields.append(f"lanes = {literal(lanes)}")
     if cls.id in ("0:i2c", "1:i2c"):
         lanes = [{"id": "i2c", "name": "I2C", "channel": "sda", "channels": ["sda", "scl"], "classes": ["start", "repeat-start", "stop", "ack", "nack", "address-read", "address-write", "data-read", "data-write", "warnings"]}]
         fields.append(f"lanes = {literal(lanes)}")
@@ -1659,7 +1669,73 @@ def output_name(folder: Path) -> str:
 
 def port_folder(folder: Path) -> str:
     cls = load_decoder(folder)
-    return Gen(folder, cls).translate()
+    text = Gen(folder, cls).translate()
+    if cls.id == "rgb_led_ws281x":
+        # Python booleans are integers; Lua needs explicit bit values. Emit
+        # the RGB annotation after all components have been assembled.
+        old_header = "  local elems, default_val, view_val, i, default_index\n"
+        byte_code = """  local count = #self.bits
+  if count % 8 == 1 then self.byte_start = self.ss end
+  if count > 0 and count % 8 == 0 then
+    local byte = 0
+    for index = count - 7, count do byte = (byte << 1) | self.bits[index] end
+    self:put(self.byte_start, samplenum - 1, self.out_ann, { 3, { logicview.pymod("@%02X", byte) } })
+  end
+"""
+        if old_header not in text:
+            raise ValueError("WS281x translated bit handler changed")
+        text = text.replace(old_header, old_header + byte_code, 1)
+        text = text.replace("  self.bit_ = nil\n  self.colorsize = nil", "  self.bit_ = nil\n  self.last_bit_period = nil\n  self.colorsize = nil", 1)
+        text = text.replace("function _decoder.check_bit_(self, samplenum)", "function _decoder.check_bit_(self, samplenum, terminal)")
+        old_period = "  tH_samples = (self.es - self.ss)\n  tH ="
+        new_period = """  tH_samples = (self.es - self.ss)
+  if not terminal then
+    self.last_bit_period = period
+  elseif self.last_bit_period then
+    period = self.last_bit_period
+  end
+  tH ="""
+        if old_period not in text:
+            raise ValueError("WS281x translated bit timing changed")
+        text = text.replace(old_period, new_period, 1)
+        start = text.index("function _decoder.end_(self)")
+        end = text.index("function _decoder.decode(self)", start)
+        text = text[:start] + """function _decoder.finish_last_bit(self, limit)
+  if self.state ~= "BIT FALLING" or not self.es or self.es <= self.ss then return end
+  self:check_bit_(limit, true)
+  local bit_end = _math.min(limit, self.ss + (self.last_bit_period or (self.es - self.ss)))
+  bit_end = _math.max(self.es, bit_end)
+  self:put(self.ss, bit_end - 1, self.out_ann, { 0, { logicview.pymod("%d", self.bit_) } })
+  _table.insert(self.bits, self.bit_)
+  self:handle_bits(bit_end)
+end
+function _decoder.end_(self)
+  self:finish_last_bit(self.last_samplenum + 1)
+end
+""" + text[end:]
+        old_reset = """        self:check_bit_(self.samplenum)
+        self:put(self.ss, self.es, self.out_ann, { 0, { logicview.pymod("%d", self.bit_) } })
+        _table.insert(self.bits, self.bit_)
+        self:handle_bits(self.es)
+        self.ss = self.es"""
+        if old_reset not in text:
+            raise ValueError("WS281x translated reset handling changed")
+        text = text.replace(old_reset, "        self:finish_last_bit(self.samplenum)\n        self.ss = self.es", 1)
+        text = text.replace("self.bit_ = true", "self.bit_ = 1")
+        text = text.replace("self.bit_ = ((tH_samples / period) > 0.5)", "self.bit_ = (tH_samples / period) > 0.5 and 1 or 0")
+        for fmt, label in (("06x", "1"), ("08x", "2")):
+            line = f'        self:put(self.ss_packet, samplenum, self.out_ann, {{ 2, {{ logicview.pymod("%s#%{fmt}", {{ logicview.idx(self.options, "view_color_order"), view_val }}) }} }})\n'
+            old = line + f"        ::continue_{label}::\n      end"
+            if old not in text:
+                raise ValueError("WS281x translated color loop changed")
+            text = text.replace(old, f"        ::continue_{label}::\n      end\n" + line.replace("        self:put", "      self:put").rstrip("\n"))
+            old_value = f'logicview.pymod("%s#%{fmt}", {{ logicview.idx(self.options, "view_color_order"), view_val }}) }} }})'
+            new_value = f'logicview.pymod("%s#%{fmt}", {{ logicview.idx(self.options, "view_color_order"), view_val }}), logicview.pymod("@%{fmt}", view_val) }} }})'
+            if old_value not in text:
+                raise ValueError("WS281x translated color output changed")
+            text = text.replace(old_value, new_value)
+        text = text.replace("self:put(self.ss_packet, samplenum, self.out_ann, { 2,", "self:put(self.ss_packet, samplenum - 1, self.out_ann, { 2,")
+    return text
 
 
 def main(argv):

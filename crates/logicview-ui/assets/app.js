@@ -2066,6 +2066,9 @@ function rowKindLabel(row) {
 
 function valueAnnotations(decoder) {
   const rows = (state.waveformAnnotations || []).filter((row) => row.decoder === decoder.id);
+  // WS281x also emits overlapping per-bit and full-color annotations for the
+  // decode table. Waveform value views show only its eight-bit data chunks.
+  if (decoder.protocol === "rgb_led_ws281x") return rows.filter((row) => row.class === "byte");
   const values = rows.filter((row) => !FRAME_CLASS.has(row.class));
   return values.length ? values : rows;
 }
@@ -2094,8 +2097,10 @@ function dataLineTargets(decoder) {
   const specs = decoderLaneSpecs(decoder);
   if (specs.length) return specs.map((lane) => ({
     channel: channels[lane.channel], lane: lane.id,
-    label: (row) => lane.value_field && row.fields?.[lane.value_field] != null
-      ? "0x" + row.fields[lane.value_field] : text(row),
+    label: (row) => decoder.protocol === "rgb_led_ws281x"
+      ? laneLabel(row, decodeFormat(decoder.id), lane.id, decoder)
+      : lane.value_field && row.fields?.[lane.value_field] != null
+        ? "0x" + row.fields[lane.value_field] : text(row),
   }));
   if (decoder.protocol === "i2c") return [{ channel: channels.sda, label: text }];
   if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
@@ -2204,12 +2209,12 @@ function annotationNumbers(row) {
   return [];
 }
 
-function formatDecoded(value, format) {
+function formatDecoded(value, format, bitWidth = 8) {
   const n = value;
   if (format === "dec") return String(n);
-  if (format === "bin") return n.toString(2).padStart(8, "0");
+  if (format === "bin") return n.toString(2).padStart(bitWidth, "0");
   if (format === "oct") return n.toString(8);
-  return "0x" + n.toString(16).toUpperCase().padStart(2, "0");
+  return "0x" + n.toString(16).toUpperCase().padStart(Math.ceil(bitWidth / 4), "0");
 }
 
 function condensedLabel(row, format) {
@@ -2221,7 +2226,7 @@ function laneLabel(row, format, lane, decoder) {
   const raw = laneValue(row, decoder, lane);
   if (raw == null || raw === "") return annotationLabel(row);
   const value = /^[0-9a-f]+$/i.test(String(raw)) ? parseInt(raw, 16) : NaN;
-  return Number.isFinite(value) ? formatDecoded(value, format) : String(raw);
+  return Number.isFinite(value) ? formatDecoded(value, format, decoder.protocol === "rgb_led_ws281x" ? String(raw).length * 4 : 8) : String(raw);
 }
 
 function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
@@ -6358,6 +6363,7 @@ document.getElementById("run").addEventListener("contextmenu", (ev) => {
   else openRunMenu();
 });
 document.getElementById("stop").addEventListener("click", () => stopCapture());
+document.getElementById("wait-cancel").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
 document.getElementById("device-select").addEventListener("click", (ev) => {
   ev.stopPropagation();
@@ -6695,7 +6701,7 @@ function paintWait() {
   const buffer = settings.depth !== "stream";
   const waiting = state.phase === "waiting_trigger";
   const sampling = buffer && (state.phase === "running" || state.phase === "arming") && state.planned > 0 && state.total < state.planned;
-  if (state.waitKind === "waiting" && !waiting && (state.phase === "running" || state.phase === "stopped")) {
+  if (state.waitKind === "waiting" && state.phase === "running") {
     showTriggered();
     return;
   }

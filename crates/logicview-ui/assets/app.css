@@ -1271,7 +1271,17 @@ details.advanced summary {
   text-transform: none;
   color: var(--text);
 }
+.wait-dial { position: relative; width: 112px; height: 112px; margin: 0 auto; }
 .radial { width: 112px; height: 112px; }
+.wait-cancel {
+  position: absolute; inset: 50% auto auto 50%; transform: translate(-50%, -50%);
+  width: 66px; height: 66px; padding: 0; border-radius: 50%;
+  border: 2px solid #e4616b; background: #7d2731; color: #fff;
+  font-size: 12px; font-weight: 700; cursor: pointer;
+}
+.wait-cancel:hover { background: #a4323e; border-color: #ff8891; }
+.wait-cancel:focus-visible { outline: 3px solid #ffb7be; outline-offset: 3px; }
+.wait-dialog.triggered .wait-cancel { display: none; }
 .radial-track, .radial-value, .radial-spin {
   fill: none;
   stroke-width: 8;

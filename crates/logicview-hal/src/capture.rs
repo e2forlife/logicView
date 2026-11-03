@@ -42,9 +42,9 @@ pub struct CaptureJob {
     pub on_stop: OnStop,
     /// Cancel the sample pipe after a good header and return [`HalError::Interrupted`].
     pub abort_after_header: bool,
-    /// How long to wait for the header before giving up. Buffer captures need
-    /// at least the record duration, because the header arrives with the upload.
-    pub header_wait: Duration,
+    /// Header timeout, or `None` to wait indefinitely for a hardware trigger.
+    /// Buffer captures need at least the record duration before timing out.
+    pub header_wait: Option<Duration>,
     /// Stop after this many sample bytes and return them. `None` reads the
     /// budget the header describes.
     pub sample_limit: Option<u64>,
@@ -133,7 +133,7 @@ pub fn run_capture(
     } else {
         BUFFER_TRANSFER_BYTES
     };
-    let mut deadline = std::time::Instant::now() + job.header_wait;
+    let mut deadline = job.header_wait.map(|wait| std::time::Instant::now() + wait);
 
     loop {
         if !forced && !discarded && job.stop.load(Ordering::Relaxed) {
@@ -155,6 +155,17 @@ pub fn run_capture(
                     break;
                 }
                 OnStop::Upload => {
+                    // A trigger wait has no samples to upload yet. Cancel it
+                    // directly instead of waiting for a forced upload header.
+                    if header.is_none() && job.header_wait.is_none() {
+                        if let Err(err) = pod.force_stop() {
+                            cancel(&mut ep);
+                            let _ = pod.stop();
+                            return Err(err);
+                        }
+                        discarded = true;
+                        break;
+                    }
                     if let Err(err) = pod.force_ready() {
                         cancel(&mut ep);
                         let _ = pod.stop();
@@ -166,7 +177,7 @@ pub fn run_capture(
                         // Keep a short tail after the stop, then leave the pipe.
                         limit_after_stop = Some(kept.saturating_add(8_192));
                     }
-                    deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    deadline = Some(std::time::Instant::now() + Duration::from_secs(3));
                 }
             }
         }
@@ -211,7 +222,9 @@ pub fn run_capture(
                                 failed = Some(err);
                                 break;
                             }
-                            deadline = std::time::Instant::now() + Duration::from_secs(2);
+                            // Streaming pods may send a header before the trigger.
+                            // Keep waiting until sample data arrives or stop is requested.
+                            deadline = deadline_after_header(job.header_wait, forced, std::time::Instant::now());
                         }
                         Err(err) => {
                             let preview = data
@@ -245,12 +258,12 @@ pub fn run_capture(
                         }
                         pending.drain(..whole);
                     }
-                    deadline = std::time::Instant::now()
+                    deadline = Some(std::time::Instant::now()
                         + if forced {
                             Duration::from_millis(500)
                         } else {
                             Duration::from_secs(2)
-                        };
+                        });
                     if kept >= budget {
                         break;
                     }
@@ -295,7 +308,7 @@ pub fn run_capture(
                 break;
             }
             None => {
-                if std::time::Instant::now() > deadline {
+                if deadline_expired(deadline, std::time::Instant::now()) {
                     if header.is_none() && !discarded {
                         failed = Some(HalError::Interrupted("header transfer timed out".into()));
                     } else if !forced && !job.continuous && job.sample_limit.is_none() {
@@ -335,6 +348,41 @@ fn next_transfer_size(target: u64, scheduled: u64, max_size: usize, packet: usiz
     }
     let wanted = remaining.min(max_size as u64) as usize;
     wanted.div_ceil(packet) * packet
+}
+
+/// A triggered stream may send its header before the trigger occurs.
+fn deadline_after_header(
+    header_wait: Option<Duration>,
+    forced: bool,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    if header_wait.is_none() && !forced {
+        None
+    } else {
+        Some(now + Duration::from_secs(2))
+    }
+}
+
+fn deadline_expired(deadline: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    deadline.is_some_and(|end| now > end)
+}
+
+#[cfg(test)]
+mod trigger_wait_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_wait_has_no_deadline_but_forced_and_normal_transfers_do() {
+        let now = std::time::Instant::now();
+        let much_later = now + Duration::from_secs(3600);
+        assert!(!deadline_expired(None, much_later));
+        assert_eq!(deadline_after_header(None, false, now), None);
+        assert!(deadline_expired(deadline_after_header(None, true, now), much_later));
+        assert!(deadline_expired(
+            deadline_after_header(Some(Duration::from_secs(3)), false, now),
+            much_later,
+        ));
+    }
 }
 
 /// Combines capture mode, sample limits, and stop behavior into the remaining transfer ceiling.
@@ -421,7 +469,7 @@ mod hw {
             stop: Arc::new(AtomicBool::new(false)),
             on_stop: OnStop::Upload,
             abort_after_header: false,
-            header_wait: Duration::from_secs(3),
+            header_wait: Some(Duration::from_secs(3)),
             sample_limit: None,
             product_id: Some(crate::PLUS_PID),
         }
@@ -726,7 +774,7 @@ mod hw {
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
         job.enabled_channels = 32;
-        job.header_wait = Duration::from_secs(6);
+        job.header_wait = Some(Duration::from_secs(6));
         let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
         decoded.divider = divider;
         decoded.mode = ModeFlags(0);
@@ -758,7 +806,7 @@ mod hw {
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
         job.enabled_channels = 32;
-        job.header_wait = Duration::from_secs(3);
+        job.header_wait = Some(Duration::from_secs(3));
         let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
         decoded.divider = divider;
         decoded.mode = ModeFlags(ModeFlags::STREAM);
@@ -863,7 +911,7 @@ mod hw {
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
         job.enabled_channels = u64::from(channels);
-        job.header_wait = Duration::from_secs(3);
+        job.header_wait = Some(Duration::from_secs(3));
         let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
         decoded.divider = divider;
         decoded.mode = ModeFlags(extra_mode);
@@ -907,7 +955,7 @@ mod hw {
         job.product_id = Some(crate::U3PRO32_PID);
         job.threshold = Some(crate::u3_threshold_code(1.6));
         job.enabled_channels = u64::from(channels);
-        job.header_wait = Duration::from_secs(3);
+        job.header_wait = Some(Duration::from_secs(3));
         let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
         decoded.divider = divider;
         decoded.mode = ModeFlags(mode);
@@ -1043,7 +1091,7 @@ mod hw {
         let mut job = armed(samples, mode, divider);
         job.threshold = Some(crate::threshold_code(1.6));
         job.enabled_channels = u64::from(channels);
-        job.header_wait = Duration::from_secs(4);
+        job.header_wait = Some(Duration::from_secs(4));
         let mut decoded = logicview_proto::decode_arm(&job.image).unwrap();
         decoded.divider = divider;
         decoded.mode = ModeFlags(mode);
@@ -1180,7 +1228,7 @@ mod hw {
         decoded.channel_enable = 0xFFFF;
         rle.image = logicview_proto::encode_arm(&decoded).unwrap();
         rle.enabled_channels = 16;
-        rle.header_wait = Duration::from_secs(15);
+        rle.header_wait = Some(Duration::from_secs(15));
         rle.sample_limit = Some(4_096);
         let (rle_report, _) = take(&rle);
         let rle_header = rle_report.header.expect("rle header");
@@ -1202,7 +1250,7 @@ mod hw {
         eprintln!("-- stop and upload --");
         let mut upload = armed(8_000_000, internal, 100);
         upload.on_stop = OnStop::Upload;
-        upload.header_wait = Duration::from_secs(12);
+        upload.header_wait = Some(Duration::from_secs(12));
         let flag = Arc::clone(&upload.stop);
         let killer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(700));
@@ -1230,7 +1278,7 @@ mod hw {
         eprintln!("-- stop and discard --");
         let mut discard = armed(8_000_000, internal, 100);
         discard.on_stop = OnStop::Discard;
-        discard.header_wait = Duration::from_secs(12);
+        discard.header_wait = Some(Duration::from_secs(12));
         let flag = Arc::clone(&discard.stop);
         let killer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(700));

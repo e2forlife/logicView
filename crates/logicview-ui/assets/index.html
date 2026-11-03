@@ -158,11 +158,14 @@
   <div id="hover" class="hover hidden"></div>
   <div id="capture-wait" class="wait-dialog hidden" role="dialog" aria-live="polite" aria-label="Capture progress">
     <div class="wait-card">
-      <svg class="radial" viewBox="0 0 120 120" aria-hidden="true">
-        <circle class="radial-track" cx="60" cy="60" r="46"></circle>
-        <circle id="wait-arc" class="radial-value" cx="60" cy="60" r="46"></circle>
-        <circle id="wait-spin" class="radial-spin" cx="60" cy="60" r="46"></circle>
-      </svg>
+      <div class="wait-dial">
+        <svg class="radial" viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="radial-track" cx="60" cy="60" r="46"></circle>
+          <circle id="wait-arc" class="radial-value" cx="60" cy="60" r="46"></circle>
+          <circle id="wait-spin" class="radial-spin" cx="60" cy="60" r="46"></circle>
+        </svg>
+        <button id="wait-cancel" class="wait-cancel" type="button" aria-label="Cancel capture">Cancel</button>
+      </div>
       <p id="wait-text">Sampling</p>
     </div>
   </div>

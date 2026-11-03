@@ -43,8 +43,9 @@ _decoder = {
   channels = { logicview.dict({ id = "din", name = "DIN", desc = "DIN data line" }) },
   optional_channels = {  },
   options = { logicview.dict({ id = "default_color_order", desc = "Default Color Order", default = "GRB", values = { "GRB", "RGB", "BRG", "RBG", "BGR", "GRBW", "RGBW", "WRGB", "LBGR", "LGRB", "LRGB", "LRBG", "LGBR", "LBRG" } }), logicview.dict({ id = "view_color_order", desc = "View Color Order", default = "GRB", values = { "GRB", "RGB", "BRG", "RBG", "BGR", "GRBW", "RGBW", "WRGB", "LBGR", "LGRB", "LRGB", "LRBG", "LGBR", "LBRG" } }), logicview.dict({ id = "polarity", desc = "Polarity", default = "normal", values = { "normal", "inverted" } }) },
-  annotations = { { "bit", "Bit" }, { "reset", "RESET" }, { "rgb", "RGB" } },
-  annotation_rows = { { "bit", "Bits", { 0, 1 } }, { "rgb", "RGB", { 2 } } },
+  annotations = { { "bit", "Bit" }, { "reset", "RESET" }, { "rgb", "RGB" }, { "byte", "Byte" } },
+  lanes = { { id = "color", name = "RGB LED", channel = "din", channels = { "din" }, classes = { "byte" }, value_field = "value" } },
+  annotation_rows = { { "bit", "Bits", { 0, 1 } }, { "rgb", "RGB", { 2 } }, { "byte", "Bytes", { 3 } } },
   binary = {  }
 }
 function _decoder.__init__(self)
@@ -58,6 +59,7 @@ function _decoder.reset(self)
   self.es = nil
   self.bits = {  }
   self.bit_ = nil
+  self.last_bit_period = nil
   self.colorsize = nil
 end
 function _decoder.start(self)
@@ -70,6 +72,13 @@ function _decoder.metadata(self, key, value)
 end
 function _decoder.handle_bits(self, samplenum)
   local elems, default_val, view_val, i, default_index
+  local count = #self.bits
+  if count % 8 == 1 then self.byte_start = self.ss end
+  if count > 0 and count % 8 == 0 then
+    local byte = 0
+    for index = count - 7, count do byte = (byte << 1) | self.bits[index] end
+    self:put(self.byte_start, samplenum - 1, self.out_ann, { 3, { logicview.pymod("@%02X", byte) } })
+  end
   if logicview.truth(logicview.eq(logicview.len(self.bits), self.colorsize)) then
     elems = reduce((function(a, b) return ((a << 1) | b) end), self.bits)
     default_val = 0
@@ -92,9 +101,9 @@ function _decoder.handle_bits(self, samplenum)
         elseif logicview.truth(logicview.eq(i, 2)) then
           view_val = (default_val | view_val)
         end
-        self:put(self.ss_packet, samplenum, self.out_ann, { 2, { logicview.pymod("%s#%06x", { logicview.idx(self.options, "view_color_order"), view_val }) } })
         ::continue_1::
       end
+      self:put(self.ss_packet, samplenum - 1, self.out_ann, { 2, { logicview.pymod("%s#%06x", { logicview.idx(self.options, "view_color_order"), view_val }), logicview.pymod("@%06x", view_val) } })
     else
       for _lv_i in logicview.range(4) do
         i = _lv_i
@@ -117,32 +126,41 @@ function _decoder.handle_bits(self, samplenum)
         elseif logicview.truth(logicview.eq(i, 3)) then
           view_val = (default_val | view_val)
         end
-        self:put(self.ss_packet, samplenum, self.out_ann, { 2, { logicview.pymod("%s#%08x", { logicview.idx(self.options, "view_color_order"), view_val }) } })
         ::continue_2::
       end
+      self:put(self.ss_packet, samplenum - 1, self.out_ann, { 2, { logicview.pymod("%s#%08x", { logicview.idx(self.options, "view_color_order"), view_val }), logicview.pymod("@%08x", view_val) } })
     end
     self.bits = {  }
     self.ss_packet = samplenum
   end
 end
-function _decoder.check_bit_(self, samplenum)
+function _decoder.check_bit_(self, samplenum, terminal)
   local period, tH_samples, tH
   period = (samplenum - self.ss)
   tH_samples = (self.es - self.ss)
+  if not terminal then
+    self.last_bit_period = period
+  elseif self.last_bit_period then
+    period = self.last_bit_period
+  end
   tH = (tH_samples / self.samplerate)
   if logicview.truth((tH >= 6.25e-07)) then
-    self.bit_ = true
+    self.bit_ = 1
   else
-    self.bit_ = ((tH_samples / period) > 0.5)
+    self.bit_ = (tH_samples / period) > 0.5 and 1 or 0
   end
 end
+function _decoder.finish_last_bit(self, limit)
+  if self.state ~= "BIT FALLING" or not self.es or self.es <= self.ss then return end
+  self:check_bit_(limit, true)
+  local bit_end = _math.min(limit, self.ss + (self.last_bit_period or (self.es - self.ss)))
+  bit_end = _math.max(self.es, bit_end)
+  self:put(self.ss, bit_end - 1, self.out_ann, { 0, { logicview.pymod("%d", self.bit_) } })
+  _table.insert(self.bits, self.bit_)
+  self:handle_bits(bit_end)
+end
 function _decoder.end_(self)
-  if logicview.truth(logicview.eq(self.state, "BIT FALLING")) then
-    self:check_bit_(self.last_samplenum)
-    self:put(self.ss, self.es, self.out_ann, { 0, { logicview.pymod("%d", self.bit_) } })
-    _table.insert(self.bits, self.bit_)
-    self:handle_bits(self.es)
-  end
+  self:finish_last_bit(self.last_samplenum + 1)
 end
 function _decoder.decode(self)
   if logicview.truth((not logicview.truth(self.samplerate))) then
@@ -182,10 +200,7 @@ function _decoder.decode(self)
       self.es = self.samplenum
       self:wait(logicview.dict({ [0] = "e" }))
       if logicview.truth((((self.samplenum - self.es) / self.samplerate) > 5e-05)) then
-        self:check_bit_(self.samplenum)
-        self:put(self.ss, self.es, self.out_ann, { 0, { logicview.pymod("%d", self.bit_) } })
-        _table.insert(self.bits, self.bit_)
-        self:handle_bits(self.es)
+        self:finish_last_bit(self.samplenum)
         self.ss = self.es
         self.es = self.samplenum
         self.state = "RESET"

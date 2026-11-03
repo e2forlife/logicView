@@ -1009,6 +1009,9 @@ impl Engine {
             if slot.catalog_names.is_empty() {
                 remember_catalog(slot);
             }
+            if config.trigger_enabled && mode == StartMode::Normal {
+                slot.session.phase = Phase::WaitingTrigger;
+            }
             let (names, colors) = pod_channel_style(mask);
             slot.origins = names
                 .iter()
@@ -1046,12 +1049,7 @@ impl Engine {
                 Duration::from_millis(config.repeat_interval_ms),
                 config.discard_on_stop,
                 config.run == RunPolicy::Loop,
-                if config.depth == DepthMode::Stream {
-                    Duration::from_secs(3)
-                } else {
-                    let secs = samples / config.sample_rate_hz.max(1) + 3;
-                    Duration::from_secs(secs.min(120))
-                },
+                usb_header_wait(&config, mode, samples),
                 Some(pid),
             )
         };
@@ -1126,7 +1124,7 @@ impl Engine {
                 stop,
                 samples,
                 jobs,
-                Duration::from_secs(secs.min(120)),
+                Some(Duration::from_secs(secs.min(120))),
                 discard,
             )
         };
@@ -1689,6 +1687,18 @@ impl Slot {
             error: self.session.error.clone(),
             active,
         }
+    }
+}
+
+/// USB headers may be delayed indefinitely while a hardware trigger is armed.
+fn usb_header_wait(config: &SessionConfig, mode: StartMode, samples: u64) -> Option<Duration> {
+    if config.trigger_enabled && mode == StartMode::Normal {
+        None
+    } else if config.depth == DepthMode::Stream {
+        Some(Duration::from_secs(3))
+    } else {
+        let secs = samples / config.sample_rate_hz.max(1) + 3;
+        Some(Duration::from_secs(secs.min(120)))
     }
 }
 

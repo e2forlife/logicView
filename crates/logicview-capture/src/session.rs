@@ -427,8 +427,9 @@ impl Session {
 
     /// Applies source metadata and establishes the initial trigger and running state.
     pub fn on_header(&mut self, header: LogicHeader) {
-        if header.trigger_position > 0 && self.config.trigger_enabled && !self.instant {
-            self.trigger_sample = Some(u64::from(header.trigger_position));
+        if self.config.trigger_enabled && !self.instant {
+            self.trigger_sample =
+                (header.trigger_position > 0).then_some(u64::from(header.trigger_position));
             self.phase = Phase::WaitingTrigger;
         } else {
             self.trigger_sample = None;
@@ -841,6 +842,24 @@ mod tests {
 
     use super::*;
     use logicview_proto::{decode_arm, pack_logic_atoms};
+
+    #[test]
+    fn zero_position_header_keeps_trigger_wait_until_samples_arrive() {
+        let mut session = Session::new();
+        session.config.trigger_enabled = true;
+        session.on_header(LogicHeader {
+            check_word: 0x55555555,
+            trigger_position: 0,
+            ram_start: 0,
+            remaining: 0,
+            status: 0,
+        });
+        assert_eq!(session.phase, Phase::WaitingTrigger);
+        assert_eq!(session.trigger_sample, None);
+        let channels = vec![vec![0u8; 8]; 4];
+        session.on_samples(&pack_logic_atoms(&channels).unwrap(), &[], 64).unwrap();
+        assert_eq!(session.phase, Phase::Running);
+    }
 
     /// Guards against analog spikes caused by retaining data beyond the logic capture.
     #[test]
