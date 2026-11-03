@@ -756,7 +756,7 @@ async fn reply_socket(
 /// Translates browser commands into shared engine operations and client-facing JSON results.
 async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
     match cmd {
-        Command::ListDevices => Ok(json!(engine.list_devices().await)),
+        Command::ListDevices => Ok(json!(engine.try_list_devices().await?)),
         Command::ListProfiles => Ok(json!(engine.list_profiles().await)),
         Command::Connect { id } => Ok(json!(engine.connect(&id).await?)),
         Command::AttachDevice { session, id } => {

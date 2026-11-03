@@ -4006,12 +4006,49 @@ function placeDeviceSubmenu() {
 }
 
 let deviceScanInFlight = false;
+let deviceSelectionReady = false;
+let deviceChoiceInFlight = false;
+let pendingAttachedPod = null;
+
+async function reconcileDeviceSelection(previous, devices) {
+  if (!deviceSelectionReady) return;
+  const hardware = devices.filter((device) => device.kind === "usb");
+  const previousHardware = previous.filter((device) => device.kind === "usb");
+  if (hardware.length === 1 && previousHardware.length === 0) pendingAttachedPod = hardware[0].id;
+  if (hardware.length !== 1 || !hardware.some((device) => device.id === pendingAttachedPod)) pendingAttachedPod = null;
+  if (isLive(state.phase) || commandBusy || deviceChoiceInFlight) return;
+
+  const selected = state.devices || [];
+  const missing = selected.some((device) => device.kind === "usb" && !hardware.some((pod) => pod.id === device.id));
+  const demoSelected = selected.length > 0 && selected.every((device) => device.kind === "demo");
+  if (!missing && !(demoSelected && pendingAttachedPod)) return;
+
+  deviceChoiceInFlight = true;
+  try {
+    const profiles = state.profiles.length ? state.profiles : await api({ cmd: "list_profiles" });
+    if (isLive(state.phase) || commandBusy) return;
+    const usable = hardware.filter((device) => profiles.some((profile) => profile.id === device.id && profile.hardware_tested));
+    const choices = missing ? [...usable.map((device) => device.id), "demo"] : usable.filter((device) => device.id === pendingAttachedPod).map((device) => device.id);
+    for (const id of choices) {
+      try {
+        await useDevice(id);
+        pendingAttachedPod = null;
+        return;
+      } catch (err) {
+        statusEl.textContent = `Could not select ${id}: ${err.message}`;
+      }
+    }
+    if (!missing) pendingAttachedPod = null;
+  } finally { deviceChoiceInFlight = false; }
+}
+
 async function refreshDeviceList() {
   if (deviceScanInFlight) return;
   deviceScanInFlight = true;
   try {
     const devices = await api({ cmd: "list_devices" });
-    const changed = JSON.stringify(devices) !== JSON.stringify(state.deviceList);
+    const previous = state.deviceList;
+    const changed = JSON.stringify(devices) !== JSON.stringify(previous);
     state.deviceList = devices;
     const hardware = devices.filter((device) => device.kind !== "demo");
     const plugged = document.getElementById("plugged-in");
@@ -4023,6 +4060,7 @@ async function refreshDeviceList() {
     syncDeviceSelect();
     const menu = document.getElementById("device-menu");
     if (changed && menu && !menu.classList.contains("hidden")) renderDeviceMenu();
+    await reconcileDeviceSelection(previous, devices);
   } catch (_) { /* Keep the last successful scan until the next retry. */ }
   finally { deviceScanInFlight = false; }
 }
@@ -4048,7 +4086,9 @@ async function loadDeviceChoices() {
 
 async function applyDeviceChoice(value) {
   const ids = value.split("+").filter(Boolean);
-  if (!ids.length) return;
+  if (!ids.length || deviceChoiceInFlight) return;
+  pendingAttachedPod = null;
+  deviceChoiceInFlight = true;
   try {
     if (ids.some((id) => id.startsWith("usb:"))) {
       // Fetch the authoritative status before opening, even if the background
@@ -4079,7 +4119,7 @@ async function applyDeviceChoice(value) {
     if (ids.some((id) => id.startsWith("usb:"))) {
       window.alert(err.message || "Could not open the selected USB device.");
     }
-  }
+  } finally { deviceChoiceInFlight = false; }
 }
 
 async function useDevice(id) {
@@ -7375,6 +7415,7 @@ async function boot() {
       window.alert(message);
     }
   }
+  deviceSelectionReady = true;
   connectSocket();
   drawWave();
   syncTimebaseLabel();

@@ -361,25 +361,36 @@ impl Engine {
 
     /// Discovers connected USB devices and available demos, presenting physical hardware first.
     pub async fn list_devices(&self) -> Vec<DeviceInfo> {
+        match self.try_list_devices().await {
+            Ok(devices) => devices,
+            Err(err) => {
+                tracing::warn!("USB scan failed: {err}");
+                logicview_capture::demo_pods()
+                    .iter()
+                    .map(|pod| demo_device_info(pod.id))
+                    .collect()
+            }
+        }
+    }
+
+    /// Reports USB scan failures so callers can retain the last known device list.
+    pub async fn try_list_devices(&self) -> Result<Vec<DeviceInfo>, EngineError> {
         let mut devices: Vec<DeviceInfo> = logicview_capture::demo_pods()
             .iter()
             .map(|pod| demo_device_info(pod.id))
             .collect();
-        match logicview_hal::list_pods() {
-            Ok(pods) => {
-                for pod in pods {
-                    devices.push(DeviceInfo {
-                        id: pod.id,
-                        name: pod.name,
-                        kind: "usb".into(),
-                        connected: true,
-                        super_speed: pod.super_speed,
-                    });
-                }
-            }
-            Err(err) => tracing::warn!("USB scan failed: {err}"),
+        let pods = logicview_hal::list_pods()
+            .map_err(|err| EngineError::Device(format!("USB scan failed: {err}")))?;
+        for pod in pods {
+            devices.push(DeviceInfo {
+                id: pod.id,
+                name: pod.name,
+                kind: "usb".into(),
+                connected: true,
+                super_speed: pod.super_speed,
+            });
         }
-        hardware_before_demo(devices)
+        Ok(hardware_before_demo(devices))
     }
 
     /// Selects a demo or opens a verified hardware model and installs its channels in the active
