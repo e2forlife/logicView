@@ -1696,3 +1696,6 @@ details.advanced summary {
 .close-capture-dialog h2 { margin: 0 0 24px; font-size: 17px; }
 .close-capture-actions { display: flex; justify-content: space-between; }
 .close-capture-actions button { padding: 8px 18px; }
+
+.preferences-dialog form > label.edge-snap-choice { display: flex; align-items: center; gap: 8px; margin: 14px 0; }
+.preferences-dialog .edge-snap-choice input { width: auto; margin: 0; }

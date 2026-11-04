@@ -8,6 +8,7 @@ pub struct Preferences {
     pub firmware_dir: String,
     pub scripts_dir: String,
     pub theme: String,
+    pub edge_snap: bool,
     pub mcp_enabled: bool,
     pub mcp_port: u16,
     /// Last folder used by Export Capture.
@@ -19,6 +20,7 @@ impl Default for Preferences {
             firmware_dir: String::new(),
             scripts_dir: String::new(),
             theme: "system".into(),
+            edge_snap: true,
             mcp_enabled: false,
             mcp_port: 8765,
             export_dir: String::new(),
@@ -29,7 +31,9 @@ pub fn path() -> PathBuf {
     if let Some(path) = std::env::var_os("LOGICVIEW_CONFIG_FILE") {
         return path.into();
     }
-    preferences_base_dir().join("LogicView").join("preferences.json")
+    preferences_base_dir()
+        .join("LogicView")
+        .join("preferences.json")
 }
 
 /// Resolves the platform config directory that contains the LogicView folder.
@@ -142,6 +146,7 @@ mod tests {
             firmware_dir: "firmware".into(),
             scripts_dir: "scripts".into(),
             theme: "light".into(),
+            edge_snap: false,
             mcp_enabled: true,
             mcp_port: 9135,
             export_dir: "exports".into(),
@@ -151,6 +156,8 @@ mod tests {
         assert_eq!(loaded.firmware_dir, "firmware");
         assert_eq!(loaded.scripts_dir, "scripts");
         assert_eq!(loaded.theme, "light");
+        assert!(!loaded.edge_snap);
+        assert!(serde_json::from_str::<Preferences>("{}").unwrap().edge_snap);
         assert!(loaded.mcp_enabled);
         assert_eq!(loaded.mcp_port, 9135);
         assert_eq!(loaded.export_dir, "exports");

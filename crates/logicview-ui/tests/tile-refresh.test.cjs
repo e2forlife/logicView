@@ -33,3 +33,37 @@ test("zoom refreshes available channels when another channel has no capture data
   assert.equal(state.tileView.spp, 10);
   assert.equal(draws, 1);
 });
+
+test("tile requests buffer both sides and cover a drag without refetching", async () => {
+  const v = { start: 200, spp: 2 };
+  const state = { active: "session", req: 0, tiles: {}, tileView: null };
+  let body;
+  const context = {
+    state, view: () => v, wave: { clientWidth: 100 }, socket: null,
+    pointer: { kind: "pan" }, tileAgain: false,
+    tileRequests: () => [{ row: { kind: "logic", channel: 0 }, key: "logic:0" }],
+    api: async request => { body = request; v.start = 240; return { columns: ["data"] }; },
+    drawWave() {}, drawRuler() {}, scheduleViewPaint() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(fetchCode, context);
+  await context.fetchTiles();
+  assert.equal(body.start, 100);
+  assert.equal(body.columns, 200);
+  assert.equal(context.tileCoversView(state.tileView, v.start, v.spp, 100), true);
+  assert.equal(context.tileAgain, false);
+  assert.equal(context.tileCoversView(state.tileView, 301, v.spp, 100), false);
+});
+
+test("a missing tile does not cause an endless retry", async () => {
+  const v = { start: 200, spp: 1 };
+  const state = { active: "session", req: 0, tiles: {}, tileView: null };
+  const context = { state, view: () => v, wave: { clientWidth: 100 }, socket: null,
+    pointer: null, tileAgain: false,
+    tileRequests: () => [{ row: { kind: "logic", channel: 0 }, key: "logic:0" }],
+    api: async () => { throw new Error("no data"); }, drawWave() {}, drawRuler() {}, scheduleViewPaint() {} };
+  vm.createContext(context);
+  vm.runInContext(fetchCode, context);
+  await context.fetchTiles();
+  assert.equal(context.tileAgain, false);
+});

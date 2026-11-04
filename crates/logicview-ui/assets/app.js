@@ -40,6 +40,7 @@ const state = {
   hoverText: "",
   hoverSequence: 0,
   hoverBounds: null,
+  hoverSnap: null,
   hoverX: null,
   hoverChannel: 0,
   hoverKey: null,
@@ -1789,6 +1790,7 @@ function drawWave() {
   drawGroupBorders(ctx, w, layout, palette);
   drawMeasureSpan(ctx, w, h);
   drawHoverBoundaries(ctx, w, layout);
+  drawHoverSnap(ctx, layout);
   drawMarkerLines(ctx, h);
   if (pointer && pointer.kind === "cursors") {
     const v = view();
@@ -1807,10 +1809,29 @@ function drawWave() {
   if (state.hoverX != null) {
     ctx.strokeStyle = palette.hover;
     ctx.beginPath();
-    ctx.moveTo(state.hoverX + 0.5, 0);
-    ctx.lineTo(state.hoverX + 0.5, h);
+    const x = state.hoverSnap ? sampleX(state.hoverSnap.sample) : state.hoverX;
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, h);
     ctx.stroke();
   }
+}
+
+// Highlight the exact logic transition selected by the hover cursor.
+function drawHoverSnap(ctx, layout) {
+  const snap = state.hoverSnap;
+  if (!snap) return;
+  const item = layout.find((entry) => entry.row.key === snap.key);
+  if (!item || !["logic", "bus", "decode", "condense"].includes(item.row.kind)) return;
+  const pad = Math.max(8, item.height * 0.22);
+  const x = sampleX(snap.sample);
+  ctx.save();
+  ctx.strokeStyle = "#ffca5e";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, item.top + pad);
+  ctx.lineTo(x, item.top + item.height - pad);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawGroupBorders(ctx, width, layout, palette) {
@@ -2141,7 +2162,23 @@ function traceHexagon(ctx, x, y, w, h) {
   ctx.closePath();
 }
 
-function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
+function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha, dataRow = false) {
+  if (dataRow) {
+    const spans = rows.map((row) => [sampleX(row.start_sample), Math.max(sampleX(row.start_sample) + 2, sampleX(row.end_sample))])
+      .filter(([start, end]) => end >= 0 && start <= canvasW).sort((a, b) => a[0] - b[0]);
+    ctx.save();
+    ctx.strokeStyle = traceColor(color || "#3d8dfd");
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    let end = 0;
+    for (const [start, finish] of spans) {
+      if (start > end) { ctx.moveTo(end, (top + bottom) / 2); ctx.lineTo(start, (top + bottom) / 2); }
+      end = Math.max(end, finish);
+    }
+    if (end < canvasW) { ctx.moveTo(end, (top + bottom) / 2); ctx.lineTo(canvasW, (top + bottom) / 2); }
+    ctx.stroke();
+    ctx.restore();
+  }
   const height = Math.max(12, bottom - top);
   let lastLabel = -1;
   ctx.lineWidth = 1.25;
@@ -2168,7 +2205,8 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     ctx.rect(x0 + point, top, Math.max(0, width - point * 2), height);
     ctx.clip();
     ctx.fillStyle = lightTheme() && (alpha == null || alpha < 0.7) ? wavePalette().ink : "#f7fafc";
-    ctx.fillText(label, x0 + point + 4, top + height / 2);
+    ctx.textAlign = dataRow ? "center" : "left";
+    ctx.fillText(label, dataRow ? x0 + width / 2 : x0 + point + 4, top + height / 2);
     ctx.restore();
     lastLabel = x0 + Math.min(width, ctx.measureText(label).width + point + 10);
   }
@@ -2288,7 +2326,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
     const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane, decoder) : (row) => condensedLabel(row, format);
-    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82);
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82, true);
   }
 }
 
@@ -2575,7 +2613,7 @@ function drawBuses(ctx, layout) {
     ctx.font = "12px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82);
+    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82, true);
   }
 }
 
@@ -2659,11 +2697,13 @@ function tileRequests() {
 
 async function fetchTiles() {
   const requests = tileRequests();
-  const width = Math.max(1, Math.floor(wave.clientWidth || 1));
+  const viewWidth = Math.max(1, Math.floor(wave.clientWidth || 1));
+  const width = Math.min(8192, viewWidth * 2);
   const v = view();
   const req = ++state.req;
   const spp = Math.max(v.spp, 1e-9);
-  const start = v.start;
+  const viewStart = v.start;
+  const start = Math.max(0, viewStart - Math.floor((width - viewWidth) / 2) * spp);
   if (requests.length === 0) {
     state.tiles = {};
     drawWave();
@@ -2709,7 +2749,7 @@ async function fetchTiles() {
   if (state.req !== req) return;
   const now = view();
   const widthNow = Math.max(1, Math.floor(wave.clientWidth || 1));
-  if (now.spp !== spp || widthNow !== width) {
+  if (now.spp !== spp || widthNow !== viewWidth) {
     tileAgain = true;
     return;
   }
@@ -2735,7 +2775,13 @@ async function fetchTiles() {
       }
     }
   }
-  if (now.start !== start) tileAgain = true;
+  if (now.start !== viewStart && !tileCoversView(state.tileView, now.start, now.spp, widthNow)) tileAgain = true;
+}
+
+function tileCoversView(tile, start, spp, width) {
+  if (!tile || tile.spp !== spp) return false;
+  const epsilon = spp * 1e-6;
+  return start >= tile.start - epsilon && start + width * spp <= tile.start + tile.width * tile.spp + epsilon;
 }
 
 function tileOverlap(tile, viewStart, viewSpp, viewWidth) {
@@ -4493,18 +4539,27 @@ function renderDecoderList() {
 
 let waveformAnnotationTimer = null;
 let waveformAnnotationRequest = 0;
+let waveformAnnotationRange = null;
 
-function scheduleWaveformAnnotations() {
+function scheduleWaveformAnnotations(panning = false) {
+  const v = view();
+  const visibleStart = Math.max(0, Math.floor(v.start));
+  const visibleEnd = Math.max(visibleStart + 1, Math.ceil(v.start + Math.max(1, wave.clientWidth) * v.spp));
+  const range = waveformAnnotationRange;
+  if (panning && range && range.session === state.active && range.spp === v.spp &&
+      range.start <= visibleStart && range.end >= visibleEnd) return;
   const request = ++waveformAnnotationRequest;
   clearTimeout(waveformAnnotationTimer);
   if (!state.active || !state.total || !state.decoders.length) {
     state.waveformAnnotations = [];
+    waveformAnnotationRange = null;
     return;
   }
   const session = state.active;
-  const v = view();
-  const start = Math.max(0, Math.floor(v.start));
-  const end = Math.max(start + 1, Math.ceil(v.start + Math.max(1, wave.clientWidth) * v.spp));
+  const margin = panning ? visibleEnd - visibleStart : 0;
+  const start = Math.max(0, visibleStart - margin);
+  const end = Math.min(state.total, visibleEnd + margin);
+  waveformAnnotationRange = { session, spp: v.spp, start, end };
   const decoders = state.decoders.map((decoder) => decoder.id);
   waveformAnnotationTimer = setTimeout(async () => {
     try {
@@ -4522,9 +4577,9 @@ function scheduleWaveformAnnotations() {
       state.waveformAnnotations = pages.flat();
       drawWave();
     } catch (err) {
-      if (request === waveformAnnotationRequest) statusEl.textContent = err.message;
+      if (request === waveformAnnotationRequest) { waveformAnnotationRange = null; statusEl.textContent = err.message; }
     }
-  }, 100);
+  }, panning ? 30 : 100);
 }
 
 async function loadAnnotations() {
@@ -4607,6 +4662,7 @@ function centerOn(sample) {
 
 function hoverSample() {
   if (state.hoverX == null || state.total <= 0) return 0;
+  if (state.hoverSnap) return state.hoverSnap.sample;
   return Math.min(state.total - 1, Math.max(0, Math.floor(view().start + state.hoverX * view().spp)));
 }
 
@@ -4635,7 +4691,7 @@ function placeEdgeButtons(clientY) {
   const next = document.getElementById("edge-next");
   const stage = document.querySelector(".wave-stage");
   const row = rowAt(clientY);
-  if (!prev || !next || !stage || !row || row.kind !== "logic" || state.total <= 0) {
+  if (!prev || !next || !stage || !row || !["logic", "bus", "decode", "condense"].includes(row.kind) || state.total <= 0) {
     hideEdgeButtons();
     return;
   }
@@ -4650,6 +4706,7 @@ function placeEdgeButtons(clientY) {
     return;
   }
   state.edgeChannel = row.channel;
+  state.edgeRow = row;
   prev.style.top = mid + "px";
   next.style.top = mid + "px";
   prev.classList.remove("hidden");
@@ -4658,6 +4715,7 @@ function placeEdgeButtons(clientY) {
 
 function hideEdgeButtons() {
   state.edgeChannel = null;
+  state.edgeRow = null;
   document.getElementById("edge-prev")?.classList.add("hidden");
   document.getElementById("edge-next")?.classList.add("hidden");
 }
@@ -4729,6 +4787,47 @@ async function stepEdge(forward, channel) {
     const sample = hits.reduce((best, sample) => (Math.abs(sample - from) < Math.abs(best - from) ? sample : best));
     centerOn(sample);
     statusEl.textContent = `edge at ${sample} on channel ${channel}`;
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function stepDataChange(forward, row) {
+  if (!row || row.kind === "logic") return stepEdge(forward, row?.channel);
+  const from = state.hoverX == null
+    ? Math.floor(view().start + wave.clientWidth * view().spp * 0.5)
+    : hoverSample();
+  const session = state.active;
+  try {
+    let hits = [];
+    if (row.kind === "bus" && !row.bus.decode) {
+      const channels = [...new Set(descendantChannels(row.bus))];
+      const results = await Promise.all(channels.flatMap((channel) => [true, false].map((rising) =>
+        api({ cmd: "search_edge", session, channel, from, rising, forward }))));
+      hits = results.map((result) => result.sample).filter((sample) => sample != null);
+    } else {
+      const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+      if (!decoder) return;
+      let offset = 0;
+      const rows = [];
+      for (;;) {
+        const page = await api({ cmd: "read_annotations", session, decoder: row.decoderId, offset, limit: 5000 });
+        rows.push(...page);
+        if (page.length < 5000) break;
+        offset += page.length;
+      }
+      if (state.active !== session) return;
+      const values = decoder.protocol === "rgb_led_ws281x" ? rows.filter((item) => item.class === "byte") : (() => {
+        const filtered = rows.filter((item) => !FRAME_CLASS.has(item.class));
+        return filtered.length ? filtered : rows;
+      })();
+      hits = laneAnnotations(values, row.lane, decoder).flatMap((item) => [item.start_sample, item.end_sample])
+        .filter((sample) => forward ? sample > from && sample < state.total : sample < from);
+    }
+    if (!hits.length) { statusEl.textContent = "no data change"; return; }
+    const sample = hits.reduce((best, hit) => forward ? Math.min(best, hit) : Math.max(best, hit));
+    centerOn(sample);
+    statusEl.textContent = `data change at ${sample}`;
   } catch (err) {
     statusEl.textContent = err.message;
   }
@@ -5620,6 +5719,7 @@ function placeMarker(sample, channel) {
 }
 
 async function snapMarker(marker, clientX, clientY) {
+  if (preferences.edge_snap === false) return;
   const row = rowAt(clientY);
   const channel = row && row.kind === "logic" ? row.channel : (marker.channel ?? activeLogicChannel());
   try {
@@ -5754,20 +5854,23 @@ wave.addEventListener("pointerdown", (ev) => {
     return;
   }
   if (state.tool === "measure") {
-    const sample = sampleAt(ev.clientX);
     const row = rowAt(ev.clientY);
+    const sample = state.hoverSnap && row && state.hoverSnap.key === row.key
+      ? state.hoverSnap.sample : sampleAt(ev.clientX);
     pointer = {
       kind: "measure",
       a: sample,
       b: sample,
       x: ev.clientX,
       channel: row && row.kind === "logic" ? row.channel : activeLogicChannel(),
+      row,
     };
     wave.setPointerCapture(ev.pointerId);
     drawWave();
     return;
   }
   pointer = { kind: "pan", x: ev.clientX, start: view().start };
+  hideHover();
   wave.setPointerCapture(ev.pointerId);
 });
 
@@ -5781,6 +5884,26 @@ function scheduleViewPaint() {
     drawRuler();
     drawOverview();
   });
+}
+
+let measureSnapTimer = null;
+let measureSnapSequence = 0;
+function queueMeasureSnap(active, sample, ev) {
+  const sequence = ++measureSnapSequence;
+  clearTimeout(measureSnapTimer);
+  if (preferences.edge_snap === false) { active.b = sample; return; }
+  const position = { clientX: ev.clientX, clientY: ev.clientY };
+  const session = state.active;
+  measureSnapTimer = setTimeout(async () => {
+    try {
+      const result = await nearestRowEdge(active.row || { kind: "logic", channel: active.channel }, sample, session);
+      if (pointer !== active || session !== state.active || sequence !== measureSnapSequence) return;
+      active.b = typeof result.sample === "number" ? result.sample : sample;
+      drawWave();
+      const seconds = Math.abs(active.b - active.a) / Math.max(1, state.rate);
+      showHover(position, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(active.b - active.a)} samples`);
+    } catch (_) { /* Keep the last selected edge until a lookup succeeds. */ }
+  }, 40);
 }
 
 wave.addEventListener("pointermove", (ev) => {
@@ -5803,9 +5926,14 @@ wave.addEventListener("pointermove", (ev) => {
     v.start = pointer.start - (ev.clientX - pointer.x) * v.spp;
     v.userNavigated = true;
     clampView();
-    scheduleTiles();
+    scheduleWaveformAnnotations(true);
+    const width = Math.max(1, Math.floor(wave.clientWidth || 1));
+    if (!tileCoversView(state.tileView, v.start, v.spp, width) &&
+        !(tileFlight && tileCoversView(state.pending, v.start, v.spp, width))) {
+      tileAgain = true;
+      if (!tileFlight) { tileFlight = true; runTiles(); }
+    }
     scheduleViewPaint();
-    hideHover();
     return;
   }
   if (pointer && pointer.kind === "marker") {
@@ -5823,15 +5951,21 @@ wave.addEventListener("pointermove", (ev) => {
     return;
   }
   if (pointer && pointer.kind === "measure") {
-    pointer.b = sampleAt(ev.clientX);
-    drawWave();
     if (ev.clientX < rect.left || ev.clientX >= rect.right || ev.clientY < rect.top || ev.clientY >= rect.bottom) {
+      measureSnapSequence += 1;
+      clearTimeout(measureSnapTimer);
       hideHover();
       return;
     }
+    queueMeasureSnap(pointer, sampleAt(ev.clientX), ev);
+    drawWave();
     const seconds = Math.abs(pointer.b - pointer.a) / Math.max(1, state.rate);
     showHover(ev, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(pointer.b - pointer.a)} samples`);
     return;
+  }
+  const hoveredRow = rowAt(ev.clientY);
+  if (state.hoverSnap && (!hoveredRow || hoveredRow.key !== state.hoverSnap.key)) {
+    state.hoverSnap = null;
   }
   placeEdgeButtons(ev.clientY);
   queueHover(ev);
@@ -5844,14 +5978,17 @@ function endWaveTouch(ev) {
 }
 wave.addEventListener("pointercancel", (ev) => {
   if (ev.pointerType === "touch") endWaveTouch(ev);
-  else pointer = null;
+  else { pointer = null; measureSnapSequence += 1; clearTimeout(measureSnapTimer); }
 });
 
 wave.addEventListener("pointerup", async (ev) => {
   if (ev.pointerType === "touch") { endWaveTouch(ev); return; }
   const active = pointer;
   pointer = null;
+  measureSnapSequence += 1;
+  clearTimeout(measureSnapTimer);
   if (!active) return;
+  if (active.kind === "measure") active.b = sampleAt(ev.clientX);
   if (active.kind === "cursors") {
     const channel = active.channel;
     if (Math.abs(active.b - active.a) < 2) placeMarker(active.a, channel);
@@ -5865,6 +6002,14 @@ wave.addEventListener("pointerup", async (ev) => {
   if (active.kind === "marker" && active.moved && !active.fresh) {
     await snapMarker(active.marker, ev.clientX, ev.clientY);
   } else if (active.kind === "measure" && active.a !== active.b) {
+    try {
+      const session = state.active;
+      const [a, b] = preferences.edge_snap === false ? [{}, {}] : await Promise.all([active.a, active.b].map((sample) =>
+        nearestRowEdge(active.row || { kind: "logic", channel: active.channel }, sample, session)));
+      if (session !== state.active) return;
+      if (typeof a.sample === "number") active.a = a.sample;
+      if (typeof b.sample === "number") active.b = b.sample;
+    } catch (_) { /* Keep the selected samples if edge lookup fails. */ }
     const span = {
       id: state.nextMeasure,
       n: state.nextMeasure,
@@ -5971,6 +6116,25 @@ function queueHover(ev) {
   }, 40);
 }
 
+async function nearestRowEdge(row, sample, session) {
+  if (row.kind === "logic") return api({ cmd: "nearest_edge", session, channel: row.channel, sample });
+  if (row.kind === "bus" && row.bus && !row.bus.decode) {
+    const channels = [...new Set(descendantChannels(row.bus))];
+    const edges = await Promise.all(channels.map((channel) => api({ cmd: "nearest_edge", session, channel, sample })));
+    const hits = edges.map((edge) => edge.sample).filter((hit) => typeof hit === "number");
+    return { sample: hits.length ? hits.reduce((best, hit) => Math.abs(hit - sample) < Math.abs(best - sample) ? hit : best) : null };
+  }
+  if (row.kind === "decode" || row.kind === "condense") {
+    const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+    if (!decoder) return { sample: null };
+    const spec = row.lane ? decoderLaneSpecs(decoder).find((item) => item.id === row.lane) : null;
+    if (row.lane && !spec) return { sample: null };
+    return api({ cmd: "nearest_annotation_boundary", session, decoder: row.decoderId, sample,
+      classes: spec ? spec.classes : null, value_field: spec?.value_field || null });
+  }
+  return { sample: null };
+}
+
 // A decoder row represents annotation spans, not a single physical channel.
 async function decodedHoverBounds(row, sample, session, sequence) {
   let offset = 0;
@@ -5979,9 +6143,9 @@ async function decodedHoverBounds(row, sample, session, sequence) {
     const page = await api({ cmd: "read_annotations", session, decoder: row.decoderId, start: sample, offset, limit: 5000 });
     if (sequence !== state.hoverSequence || session !== state.active || pointer) return null;
     for (const item of page) {
-      if (FRAME_CLASS.has(item.class)) continue;
+      const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+      if (decoder?.protocol === "rgb_led_ws281x" ? item.class !== "byte" : FRAME_CLASS.has(item.class)) continue;
       if (row.lane) {
-        const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
         if (decoder ? !laneAnnotations([item], row.lane, decoder).length : !item.fields || item.fields[row.lane] == null) continue;
       }
       if (!current) {
@@ -6028,7 +6192,7 @@ async function runHover(ev, sequence) {
     hideHover();
     return;
   }
-  const sample = Math.min(state.total - 1, Math.max(0, Math.floor(view().start + x * view().spp)));
+  let sample = Math.min(state.total - 1, Math.max(0, Math.floor(view().start + x * view().spp)));
   state.hoverKey = row.key;
   if (row.kind === "analog") {
     state.hoverBounds = null;
@@ -6044,12 +6208,31 @@ async function runHover(ev, sequence) {
     return;
   }
   try {
-    if (row.kind === "decode" || row.kind === "bus") {
-      const bounds = row.kind === "decode"
+    const originalSample = sample;
+    if (preferences.edge_snap !== false && ["logic", "bus", "decode", "condense"].includes(row.kind)) {
+      const edge = await nearestRowEdge(row, sample, session);
+      if (sequence !== state.hoverSequence || session !== state.active || pointer || preferences.edge_snap === false) return;
+      state.hoverSnap = typeof edge.sample === "number" ? { key: row.key, sample: edge.sample } : null;
+      if (state.hoverSnap) sample = state.hoverSnap.sample;
+      drawWave();
+    } else state.hoverSnap = null;
+    if (row.kind === "decode" || row.kind === "condense" || row.kind === "bus") {
+      let bounds = row.kind === "decode" || row.kind === "condense"
         ? await decodedHoverBounds(row, sample, session, sequence)
         : await busHoverBounds(row, sample, session);
+      if (!bounds && (row.kind === "decode" || row.kind === "condense") && sample > 0 && sample !== originalSample) {
+        bounds = await decodedHoverBounds(row, sample - 1, session, sequence);
+      }
       if (sequence !== state.hoverSequence || session !== state.active || pointer) return;
-      if (!bounds) { hideHover(); return; }
+      if (!bounds) {
+        if (!state.hoverSnap) { hideHover(); return; }
+        state.hoverBounds = null;
+        state.hoverText = "";
+        hoverEl.classList.add("hidden");
+        paintStatus();
+        drawWave();
+        return;
+      }
       const width = formatSeconds((bounds.end - bounds.start) / state.rate);
       const gap = bounds.next == null ? null : formatSeconds((bounds.next - bounds.end) / state.rate);
       state.lastMeasure = null;
@@ -6107,8 +6290,9 @@ function hideHover() {
   state.hoverEvent = null;
   if (hoverTimer) clearTimeout(hoverTimer);
   hoverTimer = null;
-  const hadBounds = !!state.hoverBounds;
+  const hadBounds = !!state.hoverBounds || !!state.hoverSnap;
   state.hoverBounds = null;
+  state.hoverSnap = null;
   state.hoverText = "";
   hoverEl.classList.add("hidden");
   paintStatus();
@@ -6403,11 +6587,11 @@ document.getElementById("trig-pre").addEventListener("change", (ev) => {
 });
 document.getElementById("edge-prev").addEventListener("click", (ev) => {
   ev.stopPropagation();
-  stepEdge(false, state.edgeChannel);
+  stepDataChange(false, state.edgeRow);
 });
 document.getElementById("edge-next").addEventListener("click", (ev) => {
   ev.stopPropagation();
-  stepEdge(true, state.edgeChannel);
+  stepDataChange(true, state.edgeRow);
 });
 const waveStage = document.querySelector(".wave-stage");
 let rowScrollLock = false;
@@ -7281,7 +7465,7 @@ function closeDecodeConfig() {
   document.getElementById("decode-config").classList.add("hidden");
 }
 
-let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "" };
+let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "", edge_snap: true };
 let exportDirTimer = null;
 let exportDirSave = 0;
 
@@ -7335,6 +7519,7 @@ async function loadPreferences() {
 document.getElementById("preferences-open").addEventListener("click", () => {
   document.getElementById("preferences-firmware").value = preferences.firmware_dir;
   document.getElementById("preferences-scripts").value = preferences.scripts_dir;
+  document.getElementById("preferences-edge-snap").checked = preferences.edge_snap !== false;
   const theme = document.querySelector(`input[name="preferences-theme"][value="${preferences.theme}"]`);
   if (theme) theme.checked = true;
   document.getElementById("preferences-error").textContent = "";
@@ -7344,11 +7529,12 @@ document.getElementById("preferences-cancel").addEventListener("click", () => do
 document.getElementById("preferences-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const next = { firmware_dir: document.getElementById("preferences-firmware").value.trim(),
-    scripts_dir: document.getElementById("preferences-scripts").value.trim(), theme: document.querySelector('input[name="preferences-theme"]:checked').value };
+    scripts_dir: document.getElementById("preferences-scripts").value.trim(), edge_snap: document.getElementById("preferences-edge-snap").checked, theme: document.querySelector('input[name="preferences-theme"]:checked').value };
   try {
     const response = await fetch("/api/preferences", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     if (!response.ok) throw new Error(await response.text());
     preferences = await response.json();
+    if (!preferences.edge_snap) { state.hoverSnap = null; state.hoverSequence += 1; }
     applyTheme();
     await loadDecoderCatalog();
     if (state.tab === "decode") selectTab("decode");

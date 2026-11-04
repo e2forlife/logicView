@@ -935,45 +935,104 @@ fn summary_text(data: &Value) -> String {
 
 /// Describes the automation tools advertised during MCP discovery.
 fn tool_defs() -> Vec<Value> {
+    let annotation_filters = || {
+        json!({
+            "decoder": {"type": "string", "description": "Filter by decoder instance ID returned by add_decoder or list_decoder_instances."},
+            "query": {"type": "string", "description": "Text substring or byte sequence such as A0-10-5A."},
+            "start": {"type": "integer", "minimum": 0, "description": "Include rows ending after this sample."},
+            "end": {"type": "integer", "minimum": 0, "description": "Include rows starting before this exclusive sample."},
+            "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Number of matching rows to skip."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200, "description": "Maximum rows to return; the server clamps this to 1?5000."}
+        })
+    };
     vec![
-        tool(
-            "list_devices",
-            "List plugged-in DreamSourceLab pods ahead of demo devices. Untested product ids are shown and are not opened.",
-            json!({}),
-        ),
-        tool("list_profiles", "Logic pod profiles. Untested product ids are not opened.", json!({})),
-        tool("connect", "Replace the session devices with one demo pod or one tested USB pod.", json!({"id": {"type": "string"}})),
-        tool("attach_device", "Stack another demo pod, or a second tested USB pod of a different product id.", json!({"id": {"type": "string"}})),
-        tool("detach_device", "Remove one stacked demo pod.", json!({"id": {"type": "string"}})),
-        tool("configure_logic", "Set sample rate, duration, and an optional ordered edge trigger. trigger_steps is a list of {channel, rising}. The demo source finds that sequence in the captured samples. The same stages are written into the arm record and have not been run on a pod.", json!({"sample_rate_hz": {"type": "integer"}, "duration_ms": {"type": "integer"}, "trigger_enabled": {"type": "boolean"}, "trigger_steps": {"type": "array"}})),
-        tool("configure_scope", "Refused: oscilloscope is not in this build.", json!({})),
-        tool("configure_daq", "Refused: data acquisition is not in this build.", json!({})),
-        tool("start_capture", "Arm the session. A running capture is reused unless force is true.", json!({"force": {"type": "boolean"}, "instant": {"type": "boolean"}})),
-        tool("wait_capture", "Wait until the capture stops. timeout_ms is required to avoid an unbounded wait and defaults to 10000.", json!({"timeout_ms": {"type": "integer"}})),
-        tool("stop_capture", "Stop and keep the samples already stored.", json!({})),
-        tool("capture_status", "Phase, sample count, devices, and warnings.", json!({})),
-        tool("add_decoder", "Add UART, I2C, SPI, or eeprom24. Channels accept an index or device/name.", json!({"protocol": {"type": "string"}, "channels": {"type": "object"}})),
-        tool("remove_decoder", "Remove a decoder instance.", json!({"id": {"type": "string"}})),
-        tool("read_annotations", "Read decoded rows. Optional query is a substring or A0-10-5A byte pattern.", json!({"query": {"type": "string"}})),
-        tool("search_annotations", "Find annotation rows by text or byte pattern.", json!({"query": {"type": "string"}})),
-        tool("search_edges", "Next or previous edge or 0/1/x pattern on one channel.", json!({"channel": {"type": "integer"}, "pattern": {"type": "string"}})),
-        tool("measure", "Width, period, frequency, and duty at a sample. persist saves it.", json!({"channel": {"type": "integer"}, "sample": {"type": "integer"}})),
-        tool("set_cursors", "Place cursors A and B and return the span.", json!({"a": {"type": "integer"}, "b": {"type": "integer"}})),
-        tool("export_annotations", "Export decoded rows as csv or text.", json!({"format": {"type": "string"}})),
-        tool("list_sessions", "Open session tabs.", json!({})),
+        tool("list_devices", "List available demo and hardware devices, including IDs for connect or attach_device.", json!({}), &[], false),
+        tool("list_profiles", "List logic pod profiles and hardware support information.", json!({}), &[], false),
+        tool("list_decoders_catalog", "List available built-in and Lua decoders, their protocol IDs, input channels, options, lanes, and stacking requirements. Use these IDs with add_decoder.", json!({}), &[], false),
+        tool("connect", "Replace the active session's devices with one demo or supported USB device.", json!({
+            "id": {"type": "string", "description": "Device ID from list_devices."}
+        }), &["id"], false),
+        tool("attach_device", "Attach another demo or supported USB device to a session.", json!({"id": {"type": "string", "description": "Device ID from list_devices."}}), &["id"], true),
+        tool("detach_device", "Remove a device from a session.", json!({"id": {"type": "string", "description": "Attached device ID."}}), &["id"], true),
+        tool("configure_logic", "Configure a logic capture. Omitted settings revert to their defaults; nonempty trigger_steps enable triggering and specify an ordered sequence.", json!({
+            "sample_rate_hz": {"type": "integer", "minimum": 0, "default": 1000000, "description": "Requested samples per second."},
+            "duration_ms": {"type": "integer", "minimum": 0, "default": 2000, "description": "Capture duration in milliseconds."},
+            "realtime": {"type": "boolean", "default": false, "description": "Pace demo capture in real time."},
+            "trigger_enabled": {"type": "boolean", "default": false, "description": "Enable the default trigger if no steps are supplied."},
+            "trigger_steps": {"type": "array", "description": "Ordered channel edges; each step accepts rising or edge (rising/falling).", "items": {"type": "object", "properties": {
+                "channel": {"type": "integer", "minimum": 0, "maximum": 31},
+                "rising": {"type": "boolean", "default": true},
+                "edge": {"type": "string", "enum": ["rising", "falling"]}
+            }, "required": ["channel"]}}
+        }), &[], true),
+        tool("configure_scope", "Unavailable: oscilloscope mode is not in this build and this call returns an error.", json!({}), &[], false),
+        tool("configure_daq", "Unavailable: data acquisition mode is not in this build and this call returns an error.", json!({}), &[], false),
+        tool("start_capture", "Start a capture. An existing active capture is reused unless force is true; instant bypasses triggering.", json!({
+            "force": {"type": "boolean", "default": false},
+            "instant": {"type": "boolean", "default": false},
+            "mode": {"type": "string", "description": "Set to instant as an alternative to instant: true.", "enum": ["instant", "normal"]}
+        }), &[], true),
+        tool("wait_capture", "Wait for the capture to settle, up to the specified timeout; inspect the returned phase.", json!({
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000, "default": 10000}
+        }), &[], true),
+        tool("stop_capture", "Stop a capture and keep samples collected so far.", json!({}), &[], true),
+        tool("capture_status", "Read the capture phase, sample count, rate, devices, and warnings.", json!({}), &[], true),
+        tool("add_decoder", "Apply a built-in or Lua decoder to a capture. First inspect list_decoders_catalog for protocol IDs, channel names and options. Returns the decoder instance ID for read_annotations. Stacked decoders can use stack_on to select a parent.", json!({
+            "protocol": {"type": "string", "description": "Decoder protocol ID from list_decoders_catalog."},
+            "id": {"type": "string", "description": "Alternative name for protocol; protocol takes precedence."},
+            "channels": {"type": "object", "description": "Map decoder input names to channel indexes or device/channel names, e.g. {\"scl\":\"SCL\",\"sda\":\"SDA\"}.", "additionalProperties": {"type": ["string", "number", "boolean"]}},
+            "options": {"type": "object", "description": "Map decoder option names to scalar values; values are converted to strings.", "additionalProperties": {"type": ["string", "number", "boolean"]}},
+            "stack_on": {"type": "string", "description": "Parent decoder instance ID for a stacked decoder. Omit to use the engine's parent selection."},
+            "region_start": {"type": "integer", "minimum": 0, "description": "Start sample of decode region; provide both region bounds."},
+            "region_end": {"type": "integer", "minimum": 0, "description": "Exclusive end sample of decode region; provide both region bounds."}
+        }), &[], true),
+        tool("remove_decoder", "Remove a decoder instance from a session.", json!({"id": {"type": "string", "description": "Decoder instance ID."}}), &["id"], true),
+        tool("list_decoder_instances", "List decoder instances in a session, including instance IDs, protocol IDs, channel bindings, options and parent relationships.", json!({}), &[], true),
+        tool("read_annotations", "Read decoded annotation rows, with instance ID, sample boundaries, class, text and fields. Filter by decoder, time range or query; use offset and limit to paginate. Decoder lanes can be selected from the returned class and fields.", annotation_filters(), &[], true),
+        tool("search_annotations", "Search decoded annotations by text or byte pattern; supports the same decoder, sample range and pagination filters as read_annotations.", annotation_filters(), &["query"], true),
+        tool("search_edges", "Search a channel for a rising or falling edge, or a bit pattern when pattern is supplied. Returns a sample or null.", json!({
+            "channel": {"type": "integer", "minimum": 0, "description": "Capture channel index."},
+            "from": {"type": "integer", "minimum": 0, "default": 0, "description": "Starting sample."},
+            "rising": {"type": "boolean", "default": true, "description": "Edge direction when no pattern is supplied."},
+            "forward": {"type": "boolean", "default": true, "description": "Search forward when true, backward when false."},
+            "pattern": {"type": "string", "description": "Sequence of 0, 1 or x levels; whitespace is ignored. Overrides edge direction."}
+        }), &["channel"], true),
+        tool("measure", "Measure pulse width, period, frequency and duty on one channel at a sample. Set persist to save the measurement.", json!({
+            "channel": {"type": "integer", "minimum": 0}, "sample": {"type": "integer", "minimum": 0},
+            "persist": {"type": "boolean", "default": false}
+        }), &["channel", "sample"], true),
+        tool("set_cursors", "Set either or both sample cursors and measure their span and edge count on a channel; omitted cursor positions remain unchanged.", json!({
+            "a": {"type": "integer", "minimum": 0, "description": "Cursor A sample."},
+            "b": {"type": "integer", "minimum": 0, "description": "Cursor B sample."},
+            "channel": {"type": "integer", "minimum": 0, "default": 0, "description": "Channel for edge count."}
+        }), &[], true),
+        tool("export_annotations", "Export matching decoded annotations as CSV or text.", json!({
+            "format": {"type": "string", "enum": ["csv", "text"], "default": "csv"},
+            "query": {"type": "string", "description": "Optional text or byte-pattern filter."}
+        }), &[], true),
+        tool("list_sessions", "List session IDs and the active session. Pass an ID as session to session-scoped tools.", json!({}), &[], false),
     ]
 }
 
-/// Builds a tool discovery entry from its name, description, and argument schema.
-fn tool(name: &str, description: &str, properties: Value) -> Value {
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-        }
-    })
+/// Builds an MCP tool definition with complete argument descriptions.
+fn tool(
+    name: &str,
+    description: &str,
+    mut properties: Value,
+    required: &[&str],
+    scoped: bool,
+) -> Value {
+    if scoped {
+        properties["session"] = json!({"type": "string", "description": "Session ID from list_sessions; omit to use the active session."});
+    }
+    let mut schema = json!({"type": "object", "properties": properties});
+    if !required.is_empty() {
+        schema["required"] = json!(required);
+    }
+    if name == "add_decoder" {
+        schema["anyOf"] = json!([{"required": ["protocol"]}, {"required": ["id"]}]);
+    }
+    json!({"name": name, "description": description, "inputSchema": schema})
 }
 
 /// Lists the engine state and catalog resources advertised during MCP discovery.
@@ -981,7 +1040,7 @@ fn resource_defs() -> Vec<Value> {
     [
         ("logicview://devices", "Demo pods and connected tested pods"),
         ("logicview://session", "Active capture"),
-        ("logicview://catalog/decoders", "Built-in decoder schemas"),
+        ("logicview://catalog/decoders", "Built-in and Lua decoder schemas"),
         ("logicview://catalog/profiles", "Logic pod profiles, with untested ids marked"),
     ]
     .into_iter()
@@ -1062,6 +1121,103 @@ mod tests {
             .as_str()
             .expect("structured text");
         serde_json::from_str(text).expect("json payload")
+    }
+
+    /// MCP clients can discover every dispatched tool and its usable parameters.
+    #[tokio::test]
+    async fn tool_discovery_exposes_decoder_workflow_and_supported_parameters() {
+        let mut session = McpSession::local(Engine::new());
+        let response = rpc(&mut session, 1, "tools/list", json!({})).await;
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names: std::collections::HashSet<&str> = tools
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        let expected = [
+            "list_devices",
+            "list_profiles",
+            "list_decoders_catalog",
+            "connect",
+            "attach_device",
+            "detach_device",
+            "configure_logic",
+            "configure_scope",
+            "configure_daq",
+            "start_capture",
+            "wait_capture",
+            "stop_capture",
+            "capture_status",
+            "add_decoder",
+            "remove_decoder",
+            "list_decoder_instances",
+            "read_annotations",
+            "search_annotations",
+            "search_edges",
+            "measure",
+            "set_cursors",
+            "export_annotations",
+            "list_sessions",
+        ];
+        assert_eq!(names.len(), tools.len());
+        assert_eq!(names, expected.into_iter().collect());
+        let properties = |name: &str| -> &Value {
+            &tools.iter().find(|item| item["name"] == name).unwrap()["inputSchema"]["properties"]
+        };
+        for field in [
+            "session",
+            "protocol",
+            "channels",
+            "options",
+            "stack_on",
+            "region_start",
+            "region_end",
+        ] {
+            assert!(
+                properties("add_decoder").get(field).is_some(),
+                "missing add_decoder.{field}"
+            );
+        }
+        for field in [
+            "session", "decoder", "query", "start", "end", "offset", "limit",
+        ] {
+            assert!(
+                properties("read_annotations").get(field).is_some(),
+                "missing read_annotations.{field}"
+            );
+        }
+        for (name, fields) in [
+            ("configure_logic", &["realtime", "trigger_steps"][..]),
+            ("search_edges", &["from", "rising", "forward"][..]),
+            ("measure", &["persist"][..]),
+            ("set_cursors", &["channel"][..]),
+        ] {
+            for field in fields {
+                assert!(
+                    properties(name).get(field).is_some(),
+                    "missing {name}.{field}"
+                );
+            }
+        }
+        let catalog = rpc(
+            &mut session,
+            2,
+            "tools/call",
+            json!({"name": "list_decoders_catalog", "arguments": {}}),
+        )
+        .await;
+        assert!(tool_data(&catalog)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decoder| decoder["id"] == "i2c"));
+        let instances = rpc(
+            &mut session,
+            3,
+            "tools/call",
+            json!({"name": "list_decoder_instances", "arguments": {}}),
+        )
+        .await;
+        assert!(tool_data(&instances).as_array().unwrap().is_empty());
     }
 
     /// Exercises discovery and protocol bring-up through the MCP request interface.

@@ -250,13 +250,61 @@ impl Engine {
         let slot = state.slot(&id)?;
         let limit = limit.clamp(1, 5_000);
         if query.is_none_or(|query| query.trim().is_empty()) {
-            return Ok(slot.annotations.iter()
+            return Ok(slot
+                .annotations
+                .iter()
                 .filter(|row| decoder.is_none_or(|id| row.decoder == id))
                 .filter(|row| start.is_none_or(|sample| row.end_sample > sample))
                 .filter(|row| end.is_none_or(|sample| row.start_sample < sample))
-                .skip(offset).take(limit).cloned().collect());
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect());
         }
-        Ok(filtered(slot, decoder, query, start, end).into_iter().skip(offset).take(limit).collect())
+        Ok(filtered(slot, decoder, query, start, end)
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
+    /// Finds the closest boundary of an annotation displayed on a decoder lane.
+    pub async fn nearest_annotation_boundary(
+        &self,
+        session: Option<&str>,
+        decoder: &str,
+        sample: u64,
+        classes: Option<&[String]>,
+        value_field: Option<&str>,
+    ) -> Result<Option<u64>, EngineError> {
+        let state = self.shared.state.lock().await;
+        let id = self.resolve(&state, session)?;
+        let slot = state.slot(&id)?;
+        let rows = slot.annotations.iter().filter(|row| row.decoder == decoder);
+        let is_frame = |class: &str| matches!(class, "select" | "start" | "stop" | "ack" | "nack");
+        let has_values = rows.clone().any(|row| !is_frame(&row.class));
+        let mut best: Option<u64> = None;
+        for row in rows {
+            if row.protocol == "rgb_led_ws281x" {
+                if row.class != "byte" {
+                    continue;
+                }
+            } else if has_values && is_frame(&row.class) {
+                continue;
+            }
+            if classes.is_some_and(|items| !items.contains(&row.class)) {
+                continue;
+            }
+            if value_field.is_some_and(|field| !row.fields.contains_key(field)) {
+                continue;
+            }
+            for boundary in [row.start_sample, row.end_sample] {
+                if best.is_none_or(|old| boundary.abs_diff(sample) < old.abs_diff(sample)) {
+                    best = Some(boundary);
+                }
+            }
+        }
+        Ok(best)
     }
 
     /// Returns the first page of annotation matches across the session's analyzers.

@@ -553,10 +553,14 @@ struct SaveSetup {
     setup: Value,
 }
 
-async fn save_setup(Json(input): Json<SaveSetup>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn save_setup(
+    Json(input): Json<SaveSetup>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let path = input.path;
     if !path.is_absolute()
-        || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lvsetup") || ext.eq_ignore_ascii_case("json"))
+        || !path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("lvsetup") || ext.eq_ignore_ascii_case("json")
+        })
         || !path.parent().is_some_and(|parent| parent.is_dir())
         || (path.exists() && !path.is_file())
     {
@@ -565,7 +569,8 @@ async fn save_setup(Json(input): Json<SaveSetup>) -> Result<Json<Value>, (Status
     if input.setup.get("kind").and_then(Value::as_str) != Some("logicview-setup") {
         return Err(export_error("Invalid setup data"));
     }
-    let bytes = serde_json::to_vec_pretty(&input.setup).map_err(|err| export_error(err.to_string()))?;
+    let bytes =
+        serde_json::to_vec_pretty(&input.setup).map_err(|err| export_error(err.to_string()))?;
     std::fs::write(&path, bytes).map_err(|err| export_error(err.to_string()))?;
     Ok(Json(json!({ "ok": true, "path": path.to_string_lossy() })))
 }
@@ -593,9 +598,10 @@ async fn save_as(
     } else {
         input.path.with_extension("lvcap")
     };
-    let parent = path.parent().filter(|dir| dir.is_dir()).ok_or_else(|| {
-        export_error("Choose a folder that exists")
-    })?;
+    let parent = path
+        .parent()
+        .filter(|dir| dir.is_dir())
+        .ok_or_else(|| export_error("Choose a folder that exists"))?;
     if path.file_name().is_none() || parent.as_os_str().is_empty() {
         return Err(export_error("Choose a file"));
     }
@@ -795,9 +801,7 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
             Ok(json!({"sessions": sessions, "active": active}))
         }
         Command::CreateSession { name } => Ok(json!(engine.create_session(name).await?)),
-        Command::RenameSession { id, name } => {
-            Ok(json!(engine.rename_session(&id, &name).await?))
-        }
+        Command::RenameSession { id, name } => Ok(json!(engine.rename_session(&id, &name).await?)),
         Command::CloseSession { id } => {
             let active = engine.close_session(&id).await?;
             Ok(json!({"active": active}))
@@ -1029,6 +1033,15 @@ async fn dispatch(engine: &Engine, cmd: Command) -> Result<Value, ApiError> {
                 )
                 .await?
         )),
+        Command::NearestAnnotationBoundary {
+            session,
+            decoder,
+            sample,
+            classes,
+            value_field,
+        } => Ok(json!({"sample": engine.nearest_annotation_boundary(
+                session.as_deref(), &decoder, sample, classes.as_deref(), value_field.as_deref()
+            ).await?})),
         Command::ExportAnnotations {
             session,
             format,
@@ -1419,6 +1432,15 @@ enum Command {
         offset: Option<usize>,
         #[serde(default)]
         limit: Option<usize>,
+    },
+    NearestAnnotationBoundary {
+        session: Option<String>,
+        decoder: String,
+        sample: u64,
+        #[serde(default)]
+        classes: Option<Vec<String>>,
+        #[serde(default)]
+        value_field: Option<String>,
     },
     ExportAnnotations {
         session: Option<String>,
@@ -1932,6 +1954,14 @@ mod tests {
         let rows = rows.as_array().unwrap();
         assert!(!rows.is_empty());
         assert!(rows[0]["text"].as_str().unwrap().contains("MISO 0x3C"));
+        let decoder = rows[0]["decoder"].as_str().unwrap();
+        let start = rows[0]["start_sample"].as_u64().unwrap();
+        let edge = post(&app, json!({"cmd": "nearest_annotation_boundary", "decoder": decoder,
+            "sample": start, "classes": ["word"], "value_field": "mosi"})).await;
+        assert_eq!(edge["sample"], start);
+        let none = post(&app, json!({"cmd": "nearest_annotation_boundary", "decoder": decoder,
+            "sample": start, "classes": ["word"], "value_field": "missing"})).await;
+        assert!(none["sample"].is_null());
     }
 
     /// Checks that ordered trigger settings reach the engine and report the observed demo trigger
@@ -2316,7 +2346,8 @@ mod tests {
         }
         assert_eq!(status["phase"], "stopped");
 
-        let path = std::env::temp_dir().join(format!("logicview-save-as-{}.lvcap", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("logicview-save-as-{}.lvcap", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let saved = app
             .oneshot(
@@ -2324,7 +2355,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/save-as")
                     .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&json!({"path": path})).unwrap()))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"path": path})).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2340,13 +2373,25 @@ mod tests {
         let app = router(Engine::new());
         let setup = json!({"kind": "logicview-setup", "version": 1, "names": {"logic:0": "Clock"}});
         let request = |path: &std::path::Path| {
-            Request::builder().method("POST").uri("/api/save-setup")
+            Request::builder()
+                .method("POST")
+                .uri("/api/save-setup")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&json!({"path": path, "setup": setup})).unwrap())).unwrap()
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"path": path, "setup": setup})).unwrap(),
+                ))
+                .unwrap()
         };
-        let relative = app.clone().oneshot(request(std::path::Path::new("setup.lvsetup"))).await.unwrap();
+        let relative = app
+            .clone()
+            .oneshot(request(std::path::Path::new("setup.lvsetup")))
+            .await
+            .unwrap();
         assert_eq!(relative.status(), StatusCode::BAD_REQUEST);
-        let path = std::env::temp_dir().join(format!("logicview-setup-test-{}.lvsetup", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "logicview-setup-test-{}.lvsetup",
+            std::process::id()
+        ));
         let saved = app.oneshot(request(&path)).await.unwrap();
         assert!(saved.status().is_success());
         let data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

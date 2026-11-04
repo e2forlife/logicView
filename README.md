@@ -145,6 +145,9 @@ cargo run -p logicview-app -- mcp
 
 The robot button in the lower-right corner controls the MCP server. It is off by default; enable it to expose a loopback HTTP endpoint at `http://127.0.0.1:8765/mcp` (or the configured port). Changes to the port take effect after disabling and re-enabling the server. The enabled state and port persist between launches. The stdio MCP server attaches to the running engine when the desktop MCP server is enabled; otherwise it starts its own demo engine. On Unix the default endpoint is `/tmp/logicview.sock`. On Windows, the running UI writes its loopback TCP endpoint to `%TEMP%\logicview.sock`. `LOGICVIEW_SOCKET` overrides the Unix socket path or Windows endpoint file path; on Windows a loopback `host:port` value specifies a TCP address instead.
 
+
+MCP clients can call `list_decoders_catalog` to discover built-in and Lua decoders, their inputs, options, and lane definitions. Use `add_decoder` to bind inputs to channel indexes or device/channel names, then use `list_decoder_instances` and `read_annotations` to retrieve decoded rows. Annotation reads accept a decoder instance ID, sample range, query, offset, and limit. `tools/list` describes the available tools and their parameters; most session-scoped tools accept an optional `session` ID from `list_sessions`.
+
 ## Architecture
 
 | Crate | Responsibility |
