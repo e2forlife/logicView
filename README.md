@@ -21,7 +21,15 @@ See [Mission and vision](MISSION.md) for the project's direction and [Contributi
 
 ## Get started
 
-Install the stable [Rust toolchain](https://www.rust-lang.org/tools/install). On Linux, the desktop build also requires WebKitGTK 4.1, GTK 3, and pkg-config development packages. On Windows, the desktop window uses WebView2.
+Install the stable [Rust toolchain](https://www.rust-lang.org/tools/install). On Windows, the desktop window uses WebView2. On Linux, install build and runtime packages:
+
+```sh
+# Debian/Ubuntu build dependencies
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config
+
+# Debian/Ubuntu runtime libraries (usually pulled in by the -dev packages)
+# libwebkit2gtk-4.1-0 libgtk-3-0
+```
 
 ```sh
 cargo test --workspace
@@ -30,11 +38,32 @@ cargo run -p logicview-app
 
 The app opens a desktop window and serves its interface on loopback port `4173`. Set `LOGICVIEW_PORT` to choose a different port. Press **Run** to use the demo source; add **Demo SPI** from the device drawer to see multiple demo pods on the waveform. The analyzers drawer adds protocol decoders, and the measurement drawer keeps waveform readings.
 
-For supported hardware, firmware and FPGA bitstreams are not included in the repository. If the pod's FPGA is not already configured, set `LOGICVIEW_FIRMWARE_DIR` to a directory containing the appropriate user-supplied `DSLogicPlus.bin` or `DSLogicU3Pro32.bin`. See [Contributing](CONTRIBUTING.md) before working with hardware or reference materials.
+For supported hardware, firmware and FPGA bitstreams are not included in the repository. If the pod's FPGA is not already configured, set `LOGICVIEW_FIRMWARE_DIR` to a directory containing the appropriate user-supplied `DSLogicPlus.bin` or `DSLogicU3Pro32.bin`, or place those files in a conventional search location. See [Contributing](CONTRIBUTING.md) before working with hardware or reference materials.
+
+### Linux USB permissions
+
+On Linux, DreamSourceLab pods can show as **Detected** from sysfs before the process can open them. Selecting a pod needs read-write access to `/dev/bus/usb/...`. Install the udev rule, then unplug and replug the analyzer:
+
+```sh
+sudo cp contrib/udev/99-logicview.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Or run the helper script from a source checkout or extracted release package:
+
+```sh
+scripts/install-udev.sh
+```
+
+Confirm the node is writable (mode `0666` or an ACL for your user), for example `ls -l /dev/bus/usb/*/*` after replug. Without the rule, selecting a detected pod fails and the session stays on Demo — listing only needs sysfs, opening needs read-write access. Hardware checks are operator-run (`cargo test -p logicview-hal -- --ignored`) and are not assumed by CI.
+
+For more Linux pod symptoms (permissions, firmware paths, AppImage runtime libraries, capture fill noise, MCP), see the [Linux troubleshooting guide](docs/linux-troubleshooting.md).
 
 ## Preferences and extensions
 
 Use the gear in the upper right to set the firmware directory, Lua decoder script directory, and light, dark, or system theme. Preferences persist across launches. A blank firmware directory uses the standard search locations; `LOGICVIEW_FIRMWARE_DIR` takes precedence. On Windows preferences are stored in `%APPDATA%\LogicView\preferences.json`; on Linux they use `XDG_CONFIG_HOME` or `~/.config/LogicView`.
+
+When the firmware preference and `LOGICVIEW_FIRMWARE_DIR` are unset, LogicView also looks in conventional locations: on Windows, a DSView `res` folder under Program Files and `%LOCALAPPDATA%\Temp\lv-fw`; on Linux, `$XDG_DATA_HOME/LogicView/firmware` (or `~/.local/share/LogicView/firmware`), `/usr/local/share/LogicView/firmware`, `/usr/share/LogicView/firmware`, and common DSView Linux `res` paths.
 
 Device identities, USB IDs, channel counts, bitstream filenames, and tested status are in [profiles.toml](profiles.toml). LogicView loads this file at startup from `LOGICVIEW_PROFILES`, the working directory, or beside the executable, and falls back to bundled defaults. Restart after editing it. Profiles describe hardware; the current USB capture implementation still supports only the Plus and U3Pro32 backends. Adding another ID or marking it tested does not implement its hardware protocol or make it safe to open.
 
@@ -83,9 +112,9 @@ DSView uses USB vendor control requests (`b0`, `b1`, `b2`) for device commands, 
 
 Obtain FPGA images and any required USB-controller firmware from [DreamSourceLab's DSView project](https://github.com/DreamSourceLab/DSView) or its distributions. DSView profiles name both `.fw` controller firmware and `.bin` FPGA images; availability may vary by distribution. LogicView loads the two supported `.bin` files from `LOGICVIEW_FIRMWARE_DIR` (or its other documented search locations), but does not upload `.fw` files. No firmware or bitstreams are distributed with LogicView.
 
-### Windows packaging
+### Packaging
 
-From the repository directory:
+From the repository directory on Windows:
 
 ```bat
 scripts\package-release.cmd
@@ -94,6 +123,20 @@ scripts\run-debug.cmd
 
 The packaging script builds a release executable and writes `dist\logicview-<version>-windows.zip`, including the UI assets. Extract the archive and run `logicview.exe`. The debug script keeps a console open for logs.
 
+On Linux:
+
+```sh
+scripts/package-release.sh
+scripts/run-debug.sh
+```
+
+The Linux packaging script writes both:
+
+- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, example decoders, UI assets, the application icon and desktop entry, and the udev rule. Extract and run `./logicview`. `scripts/install-desktop.sh` installs the icon and menu entry for your user.
+- `dist/logicview-<version>-x86_64.AppImage` — the same payload as a single executable file, with the application icon embedded for file managers. Mark it executable and run it (`chmod +x … && ./logicview-…-x86_64.AppImage`).
+
+The AppImage is a thin bundle: it still needs host WebKitGTK 4.1 and GTK 3 (`libwebkit2gtk-4.1-0` and GTK 3 on Debian/Ubuntu), the same runtime libraries as a normal desktop build. It downloads `appimagetool` into `dist/.appimage-tools` on first use (override with `LOGICVIEW_APPIMAGE_TOOL_DIR` / `LOGICVIEW_APPIMAGETOOL_URL`). Packaging also needs `squashfs-tools`. The image is gzip-compressed so file managers can read its icon, and the script installs a per-user AppImage thumbnailer for desktops that do not ship one.
+
 ### MCP server
 
 ```sh
@@ -101,6 +144,9 @@ cargo run -p logicview-app -- mcp
 ```
 
 The robot button in the lower-right corner controls the MCP server. It is off by default; enable it to expose a loopback HTTP endpoint at `http://127.0.0.1:8765/mcp` (or the configured port). Changes to the port take effect after disabling and re-enabling the server. The enabled state and port persist between launches. The stdio MCP server attaches to the running engine when the desktop MCP server is enabled; otherwise it starts its own demo engine. On Unix the default endpoint is `/tmp/logicview.sock`. On Windows, the running UI writes its loopback TCP endpoint to `%TEMP%\logicview.sock`. `LOGICVIEW_SOCKET` overrides the Unix socket path or Windows endpoint file path; on Windows a loopback `host:port` value specifies a TCP address instead.
+
+
+MCP clients can call `list_decoders_catalog` to discover built-in and Lua decoders, their inputs, options, and lane definitions. Use `add_decoder` to bind inputs to channel indexes or device/channel names, then use `list_decoder_instances` and `read_annotations` to retrieve decoded rows. Annotation reads accept a decoder instance ID, sample range, query, offset, and limit. `tools/list` describes the available tools and their parameters; most session-scoped tools accept an optional `session` ID from `list_sessions`.
 
 ## Architecture
 

@@ -165,12 +165,12 @@ impl Pod {
         let device = info
             .open()
             .wait()
-            .map_err(|err| HalError::Usb(err.to_string()))?;
+            .map_err(|err| usb_access_error("open", &err.to_string()))?;
         let speed = device.speed();
         let interface = device
             .claim_interface(0)
             .wait()
-            .map_err(|err| HalError::Usb(err.to_string()))?;
+            .map_err(|err| usb_access_error("claim", &err.to_string()))?;
         let mut pod = Self {
             interface,
             firmware_major: 0,
@@ -613,20 +613,60 @@ fn bitstream_path(file_name: &str) -> Result<PathBuf, HalError> {
     })
 }
 
+/// Maps raw USB open/claim failures onto an actionable message for the operator.
+///
+/// On Linux a pod can appear in the device list from sysfs while `/dev/bus/usb`
+/// is still read-only. Permission errors then look like "cannot select" the pod.
+fn usb_access_error(action: &str, detail: &str) -> HalError {
+    let lower = detail.to_ascii_lowercase();
+    let permission = lower.contains("permission")
+        || lower.contains("access denied")
+        || lower.contains("eacces")
+        || lower.contains("os error 13");
+    if permission {
+        #[cfg(target_os = "linux")]
+        {
+            return HalError::Usb(format!(
+                "could not {action} the USB device ({detail}). Install contrib/udev/99-logicview.rules, reload udev, and replug the analyzer so /dev/bus/usb allows read-write access"
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return HalError::Usb(format!(
+                "could not {action} the USB device ({detail}). Close other apps using the analyzer and try again"
+            ));
+        }
+    }
+    HalError::Usb(format!("could not {action} the USB device: {detail}"))
+}
+
 /// Lists conventional external locations that may contain the required FPGA image.
 fn candidate_dirs() -> Vec<PathBuf> {
-    let mut dirs = dsview_res_dirs(
-        std::env::var("ProgramFiles").ok().as_deref(),
-        std::env::var("ProgramFiles(x86)").ok().as_deref(),
-    );
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        dirs.push(Path::new(&local).join("Temp").join("lv-fw"));
+    let mut dirs = Vec::new();
+    #[cfg(windows)]
+    {
+        dirs.extend(dsview_res_dirs(
+            std::env::var("ProgramFiles").ok().as_deref(),
+            std::env::var("ProgramFiles(x86)").ok().as_deref(),
+        ));
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            dirs.push(Path::new(&local).join("Temp").join("lv-fw"));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        dirs.extend(linux_firmware_dirs(
+            std::env::var_os("XDG_DATA_HOME"),
+            std::env::var_os("HOME"),
+        ));
+        dirs.extend(linux_dsview_res_dirs());
     }
     dirs
 }
 
 /// DreamSourceLab installs keep bitstreams in `res`. Nothing from that folder
 /// is copied into this repo; open reads the file in place.
+#[cfg(any(windows, test))]
 fn dsview_res_dirs(program_files: Option<&str>, program_files_x86: Option<&str>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for root in [program_files, program_files_x86].into_iter().flatten() {
@@ -641,12 +681,53 @@ fn dsview_res_dirs(program_files: Option<&str>, program_files_x86: Option<&str>)
     dirs
 }
 
+/// XDG and system data directories used for user-supplied FPGA images on Unix.
+#[cfg(not(windows))]
+fn linux_firmware_dirs(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let data_home = xdg_data_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|path| PathBuf::from(path).join(".local").join("share")));
+    if let Some(base) = data_home {
+        dirs.push(base.join("LogicView").join("firmware"));
+    }
+    for system in [
+        Path::new("/usr/local/share/LogicView/firmware"),
+        Path::new("/usr/share/LogicView/firmware"),
+    ] {
+        if !dirs.iter().any(|dir| dir == system) {
+            dirs.push(system.to_path_buf());
+        }
+    }
+    dirs
+}
+
+/// Common DSView Linux install layouts; bitstreams are opened in place.
+#[cfg(not(windows))]
+fn linux_dsview_res_dirs() -> Vec<PathBuf> {
+    [
+        Path::new("/usr/local/share/DSView/res"),
+        Path::new("/usr/share/DSView/res"),
+        Path::new("/opt/DSView/res"),
+    ]
+    .into_iter()
+    .map(Path::to_path_buf)
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! Checks device identification and external bitstream discovery without claiming hardware.
 
     use super::{describe_listed, dsview_res_dirs, matches_plus, supported_product};
+    #[cfg(not(windows))]
+    use super::{linux_dsview_res_dirs, linux_firmware_dirs};
     use nusb::Speed;
+    #[cfg(not(windows))]
+    use std::path::PathBuf;
 
     /// Checks that device identity and the openable-model allowlist remain distinct from discovery.
     #[test]
@@ -690,5 +771,45 @@ mod tests {
         assert_eq!(dirs[0].parent().unwrap().file_name().unwrap(), "DSView");
         assert!(dirs[1].parent().unwrap().ends_with("DSView"));
         assert!(dsview_res_dirs(Some(""), None).is_empty());
+    }
+
+    /// Permission failures while opening a listed pod point at the udev rule on Linux.
+    #[test]
+    fn usb_permission_errors_explain_how_to_fix_access() {
+        let err = super::usb_access_error("open", "Permission denied (os error 13)");
+        let text = err.to_string();
+        assert!(text.contains("could not open the USB device"));
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("99-logicview.rules"));
+        let other = super::usb_access_error("claim", "device busy");
+        assert!(other.to_string().contains("could not claim the USB device: device busy"));
+    }
+
+    /// Checks XDG and system firmware directories used on Linux and other Unix hosts.
+    #[cfg(not(windows))]
+    #[test]
+    fn firmware_search_includes_linux_xdg_and_system_dirs() {
+        let with_xdg = linux_firmware_dirs(Some("/tmp/xdg-data".into()), Some("/home/dev".into()));
+        assert_eq!(
+            with_xdg[0],
+            PathBuf::from("/tmp/xdg-data/LogicView/firmware")
+        );
+        assert!(with_xdg.iter().any(|dir| dir.ends_with("usr/share/LogicView/firmware")));
+        assert!(with_xdg
+            .iter()
+            .any(|dir| dir.ends_with("usr/local/share/LogicView/firmware")));
+
+        let from_home = linux_firmware_dirs(None, Some("/home/dev".into()));
+        assert_eq!(
+            from_home[0],
+            PathBuf::from("/home/dev/.local/share/LogicView/firmware")
+        );
+
+        let dsview = linux_dsview_res_dirs();
+        assert!(dsview.iter().any(|dir| dir.ends_with("usr/share/DSView/res")));
+        assert!(dsview
+            .iter()
+            .any(|dir| dir.ends_with("usr/local/share/DSView/res")));
+        assert!(dsview.iter().any(|dir| dir.ends_with("opt/DSView/res")));
     }
 }

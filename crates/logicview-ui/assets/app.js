@@ -40,6 +40,7 @@ const state = {
   hoverText: "",
   hoverSequence: 0,
   hoverBounds: null,
+  hoverSnap: null,
   hoverX: null,
   hoverChannel: 0,
   hoverKey: null,
@@ -105,6 +106,8 @@ let hoverTimer = null;
 let pointer = null;
 let zoomAnchor = null;
 let zoomAnchorTimer = null;
+const touchPoints = new Map();
+let pinch = null;
 
 function view() {
   const id = state.active || "pending";
@@ -1003,6 +1006,13 @@ function memberMatches(member, item) {
 }
 
 let channelDrag = null;
+let suppressChannelClick = false;
+document.addEventListener("click", (ev) => {
+  if (!suppressChannelClick || !gutter.contains(ev.target)) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  suppressChannelClick = false;
+}, true);
 
 function channelKeyAt(clientY) {
   const nodes = [...gutter.querySelectorAll(".ch")];
@@ -1031,10 +1041,13 @@ function finishChannelDrag() {
   const drag = channelDrag;
   channelDrag = null;
   highlightChannel(null);
-  if (!drag.moved) selectOnly(drag.key);
+  if (drag.moved) {
+    suppressChannelClick = true;
+    setTimeout(() => { suppressChannelClick = false; }, 0);
+  } else if (drag.selectOnClick) selectOnly(drag.key);
 }
 
-function startChannelDrag(key, startY) {
+function startChannelDrag(key, startY, selectOnClick = true) {
   if (channelDrag) finishChannelDrag();
   const move = (e) => {
     if (!channelDrag) return;
@@ -1056,7 +1069,7 @@ function startChannelDrag(key, startY) {
     }
     finishChannelDrag();
   };
-  channelDrag = { key, startY, moved: false, move, up };
+  channelDrag = { key, startY, moved: false, move, up, selectOnClick };
   window.addEventListener("mousemove", move);
   window.addEventListener("mouseup", up);
   window.addEventListener("pointermove", move);
@@ -1183,6 +1196,21 @@ function foldSpacer() {
   return spacer;
 }
 
+// A container header is followed by its visible descendants until the next
+// row at the same or shallower depth. Folded groups therefore frame one row.
+function groupRanges(layout) {
+  const ranges = [];
+  for (let i = 0; i < layout.length; i++) {
+    const row = layout[i].row;
+    if (!row.header || !row.bus || row.bus.decode || (row.kind !== "group" && row.kind !== "bus")) continue;
+    const depth = row.depth || 0;
+    let end = i;
+    while (end + 1 < layout.length && (layout[end + 1].row.depth || 0) > depth) end++;
+    ranges.push({ start: i, end });
+  }
+  return ranges;
+}
+
 function renderGutter() {
   const metrics = rowMetrics();
   const selected = new Set(ensureSelection().selection);
@@ -1190,13 +1218,17 @@ function renderGutter() {
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
-  for (const item of metrics.layout) {
+  const ranges = groupRanges(metrics.layout);
+  for (const [index, item] of metrics.layout.entries()) {
     const row = item.row;
     const folded = rowFolded(row);
     const dim = state.hidden.has(row.key);
     const el = document.createElement("div");
     el.className = "ch" + (row.child ? " child" : "") + (selected.has(row.key) ? " selected" : "") + (dim ? " dim" : "");
     el.dataset.key = row.key;
+    if (ranges.some((range) => range.start <= index && index <= range.end)) el.classList.add("group-frame");
+    if (ranges.some((range) => range.start === index)) el.classList.add("group-frame-top");
+    if (ranges.some((range) => range.end === index)) el.classList.add("group-frame-bottom");
     if ((row.depth || 0) > 1) el.style.setProperty("--nest", ((row.depth - 1) * 14) + "px");
     el.style.height = item.height + "px";
     el.style.flex = "none";
@@ -1207,9 +1239,13 @@ function renderGutter() {
     el.style.setProperty("--channel-color", shown);
     bar.style.background = shown;
     bar.title = "Channel color";
+    if (row.kind === "logic" && signalName(row) !== row.name) {
+      bar.textContent = String(originalChannelNumber(row));
+      bar.classList.add("numbered");
+      bar.title = `Channel ${bar.textContent} color`;
+    }
     bar.addEventListener("mousedown", (ev) => {
       ev.preventDefault();
-      ev.stopPropagation();
     });
     bar.addEventListener("click", (ev) => {
       ev.preventDefault();
@@ -1220,9 +1256,8 @@ function renderGutter() {
     name.className = "name";
     name.textContent = signalName(row);
 
-    if (row.kind === "logic") {
+    if (row.kind === "logic" || ((row.kind === "group" || row.kind === "bus") && row.bus && !row.bus.decode)) {
       name.title = "Double-click to rename";
-      name.addEventListener("mousedown", (ev) => ev.stopPropagation());
       name.addEventListener("dblclick", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
@@ -1261,13 +1296,14 @@ function renderGutter() {
     if (foldable) el.append(bar, foldButton(row, folded), name, kind, eye, handle);
     else el.append(bar, name, kind, eye, handle);
     el.addEventListener("mousedown", (ev) => {
-      if (ev.button !== 0 || ev.target.closest("button, .row-resize, .bar")) return;
-      if (ev.shiftKey || ev.ctrlKey || ev.metaKey) {
+      if (ev.button !== 0 || ev.target.closest(".row-resize, input")) return;
+      const interactive = ev.target.closest("button, .bar");
+      if (!interactive && (ev.shiftKey || ev.ctrlKey || ev.metaKey)) {
         ev.preventDefault();
         applySelection(row.key, ev);
         return;
       }
-      startChannelDrag(row.key, ev.clientY);
+      startChannelDrag(row.key, ev.clientY, !interactive && !ev.target.closest(".name"));
     });
     el.addEventListener("contextmenu", (ev) => {
       ev.preventDefault();
@@ -1291,11 +1327,19 @@ function signalName(row) {
   return (names && names[row.key]) || row.name;
 }
 
+function originalChannelNumber(row) {
+  const probes = state.probes || [];
+  const probe = probeForRow(row);
+  if (probe) return localProbeIndex(probes, probe);
+  const physical = /(?:^|\s)D(\d+)$/i.exec(row.name || "");
+  return physical ? Number(physical[1]) : row.channel;
+}
+
 function startRename(row, nameEl) {
   const input = document.createElement("input");
   input.className = "rename";
   input.value = signalName(row);
-  input.setAttribute("aria-label", "Signal name");
+  input.setAttribute("aria-label", row.kind === "logic" ? "Signal name" : "Group name");
   nameEl.replaceWith(input);
   input.focus();
   input.select();
@@ -1306,11 +1350,17 @@ function startRename(row, nameEl) {
     if (commit) {
       const next = input.value.trim();
       const names = view().names || (view().names = {});
-      if (!next || next === row.name) delete names[row.key];
+      if (row.kind !== "logic" && row.bus && !row.bus.decode) {
+        if (next) {
+          row.bus.name = next;
+          delete names[row.key];
+        }
+      } else if (!next || next === row.name) delete names[row.key];
       else names[row.key] = next;
     }
     state.gutterSig = "";
     renderGutter();
+    if (row.kind !== "logic") drawWave();
   };
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
@@ -1544,7 +1594,21 @@ function drawRuler() {
     ctx.fillStyle = "#9aa6b8";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "center";
-    ctx.textBaseline = "top";
+    ctx.textBaseline = "middle";
+    // Short subdivisions make the scale readable between labeled divisions.
+    const minorStep = step / 5;
+    const firstMinor = Math.ceil(startSec / minorStep);
+    const lastMinor = Math.floor((startSec + span) / minorStep);
+    if (minorStep / span * w >= 4) {
+      ctx.strokeStyle = "#3a4658";
+      ctx.beginPath();
+      for (let i = firstMinor; i <= lastMinor; i++) {
+        const x = ((i * minorStep * state.rate + triggerOrigin()) - v.start) / v.spp;
+        ctx.moveTo(x + 0.5, h - 4);
+        ctx.lineTo(x + 0.5, h);
+      }
+      ctx.stroke();
+    }
     let lastLabel = -Infinity;
     for (let t = first; t < startSec + span + step * 0.01; t += step) {
       const x = ((t * state.rate + triggerOrigin()) - v.start) / v.spp;
@@ -1555,7 +1619,7 @@ function drawRuler() {
       ctx.lineTo(x + 0.5, h);
       ctx.stroke();
       if (x - lastLabel < 72) continue;
-      ctx.fillText(formatRulerTick(t, step), x, 3);
+      ctx.fillText(formatRulerTick(t, step), x, (h - 7) / 2);
       lastLabel = x;
     }
   }
@@ -1591,6 +1655,7 @@ function wavePalette() {
       bgAlt: "#e6dcc8",
       ink: "#243140",
       grid: "rgba(36, 49, 64, 0.12)",
+      groupBorder: "#526275",
       timeGrid: "rgba(36, 72, 110, 0.18)",
       logicGuide: "rgba(36, 49, 64, 0.16)",
       analogGuide: "rgba(36, 49, 64, 0.22)",
@@ -1606,6 +1671,7 @@ function wavePalette() {
     bgAlt: "#141b24",
     ink: "#d5deea",
     grid: "rgba(255,255,255,0.045)",
+    groupBorder: "#718198",
     timeGrid: "rgba(86, 140, 190, 0.16)",
     logicGuide: "rgba(140, 170, 200, 0.14)",
     analogGuide: "rgba(140, 170, 200, 0.18)",
@@ -1684,6 +1750,7 @@ function drawWave() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("Click Run to capture data", w / 2, h / 2);
+    drawGroupBorders(ctx, w, layout, palette);
     return;
   }
   drawGrid(ctx, w, h, layout, palette);
@@ -1720,8 +1787,10 @@ function drawWave() {
     ctx.fillText("H", 8, top + pad);
     ctx.fillText("L", 8, top + item.height - pad);
   }
+  drawGroupBorders(ctx, w, layout, palette);
   drawMeasureSpan(ctx, w, h);
   drawHoverBoundaries(ctx, w, layout);
+  drawHoverSnap(ctx, layout);
   drawMarkerLines(ctx, h);
   if (pointer && pointer.kind === "cursors") {
     const v = view();
@@ -1740,10 +1809,47 @@ function drawWave() {
   if (state.hoverX != null) {
     ctx.strokeStyle = palette.hover;
     ctx.beginPath();
-    ctx.moveTo(state.hoverX + 0.5, 0);
-    ctx.lineTo(state.hoverX + 0.5, h);
+    const x = state.hoverSnap ? sampleX(state.hoverSnap.sample) : state.hoverX;
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, h);
     ctx.stroke();
   }
+}
+
+// Highlight the exact logic transition selected by the hover cursor.
+function drawHoverSnap(ctx, layout) {
+  const snap = state.hoverSnap;
+  if (!snap) return;
+  const item = layout.find((entry) => entry.row.key === snap.key);
+  if (!item || !["logic", "bus", "decode", "condense"].includes(item.row.kind)) return;
+  const pad = Math.max(8, item.height * 0.22);
+  const x = sampleX(snap.sample);
+  ctx.save();
+  ctx.strokeStyle = "#ffca5e";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, item.top + pad);
+  ctx.lineTo(x, item.top + item.height - pad);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawGroupBorders(ctx, width, layout, palette) {
+  ctx.save();
+  ctx.strokeStyle = palette.groupBorder;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const range of groupRanges(layout)) {
+    const top = layout[range.start].top;
+    const last = layout[range.end];
+    const bottom = last.top + last.height;
+    ctx.moveTo(0, top + 1);
+    ctx.lineTo(width, top + 1);
+    ctx.moveTo(0, bottom - 1);
+    ctx.lineTo(width, bottom - 1);
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 // Temporary dimension lines connect the exact boundaries used by the hover values.
@@ -1981,6 +2087,9 @@ function rowKindLabel(row) {
 
 function valueAnnotations(decoder) {
   const rows = (state.waveformAnnotations || []).filter((row) => row.decoder === decoder.id);
+  // WS281x also emits overlapping per-bit and full-color annotations for the
+  // decode table. Waveform value views show only its eight-bit data chunks.
+  if (decoder.protocol === "rgb_led_ws281x") return rows.filter((row) => row.class === "byte");
   const values = rows.filter((row) => !FRAME_CLASS.has(row.class));
   return values.length ? values : rows;
 }
@@ -2009,8 +2118,10 @@ function dataLineTargets(decoder) {
   const specs = decoderLaneSpecs(decoder);
   if (specs.length) return specs.map((lane) => ({
     channel: channels[lane.channel], lane: lane.id,
-    label: (row) => lane.value_field && row.fields?.[lane.value_field] != null
-      ? "0x" + row.fields[lane.value_field] : text(row),
+    label: (row) => decoder.protocol === "rgb_led_ws281x"
+      ? laneLabel(row, decodeFormat(decoder.id), lane.id, decoder)
+      : lane.value_field && row.fields?.[lane.value_field] != null
+        ? "0x" + row.fields[lane.value_field] : text(row),
   }));
   if (decoder.protocol === "i2c") return [{ channel: channels.sda, label: text }];
   if (decoder.protocol === "uart") return [{ channel: channels.rx, label: text }];
@@ -2051,7 +2162,23 @@ function traceHexagon(ctx, x, y, w, h) {
   ctx.closePath();
 }
 
-function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
+function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha, dataRow = false) {
+  if (dataRow) {
+    const spans = rows.map((row) => [sampleX(row.start_sample), Math.max(sampleX(row.start_sample) + 2, sampleX(row.end_sample))])
+      .filter(([start, end]) => end >= 0 && start <= canvasW).sort((a, b) => a[0] - b[0]);
+    ctx.save();
+    ctx.strokeStyle = traceColor(color || "#3d8dfd");
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    let end = 0;
+    for (const [start, finish] of spans) {
+      if (start > end) { ctx.moveTo(end, (top + bottom) / 2); ctx.lineTo(start, (top + bottom) / 2); }
+      end = Math.max(end, finish);
+    }
+    if (end < canvasW) { ctx.moveTo(end, (top + bottom) / 2); ctx.lineTo(canvasW, (top + bottom) / 2); }
+    ctx.stroke();
+    ctx.restore();
+  }
   const height = Math.max(12, bottom - top);
   let lastLabel = -1;
   ctx.lineWidth = 1.25;
@@ -2078,7 +2205,8 @@ function drawHexagons(ctx, rows, top, bottom, color, canvasW, labelOf, alpha) {
     ctx.rect(x0 + point, top, Math.max(0, width - point * 2), height);
     ctx.clip();
     ctx.fillStyle = lightTheme() && (alpha == null || alpha < 0.7) ? wavePalette().ink : "#f7fafc";
-    ctx.fillText(label, x0 + point + 4, top + height / 2);
+    ctx.textAlign = dataRow ? "center" : "left";
+    ctx.fillText(label, dataRow ? x0 + width / 2 : x0 + point + 4, top + height / 2);
     ctx.restore();
     lastLabel = x0 + Math.min(width, ctx.measureText(label).width + point + 10);
   }
@@ -2119,12 +2247,12 @@ function annotationNumbers(row) {
   return [];
 }
 
-function formatDecoded(value, format) {
+function formatDecoded(value, format, bitWidth = 8) {
   const n = value;
   if (format === "dec") return String(n);
-  if (format === "bin") return n.toString(2).padStart(8, "0");
+  if (format === "bin") return n.toString(2).padStart(bitWidth, "0");
   if (format === "oct") return n.toString(8);
-  return "0x" + n.toString(16).toUpperCase().padStart(2, "0");
+  return "0x" + n.toString(16).toUpperCase().padStart(Math.ceil(bitWidth / 4), "0");
 }
 
 function condensedLabel(row, format) {
@@ -2136,7 +2264,7 @@ function laneLabel(row, format, lane, decoder) {
   const raw = laneValue(row, decoder, lane);
   if (raw == null || raw === "") return annotationLabel(row);
   const value = /^[0-9a-f]+$/i.test(String(raw)) ? parseInt(raw, 16) : NaN;
-  return Number.isFinite(value) ? formatDecoded(value, format) : String(raw);
+  return Number.isFinite(value) ? formatDecoded(value, format, decoder.protocol === "rgb_led_ws281x" ? String(raw).length * 4 : 8) : String(raw);
 }
 
 function drawStepSeries(ctx, rows, top, bot, color, valueOf) {
@@ -2198,7 +2326,7 @@ function drawCondensedRows(ctx, canvasW, layout) {
     const hexH = Math.min(48, Math.max(16, bandBot - bandTop));
     const mid = (bandTop + bandBot) / 2;
     const labelOf = item.row.lane ? (row) => laneLabel(row, format, item.row.lane, decoder) : (row) => condensedLabel(row, format);
-    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82);
+    drawHexagons(ctx, rows, mid - hexH / 2, mid + hexH / 2, traceColor(item.row.color), canvasW, labelOf, 0.82, true);
   }
 }
 
@@ -2485,7 +2613,7 @@ function drawBuses(ctx, layout) {
     ctx.font = "12px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82);
+    drawHexagons(ctx, runs, mid - hexH / 2, mid + hexH / 2, color, canvasW, (run) => formatBusValue(run.value, bus.radix || "hex", run.bits), 0.82, true);
   }
 }
 
@@ -2569,11 +2697,13 @@ function tileRequests() {
 
 async function fetchTiles() {
   const requests = tileRequests();
-  const width = Math.max(1, Math.floor(wave.clientWidth || 1));
+  const viewWidth = Math.max(1, Math.floor(wave.clientWidth || 1));
+  const width = Math.min(8192, viewWidth * 2);
   const v = view();
   const req = ++state.req;
   const spp = Math.max(v.spp, 1e-9);
-  const start = v.start;
+  const viewStart = v.start;
+  const start = Math.max(0, viewStart - Math.floor((width - viewWidth) / 2) * spp);
   if (requests.length === 0) {
     state.tiles = {};
     drawWave();
@@ -2619,7 +2749,7 @@ async function fetchTiles() {
   if (state.req !== req) return;
   const now = view();
   const widthNow = Math.max(1, Math.floor(wave.clientWidth || 1));
-  if (now.spp !== spp || widthNow !== width) {
+  if (now.spp !== spp || widthNow !== viewWidth) {
     tileAgain = true;
     return;
   }
@@ -2645,7 +2775,13 @@ async function fetchTiles() {
       }
     }
   }
-  if (now.start !== start) tileAgain = true;
+  if (now.start !== viewStart && !tileCoversView(state.tileView, now.start, now.spp, widthNow)) tileAgain = true;
+}
+
+function tileCoversView(tile, start, spp, width) {
+  if (!tile || tile.spp !== spp) return false;
+  const epsilon = spp * 1e-6;
+  return start >= tile.start - epsilon && start + width * spp <= tile.start + tile.width * tile.spp + epsilon;
 }
 
 function tileOverlap(tile, viewStart, viewSpp, viewWidth) {
@@ -2790,7 +2926,7 @@ async function runCapture() {
   state.error = null;
   paintStatus();
   try {
-    view().userNavigated = false;
+    view().userNavigated = true;
     state.captureStarted = performance.now();
     state.planned = samplesForDuration(settings.durationNs, settings.rate);
     const status = await api({
@@ -3989,9 +4125,50 @@ function placeDeviceSubmenu() {
   row.classList.toggle("flip", rect.right + 196 > window.innerWidth);
 }
 
-async function loadDeviceChoices() {
+let deviceScanInFlight = false;
+let deviceSelectionReady = false;
+let deviceChoiceInFlight = false;
+let pendingAttachedPod = null;
+
+async function reconcileDeviceSelection(previous, devices) {
+  if (!deviceSelectionReady) return;
+  const hardware = devices.filter((device) => device.kind === "usb");
+  const previousHardware = previous.filter((device) => device.kind === "usb");
+  if (hardware.length === 1 && previousHardware.length === 0) pendingAttachedPod = hardware[0].id;
+  if (hardware.length !== 1 || !hardware.some((device) => device.id === pendingAttachedPod)) pendingAttachedPod = null;
+  if (isLive(state.phase) || commandBusy || deviceChoiceInFlight) return;
+
+  const selected = state.devices || [];
+  const missing = selected.some((device) => device.kind === "usb" && !hardware.some((pod) => pod.id === device.id));
+  const demoSelected = selected.length > 0 && selected.every((device) => device.kind === "demo");
+  if (!missing && !(demoSelected && pendingAttachedPod)) return;
+
+  deviceChoiceInFlight = true;
+  try {
+    const profiles = state.profiles.length ? state.profiles : await api({ cmd: "list_profiles" });
+    if (isLive(state.phase) || commandBusy) return;
+    const usable = hardware.filter((device) => profiles.some((profile) => profile.id === device.id && profile.hardware_tested));
+    const choices = missing ? [...usable.map((device) => device.id), "demo"] : usable.filter((device) => device.id === pendingAttachedPod).map((device) => device.id);
+    for (const id of choices) {
+      try {
+        await useDevice(id);
+        pendingAttachedPod = null;
+        return;
+      } catch (err) {
+        statusEl.textContent = `Could not select ${id}: ${err.message}`;
+      }
+    }
+    if (!missing) pendingAttachedPod = null;
+  } finally { deviceChoiceInFlight = false; }
+}
+
+async function refreshDeviceList() {
+  if (deviceScanInFlight) return;
+  deviceScanInFlight = true;
   try {
     const devices = await api({ cmd: "list_devices" });
+    const previous = state.deviceList;
+    const changed = JSON.stringify(devices) !== JSON.stringify(previous);
     state.deviceList = devices;
     const hardware = devices.filter((device) => device.kind !== "demo");
     const plugged = document.getElementById("plugged-in");
@@ -4001,6 +4178,16 @@ async function loadDeviceChoices() {
         : "No DreamSourceLab pod is plugged in.";
     }
     syncDeviceSelect();
+    const menu = document.getElementById("device-menu");
+    if (changed && menu && !menu.classList.contains("hidden")) renderDeviceMenu();
+    await reconcileDeviceSelection(previous, devices);
+  } catch (_) { /* Keep the last successful scan until the next retry. */ }
+  finally { deviceScanInFlight = false; }
+}
+
+async function loadDeviceChoices() {
+  await refreshDeviceList();
+  try {
     api({ cmd: "list_profiles" }).then((profiles) => {
       state.profiles = profiles;
       const note = document.getElementById("profile-note");
@@ -4019,7 +4206,9 @@ async function loadDeviceChoices() {
 
 async function applyDeviceChoice(value) {
   const ids = value.split("+").filter(Boolean);
-  if (!ids.length) return;
+  if (!ids.length || deviceChoiceInFlight) return;
+  pendingAttachedPod = null;
+  deviceChoiceInFlight = true;
   try {
     if (ids.some((id) => id.startsWith("usb:"))) {
       // Fetch the authoritative status before opening, even if the background
@@ -4030,6 +4219,7 @@ async function applyDeviceChoice(value) {
         if (!profile || !profile.hardware_tested) {
           const device = state.deviceList.find((item) => item.id === id);
           window.alert(`${profile?.name || device?.name || id}: support has not been tested in hardware.`);
+          return;
         }
       }
     }
@@ -4044,7 +4234,12 @@ async function applyDeviceChoice(value) {
   } catch (err) {
     statusEl.textContent = err.message;
     syncDeviceSelect();
-  }
+    // USB open failures used to look like the chip "snapped back" to Demo with
+    // only a status-line hint. Surface the reason in a dialog.
+    if (ids.some((id) => id.startsWith("usb:"))) {
+      window.alert(err.message || "Could not open the selected USB device.");
+    }
+  } finally { deviceChoiceInFlight = false; }
 }
 
 async function useDevice(id) {
@@ -4344,18 +4539,27 @@ function renderDecoderList() {
 
 let waveformAnnotationTimer = null;
 let waveformAnnotationRequest = 0;
+let waveformAnnotationRange = null;
 
-function scheduleWaveformAnnotations() {
+function scheduleWaveformAnnotations(panning = false) {
+  const v = view();
+  const visibleStart = Math.max(0, Math.floor(v.start));
+  const visibleEnd = Math.max(visibleStart + 1, Math.ceil(v.start + Math.max(1, wave.clientWidth) * v.spp));
+  const range = waveformAnnotationRange;
+  if (panning && range && range.session === state.active && range.spp === v.spp &&
+      range.start <= visibleStart && range.end >= visibleEnd) return;
   const request = ++waveformAnnotationRequest;
   clearTimeout(waveformAnnotationTimer);
   if (!state.active || !state.total || !state.decoders.length) {
     state.waveformAnnotations = [];
+    waveformAnnotationRange = null;
     return;
   }
   const session = state.active;
-  const v = view();
-  const start = Math.max(0, Math.floor(v.start));
-  const end = Math.max(start + 1, Math.ceil(v.start + Math.max(1, wave.clientWidth) * v.spp));
+  const margin = panning ? visibleEnd - visibleStart : 0;
+  const start = Math.max(0, visibleStart - margin);
+  const end = Math.min(state.total, visibleEnd + margin);
+  waveformAnnotationRange = { session, spp: v.spp, start, end };
   const decoders = state.decoders.map((decoder) => decoder.id);
   waveformAnnotationTimer = setTimeout(async () => {
     try {
@@ -4373,9 +4577,9 @@ function scheduleWaveformAnnotations() {
       state.waveformAnnotations = pages.flat();
       drawWave();
     } catch (err) {
-      if (request === waveformAnnotationRequest) statusEl.textContent = err.message;
+      if (request === waveformAnnotationRequest) { waveformAnnotationRange = null; statusEl.textContent = err.message; }
     }
-  }, 100);
+  }, panning ? 30 : 100);
 }
 
 async function loadAnnotations() {
@@ -4458,6 +4662,7 @@ function centerOn(sample) {
 
 function hoverSample() {
   if (state.hoverX == null || state.total <= 0) return 0;
+  if (state.hoverSnap) return state.hoverSnap.sample;
   return Math.min(state.total - 1, Math.max(0, Math.floor(view().start + state.hoverX * view().spp)));
 }
 
@@ -4486,7 +4691,7 @@ function placeEdgeButtons(clientY) {
   const next = document.getElementById("edge-next");
   const stage = document.querySelector(".wave-stage");
   const row = rowAt(clientY);
-  if (!prev || !next || !stage || !row || row.kind !== "logic" || state.total <= 0) {
+  if (!prev || !next || !stage || !row || !["logic", "bus", "decode", "condense"].includes(row.kind) || state.total <= 0) {
     hideEdgeButtons();
     return;
   }
@@ -4501,6 +4706,7 @@ function placeEdgeButtons(clientY) {
     return;
   }
   state.edgeChannel = row.channel;
+  state.edgeRow = row;
   prev.style.top = mid + "px";
   next.style.top = mid + "px";
   prev.classList.remove("hidden");
@@ -4509,6 +4715,7 @@ function placeEdgeButtons(clientY) {
 
 function hideEdgeButtons() {
   state.edgeChannel = null;
+  state.edgeRow = null;
   document.getElementById("edge-prev")?.classList.add("hidden");
   document.getElementById("edge-next")?.classList.add("hidden");
 }
@@ -4580,6 +4787,47 @@ async function stepEdge(forward, channel) {
     const sample = hits.reduce((best, sample) => (Math.abs(sample - from) < Math.abs(best - from) ? sample : best));
     centerOn(sample);
     statusEl.textContent = `edge at ${sample} on channel ${channel}`;
+  } catch (err) {
+    statusEl.textContent = err.message;
+  }
+}
+
+async function stepDataChange(forward, row) {
+  if (!row || row.kind === "logic") return stepEdge(forward, row?.channel);
+  const from = state.hoverX == null
+    ? Math.floor(view().start + wave.clientWidth * view().spp * 0.5)
+    : hoverSample();
+  const session = state.active;
+  try {
+    let hits = [];
+    if (row.kind === "bus" && !row.bus.decode) {
+      const channels = [...new Set(descendantChannels(row.bus))];
+      const results = await Promise.all(channels.flatMap((channel) => [true, false].map((rising) =>
+        api({ cmd: "search_edge", session, channel, from, rising, forward }))));
+      hits = results.map((result) => result.sample).filter((sample) => sample != null);
+    } else {
+      const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+      if (!decoder) return;
+      let offset = 0;
+      const rows = [];
+      for (;;) {
+        const page = await api({ cmd: "read_annotations", session, decoder: row.decoderId, offset, limit: 5000 });
+        rows.push(...page);
+        if (page.length < 5000) break;
+        offset += page.length;
+      }
+      if (state.active !== session) return;
+      const values = decoder.protocol === "rgb_led_ws281x" ? rows.filter((item) => item.class === "byte") : (() => {
+        const filtered = rows.filter((item) => !FRAME_CLASS.has(item.class));
+        return filtered.length ? filtered : rows;
+      })();
+      hits = laneAnnotations(values, row.lane, decoder).flatMap((item) => [item.start_sample, item.end_sample])
+        .filter((sample) => forward ? sample > from && sample < state.total : sample < from);
+    }
+    if (!hits.length) { statusEl.textContent = "no data change"; return; }
+    const sample = hits.reduce((best, hit) => forward ? Math.min(best, hit) : Math.max(best, hit));
+    centerOn(sample);
+    statusEl.textContent = `data change at ${sample}`;
   } catch (err) {
     statusEl.textContent = err.message;
   }
@@ -5048,16 +5296,30 @@ function channelSpecByIndex(index) {
   return channel ? channelSpec(channel) : String(index);
 }
 
-function saveSetup() {
-  openSaveDialog({
-    title: "Save setup",
-    note: "Channel layout, colors, cursors, and decoders. This file does not include samples.",
-    filename: "setup.lvsetup",
-    ext: ".lvsetup",
-    mime: "application/json",
-    picker: { description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] } },
-    produce: () => JSON.stringify(setupDocument(), null, 2),
-  });
+async function saveSetup() {
+  const setup = setupDocument();
+  try {
+    if (window.ipc) {
+      const path = await pickSaveFile("setup");
+      if (!path) { statusEl.textContent = "save cancelled"; return; }
+      const response = await fetch("/api/save-setup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path, setup }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok || !json.ok) throw new Error(json.error || "save failed");
+      statusEl.textContent = "saved " + (json.path || path);
+      return;
+    }
+    const blob = new Blob([JSON.stringify(setup, null, 2)], { type: "application/json" });
+    const wrote = await writeChosenFile("setup.lvsetup", blob, {
+      description: "LogicView setup", accept: { "application/json": [".lvsetup", ".json"] },
+    });
+    statusEl.textContent = wrote === "cancel" ? "save cancelled" : "saved " + wrote;
+  } catch (err) {
+    statusEl.textContent = err.message || "save failed";
+  }
 }
 
 async function openSetupFile(file) {
@@ -5457,6 +5719,7 @@ function placeMarker(sample, channel) {
 }
 
 async function snapMarker(marker, clientX, clientY) {
+  if (preferences.edge_snap === false) return;
   const row = rowAt(clientY);
   const channel = row && row.kind === "logic" ? row.channel : (marker.channel ?? activeLogicChannel());
   try {
@@ -5510,7 +5773,8 @@ wave.addEventListener("wheel", (ev) => {
   zoomAnchorTimer = setTimeout(() => {
     zoomAnchor = null;
   }, 300);
-  stepZoom(ev.deltaY > 0, zoomAnchor);
+  if (ev.ctrlKey) zoomAt(zoomAnchor.sample, zoomAnchor.x, Math.exp(ev.deltaY * 0.01));
+  else stepZoom(ev.deltaY > 0, zoomAnchor);
 }, { passive: false });
 
 function currentTimebaseIndex() {
@@ -5536,12 +5800,13 @@ function stepZoom(out, anchor) {
 function zoomAt(sample, x, factor) {
   const v = view();
   const width = Math.max(1, wave.clientWidth);
-  const minSpp = 1 / 32;
+  const minSpp = TIME_DIVS[0] * Math.max(1, state.rate) / Math.max(40, width / 10);
   const maxSpp = state.total > 0 ? state.total / width : minSpp;
   const before = v.spp;
   v.spp = Math.min(maxSpp, Math.max(minSpp, before * factor));
-  if (v.spp === before) return;
-  v.start = sample - x * v.spp;
+  const start = sample - x * v.spp;
+  if (v.spp === before && v.start === start) return;
+  v.start = start;
   v.userNavigated = true;
   clampView();
   scheduleTiles();
@@ -5552,6 +5817,17 @@ function zoomAt(sample, x, factor) {
 }
 
 wave.addEventListener("pointerdown", (ev) => {
+  if (ev.pointerType === "touch") {
+    if (state.total <= 0) return;
+    touchPoints.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    wave.setPointerCapture(ev.pointerId);
+    if (touchPoints.size === 2) {
+      const [a, b] = [...touchPoints.values()];
+      const x = (a.x + b.x) / 2 - wave.getBoundingClientRect().left;
+      pinch = { distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), sample: view().start + x * view().spp };
+    }
+    return;
+  }
   if (ev.button !== 0) return;
   if (state.total <= 0) return;
   const rect = wave.getBoundingClientRect();
@@ -5578,20 +5854,23 @@ wave.addEventListener("pointerdown", (ev) => {
     return;
   }
   if (state.tool === "measure") {
-    const sample = sampleAt(ev.clientX);
     const row = rowAt(ev.clientY);
+    const sample = state.hoverSnap && row && state.hoverSnap.key === row.key
+      ? state.hoverSnap.sample : sampleAt(ev.clientX);
     pointer = {
       kind: "measure",
       a: sample,
       b: sample,
       x: ev.clientX,
       channel: row && row.kind === "logic" ? row.channel : activeLogicChannel(),
+      row,
     };
     wave.setPointerCapture(ev.pointerId);
     drawWave();
     return;
   }
   pointer = { kind: "pan", x: ev.clientX, start: view().start };
+  hideHover();
   wave.setPointerCapture(ev.pointerId);
 });
 
@@ -5607,7 +5886,39 @@ function scheduleViewPaint() {
   });
 }
 
+let measureSnapTimer = null;
+let measureSnapSequence = 0;
+function queueMeasureSnap(active, sample, ev) {
+  const sequence = ++measureSnapSequence;
+  clearTimeout(measureSnapTimer);
+  if (preferences.edge_snap === false) { active.b = sample; return; }
+  const position = { clientX: ev.clientX, clientY: ev.clientY };
+  const session = state.active;
+  measureSnapTimer = setTimeout(async () => {
+    try {
+      const result = await nearestRowEdge(active.row || { kind: "logic", channel: active.channel }, sample, session);
+      if (pointer !== active || session !== state.active || sequence !== measureSnapSequence) return;
+      active.b = typeof result.sample === "number" ? result.sample : sample;
+      drawWave();
+      const seconds = Math.abs(active.b - active.a) / Math.max(1, state.rate);
+      showHover(position, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(active.b - active.a)} samples`);
+    } catch (_) { /* Keep the last selected edge until a lookup succeeds. */ }
+  }, 40);
+}
+
 wave.addEventListener("pointermove", (ev) => {
+  if (ev.pointerType === "touch") {
+    if (!touchPoints.has(ev.pointerId)) return;
+    touchPoints.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (pinch && touchPoints.size === 2) {
+      const [a, b] = [...touchPoints.values()];
+      const distance = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
+      const x = (a.x + b.x) / 2 - wave.getBoundingClientRect().left;
+      zoomAt(pinch.sample, x, pinch.distance / distance);
+      pinch.distance = distance;
+    }
+    return;
+  }
   const rect = wave.getBoundingClientRect();
   state.hoverX = ev.clientX - rect.left;
   if (pointer && pointer.kind === "pan") {
@@ -5615,9 +5926,14 @@ wave.addEventListener("pointermove", (ev) => {
     v.start = pointer.start - (ev.clientX - pointer.x) * v.spp;
     v.userNavigated = true;
     clampView();
-    scheduleTiles();
+    scheduleWaveformAnnotations(true);
+    const width = Math.max(1, Math.floor(wave.clientWidth || 1));
+    if (!tileCoversView(state.tileView, v.start, v.spp, width) &&
+        !(tileFlight && tileCoversView(state.pending, v.start, v.spp, width))) {
+      tileAgain = true;
+      if (!tileFlight) { tileFlight = true; runTiles(); }
+    }
     scheduleViewPaint();
-    hideHover();
     return;
   }
   if (pointer && pointer.kind === "marker") {
@@ -5635,25 +5951,44 @@ wave.addEventListener("pointermove", (ev) => {
     return;
   }
   if (pointer && pointer.kind === "measure") {
-    pointer.b = sampleAt(ev.clientX);
-    drawWave();
     if (ev.clientX < rect.left || ev.clientX >= rect.right || ev.clientY < rect.top || ev.clientY >= rect.bottom) {
+      measureSnapSequence += 1;
+      clearTimeout(measureSnapTimer);
       hideHover();
       return;
     }
+    queueMeasureSnap(pointer, sampleAt(ev.clientX), ev);
+    drawWave();
     const seconds = Math.abs(pointer.b - pointer.a) / Math.max(1, state.rate);
     showHover(ev, `measurement ${formatSeconds(seconds)}`, `<b>Measurement</b><br>${formatSeconds(seconds)}<br>${Math.abs(pointer.b - pointer.a)} samples`);
     return;
+  }
+  const hoveredRow = rowAt(ev.clientY);
+  if (state.hoverSnap && (!hoveredRow || hoveredRow.key !== state.hoverSnap.key)) {
+    state.hoverSnap = null;
   }
   placeEdgeButtons(ev.clientY);
   queueHover(ev);
   drawWave();
 });
 
+function endWaveTouch(ev) {
+  touchPoints.delete(ev.pointerId);
+  pinch = null;
+}
+wave.addEventListener("pointercancel", (ev) => {
+  if (ev.pointerType === "touch") endWaveTouch(ev);
+  else { pointer = null; measureSnapSequence += 1; clearTimeout(measureSnapTimer); }
+});
+
 wave.addEventListener("pointerup", async (ev) => {
+  if (ev.pointerType === "touch") { endWaveTouch(ev); return; }
   const active = pointer;
   pointer = null;
+  measureSnapSequence += 1;
+  clearTimeout(measureSnapTimer);
   if (!active) return;
+  if (active.kind === "measure") active.b = sampleAt(ev.clientX);
   if (active.kind === "cursors") {
     const channel = active.channel;
     if (Math.abs(active.b - active.a) < 2) placeMarker(active.a, channel);
@@ -5667,6 +6002,14 @@ wave.addEventListener("pointerup", async (ev) => {
   if (active.kind === "marker" && active.moved && !active.fresh) {
     await snapMarker(active.marker, ev.clientX, ev.clientY);
   } else if (active.kind === "measure" && active.a !== active.b) {
+    try {
+      const session = state.active;
+      const [a, b] = preferences.edge_snap === false ? [{}, {}] : await Promise.all([active.a, active.b].map((sample) =>
+        nearestRowEdge(active.row || { kind: "logic", channel: active.channel }, sample, session)));
+      if (session !== state.active) return;
+      if (typeof a.sample === "number") active.a = a.sample;
+      if (typeof b.sample === "number") active.b = b.sample;
+    } catch (_) { /* Keep the selected samples if edge lookup fails. */ }
     const span = {
       id: state.nextMeasure,
       n: state.nextMeasure,
@@ -5773,6 +6116,25 @@ function queueHover(ev) {
   }, 40);
 }
 
+async function nearestRowEdge(row, sample, session) {
+  if (row.kind === "logic") return api({ cmd: "nearest_edge", session, channel: row.channel, sample });
+  if (row.kind === "bus" && row.bus && !row.bus.decode) {
+    const channels = [...new Set(descendantChannels(row.bus))];
+    const edges = await Promise.all(channels.map((channel) => api({ cmd: "nearest_edge", session, channel, sample })));
+    const hits = edges.map((edge) => edge.sample).filter((hit) => typeof hit === "number");
+    return { sample: hits.length ? hits.reduce((best, hit) => Math.abs(hit - sample) < Math.abs(best - sample) ? hit : best) : null };
+  }
+  if (row.kind === "decode" || row.kind === "condense") {
+    const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+    if (!decoder) return { sample: null };
+    const spec = row.lane ? decoderLaneSpecs(decoder).find((item) => item.id === row.lane) : null;
+    if (row.lane && !spec) return { sample: null };
+    return api({ cmd: "nearest_annotation_boundary", session, decoder: row.decoderId, sample,
+      classes: spec ? spec.classes : null, value_field: spec?.value_field || null });
+  }
+  return { sample: null };
+}
+
 // A decoder row represents annotation spans, not a single physical channel.
 async function decodedHoverBounds(row, sample, session, sequence) {
   let offset = 0;
@@ -5781,8 +6143,11 @@ async function decodedHoverBounds(row, sample, session, sequence) {
     const page = await api({ cmd: "read_annotations", session, decoder: row.decoderId, start: sample, offset, limit: 5000 });
     if (sequence !== state.hoverSequence || session !== state.active || pointer) return null;
     for (const item of page) {
-      if (FRAME_CLASS.has(item.class)) continue;
-      if (row.lane && (!item.fields || item.fields[row.lane] == null)) continue;
+      const decoder = (state.decoders || []).find((entry) => entry.id === row.decoderId);
+      if (decoder?.protocol === "rgb_led_ws281x" ? item.class !== "byte" : FRAME_CLASS.has(item.class)) continue;
+      if (row.lane) {
+        if (decoder ? !laneAnnotations([item], row.lane, decoder).length : !item.fields || item.fields[row.lane] == null) continue;
+      }
       if (!current) {
         if (item.start_sample <= sample && sample < item.end_sample) current = item;
         else if (item.start_sample > sample) return null;
@@ -5827,7 +6192,7 @@ async function runHover(ev, sequence) {
     hideHover();
     return;
   }
-  const sample = Math.min(state.total - 1, Math.max(0, Math.floor(view().start + x * view().spp)));
+  let sample = Math.min(state.total - 1, Math.max(0, Math.floor(view().start + x * view().spp)));
   state.hoverKey = row.key;
   if (row.kind === "analog") {
     state.hoverBounds = null;
@@ -5843,12 +6208,31 @@ async function runHover(ev, sequence) {
     return;
   }
   try {
-    if (row.kind === "decode" || row.kind === "bus") {
-      const bounds = row.kind === "decode"
+    const originalSample = sample;
+    if (preferences.edge_snap !== false && ["logic", "bus", "decode", "condense"].includes(row.kind)) {
+      const edge = await nearestRowEdge(row, sample, session);
+      if (sequence !== state.hoverSequence || session !== state.active || pointer || preferences.edge_snap === false) return;
+      state.hoverSnap = typeof edge.sample === "number" ? { key: row.key, sample: edge.sample } : null;
+      if (state.hoverSnap) sample = state.hoverSnap.sample;
+      drawWave();
+    } else state.hoverSnap = null;
+    if (row.kind === "decode" || row.kind === "condense" || row.kind === "bus") {
+      let bounds = row.kind === "decode" || row.kind === "condense"
         ? await decodedHoverBounds(row, sample, session, sequence)
         : await busHoverBounds(row, sample, session);
+      if (!bounds && (row.kind === "decode" || row.kind === "condense") && sample > 0 && sample !== originalSample) {
+        bounds = await decodedHoverBounds(row, sample - 1, session, sequence);
+      }
       if (sequence !== state.hoverSequence || session !== state.active || pointer) return;
-      if (!bounds) { hideHover(); return; }
+      if (!bounds) {
+        if (!state.hoverSnap) { hideHover(); return; }
+        state.hoverBounds = null;
+        state.hoverText = "";
+        hoverEl.classList.add("hidden");
+        paintStatus();
+        drawWave();
+        return;
+      }
       const width = formatSeconds((bounds.end - bounds.start) / state.rate);
       const gap = bounds.next == null ? null : formatSeconds((bounds.next - bounds.end) / state.rate);
       state.lastMeasure = null;
@@ -5906,8 +6290,9 @@ function hideHover() {
   state.hoverEvent = null;
   if (hoverTimer) clearTimeout(hoverTimer);
   hoverTimer = null;
-  const hadBounds = !!state.hoverBounds;
+  const hadBounds = !!state.hoverBounds || !!state.hoverSnap;
   state.hoverBounds = null;
+  state.hoverSnap = null;
   state.hoverText = "";
   hoverEl.classList.add("hidden");
   paintStatus();
@@ -6162,6 +6547,7 @@ document.getElementById("run").addEventListener("contextmenu", (ev) => {
   else openRunMenu();
 });
 document.getElementById("stop").addEventListener("click", () => stopCapture());
+document.getElementById("wait-cancel").addEventListener("click", () => stopCapture());
 document.getElementById("tab-add").addEventListener("click", () => addSession());
 document.getElementById("device-select").addEventListener("click", (ev) => {
   ev.stopPropagation();
@@ -6201,11 +6587,11 @@ document.getElementById("trig-pre").addEventListener("change", (ev) => {
 });
 document.getElementById("edge-prev").addEventListener("click", (ev) => {
   ev.stopPropagation();
-  stepEdge(false, state.edgeChannel);
+  stepDataChange(false, state.edgeRow);
 });
 document.getElementById("edge-next").addEventListener("click", (ev) => {
   ev.stopPropagation();
-  stepEdge(true, state.edgeChannel);
+  stepDataChange(true, state.edgeRow);
 });
 const waveStage = document.querySelector(".wave-stage");
 let rowScrollLock = false;
@@ -6264,8 +6650,12 @@ document.addEventListener("click", (ev) => {
   if (!ev.target.closest("#device-acq-menu")) closeDeviceAcqMenu();
   if (!ev.target.closest("#bus-menu")) closeBusMenu();
   if (!ev.target.closest("#run-menu") && !ev.target.closest("#run")) closeRunMenu();
-  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
 });
+
+// Run before other controls can stop the click from reaching document.
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest("#color-flyout") && !ev.target.closest(".ch .bar")) closeColorFlyout();
+}, true);
 
 let menuDismissTimer = 0;
 let menuDismissGroup = "";
@@ -6414,6 +6804,8 @@ window.addEventListener("resize", () => {
   refreshOverview();
 });
 
+setInterval(refreshDeviceList, 2000);
+
 setInterval(async () => {
   if (!isLive(state.phase) || !state.active) return;
   try {
@@ -6493,7 +6885,7 @@ function paintWait() {
   const buffer = settings.depth !== "stream";
   const waiting = state.phase === "waiting_trigger";
   const sampling = buffer && (state.phase === "running" || state.phase === "arming") && state.planned > 0 && state.total < state.planned;
-  if (state.waitKind === "waiting" && !waiting && (state.phase === "running" || state.phase === "stopped")) {
+  if (state.waitKind === "waiting" && state.phase === "running") {
     showTriggered();
     return;
   }
@@ -7073,7 +7465,7 @@ function closeDecodeConfig() {
   document.getElementById("decode-config").classList.add("hidden");
 }
 
-let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "" };
+let preferences = { firmware_dir: "", scripts_dir: "", theme: "system", export_dir: "", edge_snap: true };
 let exportDirTimer = null;
 let exportDirSave = 0;
 
@@ -7127,6 +7519,7 @@ async function loadPreferences() {
 document.getElementById("preferences-open").addEventListener("click", () => {
   document.getElementById("preferences-firmware").value = preferences.firmware_dir;
   document.getElementById("preferences-scripts").value = preferences.scripts_dir;
+  document.getElementById("preferences-edge-snap").checked = preferences.edge_snap !== false;
   const theme = document.querySelector(`input[name="preferences-theme"][value="${preferences.theme}"]`);
   if (theme) theme.checked = true;
   document.getElementById("preferences-error").textContent = "";
@@ -7136,11 +7529,12 @@ document.getElementById("preferences-cancel").addEventListener("click", () => do
 document.getElementById("preferences-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const next = { firmware_dir: document.getElementById("preferences-firmware").value.trim(),
-    scripts_dir: document.getElementById("preferences-scripts").value.trim(), theme: document.querySelector('input[name="preferences-theme"]:checked').value };
+    scripts_dir: document.getElementById("preferences-scripts").value.trim(), edge_snap: document.getElementById("preferences-edge-snap").checked, theme: document.querySelector('input[name="preferences-theme"]:checked').value };
   try {
     const response = await fetch("/api/preferences", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(next) });
     if (!response.ok) throw new Error(await response.text());
     preferences = await response.json();
+    if (!preferences.edge_snap) { state.hoverSnap = null; state.hoverSequence += 1; }
     applyTheme();
     await loadDecoderCatalog();
     if (state.tab === "decode") selectTab("decode");
@@ -7292,8 +7686,14 @@ async function boot() {
   const pod = state.deviceList.find((device) => device.kind === "usb" && profiles.some((profile) => profile.id === device.id && profile.hardware_tested));
   if (pod && !(state.devices || []).some((device) => device.id === pod.id)) {
     try { await useDevice(pod.id); }
-    catch (err) { statusEl.textContent = `Could not open ${pod.name}: ${err.message}`; }
+    catch (err) {
+      const message = `Could not open ${pod.name}: ${err.message}`;
+      statusEl.textContent = message;
+      // Keep Demo selected, but explain why auto-connect did not stick.
+      window.alert(message);
+    }
   }
+  deviceSelectionReady = true;
   connectSocket();
   drawWave();
   syncTimebaseLabel();

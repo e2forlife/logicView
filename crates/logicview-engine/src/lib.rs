@@ -361,25 +361,36 @@ impl Engine {
 
     /// Discovers connected USB devices and available demos, presenting physical hardware first.
     pub async fn list_devices(&self) -> Vec<DeviceInfo> {
+        match self.try_list_devices().await {
+            Ok(devices) => devices,
+            Err(err) => {
+                tracing::warn!("USB scan failed: {err}");
+                logicview_capture::demo_pods()
+                    .iter()
+                    .map(|pod| demo_device_info(pod.id))
+                    .collect()
+            }
+        }
+    }
+
+    /// Reports USB scan failures so callers can retain the last known device list.
+    pub async fn try_list_devices(&self) -> Result<Vec<DeviceInfo>, EngineError> {
         let mut devices: Vec<DeviceInfo> = logicview_capture::demo_pods()
             .iter()
             .map(|pod| demo_device_info(pod.id))
             .collect();
-        match logicview_hal::list_pods() {
-            Ok(pods) => {
-                for pod in pods {
-                    devices.push(DeviceInfo {
-                        id: pod.id,
-                        name: pod.name,
-                        kind: "usb".into(),
-                        connected: true,
-                        super_speed: pod.super_speed,
-                    });
-                }
-            }
-            Err(err) => tracing::warn!("USB scan failed: {err}"),
+        let pods = logicview_hal::list_pods()
+            .map_err(|err| EngineError::Device(format!("USB scan failed: {err}")))?;
+        for pod in pods {
+            devices.push(DeviceInfo {
+                id: pod.id,
+                name: pod.name,
+                kind: "usb".into(),
+                connected: true,
+                super_speed: pod.super_speed,
+            });
         }
-        hardware_before_demo(devices)
+        Ok(hardware_before_demo(devices))
     }
 
     /// Selects a demo or opens a verified hardware model and installs its channels in the active
@@ -432,7 +443,7 @@ impl Engine {
                 (1u32 << profile.channels) - 1
             };
             self.use_pod_channels(mask, id, &profile.name, super_speed)
-                .await;
+                .await?;
             return Ok(info);
         }
         Err(EngineError::UnknownDevice(format!(
@@ -998,6 +1009,9 @@ impl Engine {
             if slot.catalog_names.is_empty() {
                 remember_catalog(slot);
             }
+            if config.trigger_enabled && mode == StartMode::Normal {
+                slot.session.phase = Phase::WaitingTrigger;
+            }
             let (names, colors) = pod_channel_style(mask);
             slot.origins = names
                 .iter()
@@ -1035,12 +1049,7 @@ impl Engine {
                 Duration::from_millis(config.repeat_interval_ms),
                 config.discard_on_stop,
                 config.run == RunPolicy::Loop,
-                if config.depth == DepthMode::Stream {
-                    Duration::from_secs(3)
-                } else {
-                    let secs = samples / config.sample_rate_hz.max(1) + 3;
-                    Duration::from_secs(secs.min(120))
-                },
+                usb_header_wait(&config, mode, samples),
                 Some(pid),
             )
         };
@@ -1115,7 +1124,7 @@ impl Engine {
                 stop,
                 samples,
                 jobs,
-                Duration::from_secs(secs.min(120)),
+                Some(Duration::from_secs(secs.min(120))),
                 discard,
             )
         };
@@ -1491,35 +1500,39 @@ impl Engine {
         device_id: &str,
         device_name: &str,
         super_speed: bool,
-    ) {
+    ) -> Result<(), EngineError> {
         let mut state = self.shared.state.lock().await;
         let active = state.active;
-        if let Some(slot) = state.slots.get_mut(active) {
-            if slot.session.phase.is_active() {
-                return;
-            }
-            let (names, colors) = pod_channel_style(mask);
-            slot.devices = vec![BoundDevice {
-                id: device_id.into(),
-                name: device_name.into(),
-                kind: "usb".into(),
-                super_speed,
-            }];
-            slot.origins = names
-                .iter()
-                .map(|_| ChannelOrigin {
-                    device_id: device_id.into(),
-                    device_name: device_name.into(),
-                })
-                .collect();
-            slot.channel_names = names;
-            slot.channel_colors = colors;
-            remember_catalog(slot);
-            slot.session.config.channel_enable = 0;
-            slot.decoders.clear();
-            slot.annotations.clear();
-            slot.session.store = LogicStore::new(mask.count_ones() as usize);
+        let Some(slot) = state.slots.get_mut(active) else {
+            return Err(EngineError::UnknownSession("active".into()));
+        };
+        if slot.session.phase.is_active() {
+            return Err(EngineError::Device(
+                "stop the capture before selecting a different device".into(),
+            ));
         }
+        let (names, colors) = pod_channel_style(mask);
+        slot.devices = vec![BoundDevice {
+            id: device_id.into(),
+            name: device_name.into(),
+            kind: "usb".into(),
+            super_speed,
+        }];
+        slot.origins = names
+            .iter()
+            .map(|_| ChannelOrigin {
+                device_id: device_id.into(),
+                device_name: device_name.into(),
+            })
+            .collect();
+        slot.channel_names = names;
+        slot.channel_colors = colors;
+        remember_catalog(slot);
+        slot.session.config.channel_enable = 0;
+        slot.decoders.clear();
+        slot.annotations.clear();
+        slot.session.store = LogicStore::new(mask.count_ones() as usize);
+        Ok(())
     }
 
     /// Resolves an optional session identifier, falling back to the selected session.
@@ -1674,6 +1687,18 @@ impl Slot {
             error: self.session.error.clone(),
             active,
         }
+    }
+}
+
+/// USB headers may be delayed indefinitely while a hardware trigger is armed.
+fn usb_header_wait(config: &SessionConfig, mode: StartMode, samples: u64) -> Option<Duration> {
+    if config.trigger_enabled && mode == StartMode::Normal {
+        None
+    } else if config.depth == DepthMode::Stream {
+        Some(Duration::from_secs(3))
+    } else {
+        let secs = samples / config.sample_rate_hz.max(1) + 3;
+        Some(Duration::from_secs(secs.min(120)))
     }
 }
 

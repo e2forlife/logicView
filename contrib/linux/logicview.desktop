@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LogicView
+Comment=Capture and explore logic analyzer signals
+Exec=logicview
+Icon=logicview
+Categories=Development;Electronics;
+Terminal=false
+StartupNotify=true
+StartupWMClass=logicview

@@ -33,7 +33,7 @@ pub(crate) async fn drive(
     interval: Duration,
     discard: bool,
     continuous: bool,
-    header_wait: Duration,
+    header_wait: Option<Duration>,
     product_id: Option<u16>,
 ) {
     let mut pass = 0u32;
@@ -235,7 +235,11 @@ async fn clear_samples(shared: &Shared, id: &str, generation: u64) {
     if slot.session.generation() == generation {
         let width = slot.session.store.channel_count();
         slot.session.store = logicview_capture::LogicStore::new(width);
-        slot.session.phase = Phase::Arming;
+        slot.session.phase = if slot.session.config.trigger_enabled && !slot.session.instant {
+            Phase::WaitingTrigger
+        } else {
+            Phase::Arming
+        };
     }
 }
 
@@ -305,7 +309,7 @@ pub(crate) async fn drive_dual(
     generation: u64,
     stop: Arc<AtomicBool>,
     samples: u64,
-    header_wait: Duration,
+    header_wait: Option<Duration>,
     discard: bool,
     jobs: Vec<PodJob>,
 ) {

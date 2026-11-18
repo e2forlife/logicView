@@ -8,6 +8,7 @@ pub struct Preferences {
     pub firmware_dir: String,
     pub scripts_dir: String,
     pub theme: String,
+    pub edge_snap: bool,
     pub mcp_enabled: bool,
     pub mcp_port: u16,
     /// Last folder used by Export Capture.
@@ -19,6 +20,7 @@ impl Default for Preferences {
             firmware_dir: String::new(),
             scripts_dir: String::new(),
             theme: "system".into(),
+            edge_snap: true,
             mcp_enabled: false,
             mcp_port: 8765,
             export_dir: String::new(),
@@ -29,12 +31,38 @@ pub fn path() -> PathBuf {
     if let Some(path) = std::env::var_os("LOGICVIEW_CONFIG_FILE") {
         return path.into();
     }
-    let base = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+    preferences_base_dir()
+        .join("LogicView")
+        .join("preferences.json")
+}
+
+/// Resolves the platform config directory that contains the LogicView folder.
+fn preferences_base_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        unix_preferences_base(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+    }
+}
+
+/// XDG config home, then `~/.config`, then the process temp directory.
+#[cfg(not(windows))]
+fn unix_preferences_base(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    xdg_config_home
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("LogicView").join("preferences.json")
+        .or_else(|| home.map(|path| PathBuf::from(path).join(".config")))
+        .unwrap_or_else(std::env::temp_dir)
 }
 pub fn load() -> Preferences {
     load_from(&path())
@@ -118,6 +146,7 @@ mod tests {
             firmware_dir: "firmware".into(),
             scripts_dir: "scripts".into(),
             theme: "light".into(),
+            edge_snap: false,
             mcp_enabled: true,
             mcp_port: 9135,
             export_dir: "exports".into(),
@@ -127,6 +156,8 @@ mod tests {
         assert_eq!(loaded.firmware_dir, "firmware");
         assert_eq!(loaded.scripts_dir, "scripts");
         assert_eq!(loaded.theme, "light");
+        assert!(!loaded.edge_snap);
+        assert!(serde_json::from_str::<Preferences>("{}").unwrap().edge_snap);
         assert!(loaded.mcp_enabled);
         assert_eq!(loaded.mcp_port, 9135);
         assert_eq!(loaded.export_dir, "exports");
@@ -144,5 +175,16 @@ mod tests {
         .is_err());
         assert_eq!(load_from(&file).theme, "light");
         std::fs::remove_file(file).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_preferences_prefer_xdg_then_home_config() {
+        let xdg = unix_preferences_base(Some("/tmp/xdg-config".into()), Some("/home/dev".into()));
+        assert_eq!(xdg, PathBuf::from("/tmp/xdg-config"));
+        let home = unix_preferences_base(None, Some("/home/dev".into()));
+        assert_eq!(home, PathBuf::from("/home/dev/.config"));
+        let fallback = unix_preferences_base(None, None);
+        assert_eq!(fallback, std::env::temp_dir());
     }
 }

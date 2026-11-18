@@ -1,0 +1,12 @@
+# LogicView: allow unprivileged access to DreamSourceLab USB devices (vendor 2a0e).
+#
+# Listing a pod only needs sysfs and can succeed before this rule is installed.
+# Selecting / opening the pod needs read-write access to /dev/bus/usb/... .
+#
+# Install (then unplug and replug the analyzer):
+#   sudo cp contrib/udev/99-logicview.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# MODE 0666 avoids depending on a plugdev membership. TAG+="uaccess" also grants
+# the active seat ACL on systemd systems.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2a0e", MODE="0666", TAG+="uaccess"

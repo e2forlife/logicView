@@ -4,3 +4,5 @@
 **/*.fw
 **/*.bit
 **/*.bitstream
+# Downloaded by scripts/package-release.sh when LOGICVIEW_APPIMAGE_TOOL_DIR points here.
+/tools/appimage-cache/
