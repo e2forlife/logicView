@@ -37,12 +37,15 @@ APPIMAGETOOL="${TOOL_DIR}/appimagetool-x86_64.AppImage"
 APPIMAGETOOL_URL="${LOGICVIEW_APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage}"
 
 rm -rf "${STAGE}" "${ARCHIVE}" "${APPDIR}" "${APPIMAGE}"
-mkdir -p "${STAGE}/assets" "${STAGE}/examples/decoders" dist
+mkdir -p "${STAGE}/assets" "${STAGE}/examples/decoders" "${STAGE}/decoders" dist
 
 cp -f "${BINARY}" "${STAGE}/logicview"
 chmod +x "${STAGE}/logicview"
 cp -f profiles.toml "${STAGE}/profiles.toml"
 cp -f examples/decoders/high_pulses.lua "${STAGE}/examples/decoders/high_pulses.lua"
+if [[ -d decoders ]]; then
+  cp -a decoders/. "${STAGE}/decoders/"
+fi
 
 if [[ ! -f crates/logicview-ui/assets/index.html ]]; then
   echo "Missing UI assets in crates/logicview-ui/assets" >&2

@@ -21,7 +21,7 @@ Then pick a host, write the registration table, and test the ranges at the edges
 
 ## Where scripts load
 
-LogicView reads `.lua` files directly in the decoder script directory. It does not look in subdirectories. A blank preference uses [`examples/decoders`](../examples/decoders), found from the source tree, the working directory, or beside the executable. Files are loaded when the application starts and again when Preferences are saved.
+LogicView reads `.lua` files directly in the decoder script directories. It does not look in subdirectories. A blank preference uses [`examples/decoders`](../examples/decoders), found from the source tree, the working directory, or beside the executable. That folder holds the translated DSView ports kept with the source tree. LogicView also loads [`decoders`](../decoders) when present; that is the homebrew set shipped in the release. An explicit preference replaces `examples/decoders` and still adds `decoders/` when it exists. Files are loaded when the application starts and again when Preferences are saved.
 
 The script returns one table. `id` is required, unique, and nonempty. It may contain only ASCII letters, digits, `_`, `-`, and `:`. `name` is the label in the decoder list and is required. Built-in ids `uart`, `i2c`, `spi`, and `eeprom24` take precedence over a script with the same id. A script that fails to load is omitted from the catalog; the error is printed to stderr. Save Preferences after adding or editing a file so the list refreshes.
 

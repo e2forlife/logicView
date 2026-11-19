@@ -4,7 +4,7 @@ LogicView decoders turn captured digital samples or lower-level protocol events 
 
 ## 1. Install and load a script
 
-1. Choose a directory for your scripts. A blank preference uses the repository's [`examples/decoders`](../examples/decoders) directory, which contains the translated DSView decoders and the shorter tutorials.
+1. Choose a directory for your scripts. A blank preference uses the repository's [`examples/decoders`](../examples/decoders) directory for the translated DSView decoders and the shorter tutorials. Homebrew scripts live in [`decoders`](../decoders) and are loaded in addition to that directory.
 2. Open **Preferences** using the gear in the upper right to point the Lua decoder script directory somewhere else. Save Preferences.
 3. Add your decoder from the Decode panel or menu, open its configuration, and map its signal roles to captured channels. Run a capture or use an existing capture to see its annotations.
 

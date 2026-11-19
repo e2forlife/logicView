@@ -27,10 +27,30 @@ fn directory() -> Option<PathBuf> {
         Some(dir)
     }
 }
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let left = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let right = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    left == right
+}
+
+fn directories() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(configured) = directory() {
+        dirs.push(configured);
+    }
+    if let Some(homebrew) = logicview_config::homebrew_scripts_dir() {
+        if dirs.iter().all(|dir| !same_dir(dir, &homebrew)) {
+            dirs.push(homebrew);
+        }
+    }
+    dirs
+}
+
 fn files() -> Vec<PathBuf> {
-    let mut paths: Vec<_> = directory()
-        .and_then(|p| std::fs::read_dir(p).ok())
+    let mut paths: Vec<_> = directories()
         .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -1203,5 +1223,146 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["A + B + West + East"]
         );
+    }
+
+    fn i2c_packet(start: u64, kind: &str, value: Option<u8>) -> super::super::ProtocolPacket {
+        let data = match value {
+            Some(byte) => serde_json::json!([kind, byte]),
+            None => serde_json::json!([kind, serde_json::Value::Null]),
+        };
+        super::super::ProtocolPacket {
+            start_sample: start,
+            end_sample: start + 1,
+            kind: kind.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn nau7802_decodes_register_writes_and_adc_reads() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../decoders/nau7802.lua");
+        let write_packets = [
+            i2c_packet(0, "START", None),
+            i2c_packet(1, "ADDRESS WRITE", Some(0x54)),
+            i2c_packet(2, "ACK", None),
+            i2c_packet(3, "DATA WRITE", Some(0x00)),
+            i2c_packet(4, "ACK", None),
+            i2c_packet(5, "DATA WRITE", Some(0x06)),
+            i2c_packet(6, "ACK", None),
+            i2c_packet(7, "STOP", None),
+        ];
+        let write = run_paths(
+            &DecodeRequest {
+                protocol: "nau7802",
+                channels: &[],
+                options: &[],
+                region: 0..16,
+                sample_len: 16,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &write_packets,
+            },
+            &AtomicBool::new(false),
+            vec![path.clone()],
+        )
+        .unwrap();
+        assert!(
+            write.annotations.iter().any(|row| {
+                row.class == "write"
+                    && row.text.contains("PU_CTRL")
+                    && row.text.contains("PUD=1")
+                    && row.text.contains("PUA=1")
+            }),
+            "{:?}",
+            write.annotations
+        );
+
+        let read_packets = [
+            i2c_packet(0, "START", None),
+            i2c_packet(1, "ADDRESS WRITE", Some(0x54)),
+            i2c_packet(2, "ACK", None),
+            i2c_packet(3, "DATA WRITE", Some(0x12)),
+            i2c_packet(4, "ACK", None),
+            i2c_packet(5, "START REPEAT", None),
+            i2c_packet(6, "ADDRESS READ", Some(0x55)),
+            i2c_packet(7, "ACK", None),
+            i2c_packet(8, "DATA READ", Some(0x00)),
+            i2c_packet(9, "ACK", None),
+            i2c_packet(10, "DATA READ", Some(0x01)),
+            i2c_packet(11, "ACK", None),
+            i2c_packet(12, "DATA READ", Some(0x00)),
+            i2c_packet(13, "NACK", None),
+            i2c_packet(14, "STOP", None),
+        ];
+        let read = run_paths(
+            &DecodeRequest {
+                protocol: "nau7802",
+                channels: &[],
+                options: &[],
+                region: 0..16,
+                sample_len: 16,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &read_packets,
+            },
+            &AtomicBool::new(false),
+            vec![path.clone()],
+        )
+        .unwrap();
+        assert!(
+            read.annotations.iter().any(|row| {
+                row.class == "sample" && row.text.contains("ADC +256") && row.text.contains("0x000100")
+            }),
+            "{:?}",
+            read.annotations
+        );
+
+        let clipped = run_paths(
+            &DecodeRequest {
+                protocol: "nau7802",
+                channels: &[],
+                options: &[],
+                region: 0..2,
+                sample_len: 16,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &write_packets,
+            },
+            &AtomicBool::new(false),
+            vec![path.clone()],
+        )
+        .unwrap();
+        assert!(
+            clipped.annotations.is_empty(),
+            "{:?}",
+            clipped.annotations
+        );
+
+        let foreign = [
+            i2c_packet(0, "START", None),
+            i2c_packet(1, "ADDRESS WRITE", Some(0x50)),
+            i2c_packet(2, "ACK", None),
+            i2c_packet(3, "DATA WRITE", Some(0x00)),
+            i2c_packet(4, "ACK", None),
+            i2c_packet(5, "DATA WRITE", Some(0x06)),
+            i2c_packet(6, "ACK", None),
+            i2c_packet(7, "STOP", None),
+        ];
+        let ignored = run_paths(
+            &DecodeRequest {
+                protocol: "nau7802",
+                channels: &[],
+                options: &[],
+                region: 0..16,
+                sample_len: 16,
+                sample_rate_hz: None,
+                lower: &[],
+                lower_packets: &foreign,
+            },
+            &AtomicBool::new(false),
+            vec![path],
+        )
+        .unwrap();
+        assert!(ignored.annotations.is_empty(), "{:?}", ignored.annotations);
     }
 }

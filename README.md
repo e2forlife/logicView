@@ -69,7 +69,7 @@ Device identities, USB IDs, channel counts, bitstream filenames, and tested stat
 
 ### Lua decoders
 
-Lua 5.5 scripts can be used alongside built-in Rust decoders. A blank decoder-script directory uses [examples/decoders](examples/decoders), which holds the translated DSView protocol decoders. Set another directory in Preferences to use your own scripts. Files ending in `.lua` in that directory are discovered when the application starts and when Preferences are saved. [high_pulses.lua](examples/decoders/high_pulses.lua) is a small tutorial; [session_edges.lua](examples/decoders/session_edges.lua) shows the session API.
+Lua 5.5 scripts can be used alongside built-in Rust decoders. A blank decoder-script directory uses [examples/decoders](examples/decoders), which holds the translated DSView protocol decoders kept with the source tree. LogicView also loads [decoders](decoders) when that folder is present; it holds homebrew scripts such as [nau7802.lua](decoders/nau7802.lua) that ship in the release package. Set another directory in Preferences to replace the examples folder; the homebrew folder stays included. Files ending in `.lua` in those directories are discovered when the application starts and when Preferences are saved. [high_pulses.lua](examples/decoders/high_pulses.lua) is a small tutorial included with the release; [session_edges.lua](examples/decoders/session_edges.lua) shows the session API.
 
 For a step-by-step guide to writing, configuring, testing, and stacking decoders, see the [Lua decoder tutorial](docs/lua-decoders.md). The [decoder developers guide](docs/decoder-developers-guide.md) is the interface reference: registration fields, both hosts, stacking, and how to build a decoder from a component datasheet.
 
@@ -132,7 +132,7 @@ scripts/run-debug.sh
 
 The Linux packaging script writes both:
 
-- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, example decoders, UI assets, the application icon and desktop entry, and the udev rule. Extract and run `./logicview`. `scripts/install-desktop.sh` installs the icon and menu entry for your user.
+- `dist/logicview-<version>-linux-x86_64.tar.gz` — binary, `profiles.toml`, the high-pulse example decoder, homebrew `decoders/`, UI assets, the application icon and desktop entry, and the udev rule. Extract and run `./logicview`. `scripts/install-desktop.sh` installs the icon and menu entry for your user.
 - `dist/logicview-<version>-x86_64.AppImage` — the same payload as a single executable file, with the application icon embedded for file managers. Mark it executable and run it (`chmod +x … && ./logicview-…-x86_64.AppImage`).
 
 The AppImage is a thin bundle: it still needs host WebKitGTK 4.1 and GTK 3 (`libwebkit2gtk-4.1-0` and GTK 3 on Debian/Ubuntu), the same runtime libraries as a normal desktop build. It downloads `appimagetool` into `dist/.appimage-tools` on first use (override with `LOGICVIEW_APPIMAGE_TOOL_DIR` / `LOGICVIEW_APPIMAGETOOL_URL`). Packaging also needs `squashfs-tools`. The image is gzip-compressed so file managers can read its icon, and the script installs a per-user AppImage thumbnailer for desktops that do not ship one.

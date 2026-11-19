@@ -73,26 +73,39 @@ pub fn load() -> Preferences {
 /// The source-tree `examples/decoders` directory is preferred, then the same
 /// relative path from the working directory and from the executable.
 pub fn default_scripts_dir() -> PathBuf {
-    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders");
-    let mut candidates = vec![compiled.clone(), PathBuf::from("examples/decoders")];
+    first_existing_dir("examples/decoders").unwrap_or_else(|| {
+        friendly_path(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/decoders"))
+    })
+}
+
+/// Homebrew decoder scripts shipped with LogicView (`decoders/`).
+///
+/// Searches the source tree, working directory, and directories beside the
+/// executable the same way [`default_scripts_dir`] does for `examples/decoders`.
+pub fn homebrew_scripts_dir() -> Option<PathBuf> {
+    first_existing_dir("decoders")
+}
+
+fn first_existing_dir(relative: &str) -> Option<PathBuf> {
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative);
+    let mut candidates = vec![compiled, PathBuf::from(relative)];
     if let Ok(current) = std::env::current_dir() {
-        candidates.push(current.join("examples/decoders"));
+        candidates.push(current.join(relative));
     }
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(|path| path.to_path_buf());
         for _ in 0..6 {
             let Some(path) = dir else { break };
-            candidates.push(path.join("examples/decoders"));
+            candidates.push(path.join(relative));
             dir = path.parent().map(|parent| parent.to_path_buf());
         }
     }
     for candidate in candidates {
         if candidate.is_dir() {
-            let resolved = candidate.canonicalize().unwrap_or(candidate);
-            return friendly_path(resolved);
+            return Some(friendly_path(candidate.canonicalize().unwrap_or(candidate)));
         }
     }
-    friendly_path(compiled)
+    None
 }
 
 /// The saved script directory, or [`default_scripts_dir`] when it is blank.
@@ -165,6 +178,9 @@ mod tests {
         assert!(!Preferences::default().mcp_enabled);
         assert!(default_scripts_dir().ends_with("examples/decoders"));
         assert!(effective_scripts_dir(&Preferences::default()).contains("examples"));
+        assert!(homebrew_scripts_dir()
+            .map(|path| path.ends_with("decoders"))
+            .unwrap_or(true));
         assert!(save_to(
             &file,
             &Preferences {
