@@ -36,6 +36,7 @@ const state = {
   hidden: new Set(),
   tiles: {},
   overviewCols: null,
+  overviewSnap: null,
   req: 0,
   hoverText: "",
   hoverSequence: 0,
@@ -134,6 +135,7 @@ function view() {
       selected: null,
       names: {},
       colors,
+      modes: {},
     };
   }
   return views[id];
@@ -211,6 +213,8 @@ function normalizeContainerInPlace(raw) {
     }).filter((member) => member && (member.kind === "group" ? Number.isFinite(member.id) : Number.isFinite(member.index)));
   }
   if (!raw.radix) raw.radix = raw.analog ? "analog" : "hex";
+  if (raw.radix === "analog") raw.analog = true;
+  else if (typeof raw.analog !== "boolean") raw.analog = false;
   if (typeof raw.msbFirst !== "boolean") raw.msbFirst = false;
   if (typeof raw.folded !== "boolean") raw.folded = false;
   raw.channels = raw.members.filter((member) => member.kind === "channel").map((member) => member.index);
@@ -336,6 +340,39 @@ function indexesInOrder(indexes, source) {
 
 function decodeShownAnalog(id) {
   return decodeFormat(id) === "analog" || !!(state.spiView[id] && state.spiView[id].analog);
+}
+
+function signalModes() {
+  const v = view();
+  if (!v.modes || typeof v.modes !== "object") v.modes = {};
+  return v.modes;
+}
+
+function signalMode(key) {
+  return signalModes()[key] === "analog" ? "analog" : "digital";
+}
+
+function setSignalMode(key, mode) {
+  if (!key) return;
+  const modes = signalModes();
+  if (mode === "analog") modes[key] = "analog";
+  else delete modes[key];
+}
+
+function rowShowsAnalog(row) {
+  if (!row) return false;
+  if (row.kind === "analog") return true;
+  if (row.kind === "logic") return signalMode(row.key) === "analog";
+  if (row.kind === "bus" || row.kind === "group") {
+    if (!row.bus) return false;
+    if (row.bus.decode) return decodeShownAnalog(row.bus.decode);
+    return !!(row.bus.analog || row.bus.radix === "analog");
+  }
+  if (row.kind === "condense" || row.kind === "decode") {
+    if (row.bus && row.bus.analog) return true;
+    return row.decoderId ? decodeShownAnalog(row.decoderId) : false;
+  }
+  return false;
 }
 
 function laneColor(channel, fallback) {
@@ -937,6 +974,7 @@ function applySelection(key, ev) {
   v.selected = v.anchor || v.selection[0] || null;
   state.gutterSig = "";
   renderGutter();
+  refreshOverview();
 }
 
 function selectOnly(key) {
@@ -1167,6 +1205,7 @@ function foldButton(row, folded) {
       renderGutter();
       drawWave();
       scheduleTiles();
+      refreshOverview();
       return;
     }
     const pref = decodePref(row.decoderId);
@@ -1178,6 +1217,7 @@ function foldButton(row, folded) {
     renderGutter();
     drawWave();
     scheduleTiles();
+    refreshOverview();
   });
   if (animate) {
     requestAnimationFrame(() => {
@@ -1214,7 +1254,7 @@ function groupRanges(layout) {
 function renderGutter() {
   const metrics = rowMetrics();
   const selected = new Set(ensureSelection().selection);
-  const sig = [...selected].join(",") + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.depth || 0) + (selected.has(item.row.key) ? "s" : "") + ((item.row.bus && item.row.bus.radix) || "") + ((item.row.bus && item.row.bus.msbFirst) ? "m" : "")).join("|");
+  const sig = [...selected].join(",") + "#" + metrics.layout.map((item) => item.row.key + signalName(item.row) + item.row.color + item.height + (state.hidden.has(item.row.key) ? "0" : "1") + (rowFolded(item.row) ? "c" : "") + (item.row.child ? "g" : "") + (item.row.depth || 0) + (selected.has(item.row.key) ? "s" : "") + ((item.row.bus && item.row.bus.radix) || "") + ((item.row.bus && item.row.bus.analog) ? "a" : "") + ((item.row.bus && item.row.bus.msbFirst) ? "m" : "") + (rowShowsAnalog(item.row) ? "A" : "D")).join("|");
   if (sig === state.gutterSig) return;
   state.gutterSig = sig;
   gutter.replaceChildren();
@@ -1765,7 +1805,10 @@ function drawWave() {
     const cols = state.tiles[row.tileKey || row.key];
     if (!cols) continue;
     if (row.kind === "analog") drawAnalog(ctx, cols, item.top, item.height, traceColor(row.color));
-    else if (row.kind === "logic") drawDigital(ctx, cols, item.top, item.height, traceColor(row.color));
+    else if (row.kind === "logic") {
+      if (signalMode(row.key) === "analog") drawLogicAnalog(ctx, cols, item.top, item.height, traceColor(row.color));
+      else drawDigital(ctx, cols, item.top, item.height, traceColor(row.color));
+    }
   }
   drawBuses(ctx, layout);
   drawCondensedRows(ctx, w, layout);
@@ -1773,7 +1816,7 @@ function drawWave() {
   ctx.restore();
   for (const item of layout) {
     const row = item.row;
-    if (row.kind !== "logic" || state.hidden.has(row.key)) continue;
+    if (row.kind !== "logic" || state.hidden.has(row.key) || signalMode(row.key) === "analog") continue;
     const top = item.top;
     const pad = Math.max(8, item.height * 0.22);
     ctx.font = "11px sans-serif";
@@ -1934,7 +1977,7 @@ function drawGrid(ctx, w, h, layout, palette = wavePalette()) {
     ctx.moveTo(0, top + 0.5);
     ctx.lineTo(w, top + 0.5);
     ctx.stroke();
-    if (row.kind === "logic") {
+    if (row.kind === "logic" && signalMode(row.key) !== "analog") {
       const pad = Math.max(8, rowH * 0.22);
       ctx.strokeStyle = palette.logicGuide;
       ctx.beginPath();
@@ -1943,6 +1986,14 @@ function drawGrid(ctx, w, h, layout, palette = wavePalette()) {
       ctx.moveTo(0, top + rowH - pad + 0.5);
       ctx.lineTo(w, top + rowH - pad + 0.5);
       ctx.stroke();
+    } else if (row.kind === "logic" && signalMode(row.key) === "analog") {
+      const pad = Math.max(8, rowH * 0.22);
+      ctx.fillStyle = palette.label;
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("1", 6, top + pad);
+      ctx.fillText("0", 6, top + rowH - pad);
     } else if (row.kind === "analog") {
       const mid = top + rowH / 2;
       ctx.strokeStyle = palette.analogGuide;
@@ -2082,6 +2133,7 @@ function rowKindLabel(row) {
   }
   if (row.kind === "analog") return "Analog";
   if (row.kind === "bus") return busRadixLabel(row.bus);
+  if (row.kind === "logic" && signalMode(row.key) === "analog") return "Analog";
   return "Digital";
 }
 
@@ -2392,6 +2444,31 @@ function drawDigital(ctx, cols, top, height, color) {
   ctx.stroke();
 }
 
+function drawLogicAnalog(ctx, cols, top, height, color) {
+  const pad = Math.max(8, height * 0.22);
+  const yTop = top + pad;
+  const yBot = top + height - pad;
+  const yOf = (high) => (high ? yTop : yBot);
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.4;
+  let prev = null;
+  for (let i = 0; i < cols.length; i++) {
+    if (tileSample(i) >= state.total) break;
+    const column = cols[i];
+    if (!column || column.valid === false) break;
+    const x = traceX(i);
+    const y = yOf(!!column.last);
+    if (prev == null) ctx.moveTo(x, y);
+    else if (prev !== y) {
+      ctx.lineTo(x, prev);
+      ctx.lineTo(x, y);
+    } else ctx.lineTo(x, y);
+    prev = y;
+  }
+  ctx.stroke();
+}
+
 function drawAnalog(ctx, cols, top, height, color) {
   const pad = 10;
   const y0 = top + pad;
@@ -2617,31 +2694,186 @@ function drawBuses(ctx, layout) {
   }
 }
 
+function overviewTargetRow() {
+  const selection = ensureSelection().selection || [];
+  const firstKey = selection[0] || null;
+  if (firstKey) {
+    const found = layoutRows().find((row) => row.key === firstKey);
+    if (found) return found;
+  }
+  const channel = state.channels.find((item) => item.index === 0) || state.channels[0];
+  return channel ? logicRowModel(channel, "") : null;
+}
+
+function overviewStrokeColor(row) {
+  if (!row) return "#3dcc8e";
+  return traceColor(row.color || "#3dcc8e");
+}
+
+function drawOverviewDigital(ctx, cols, w, h, color) {
+  if (!cols || !cols.length) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let moved = false;
+  let prev = null;
+  for (let i = 0; i < cols.length; i++) {
+    const column = cols[i];
+    if (!column || column.valid === false) break;
+    const x = (i + 0.5) * (w / cols.length);
+    const y = column.last ? 6 : h - 6;
+    if (!moved) {
+      ctx.moveTo(x, y);
+      moved = true;
+    } else if (prev !== y) {
+      ctx.lineTo(x, prev);
+      ctx.lineTo(x, y);
+    } else ctx.lineTo(x, y);
+    prev = y;
+    if (column.toggled) {
+      ctx.lineTo(x, 6);
+      ctx.lineTo(x, h - 6);
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+}
+
+function drawOverviewLogicAnalog(ctx, cols, w, h, color) {
+  if (!cols || !cols.length) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let moved = false;
+  let prev = null;
+  for (let i = 0; i < cols.length; i++) {
+    const column = cols[i];
+    if (!column || column.valid === false) break;
+    const x = (i + 0.5) * (w / cols.length);
+    const y = column.last ? 6 : h - 6;
+    if (!moved) {
+      ctx.moveTo(x, y);
+      moved = true;
+    } else if (prev !== y) {
+      ctx.lineTo(x, prev);
+      ctx.lineTo(x, y);
+    } else ctx.lineTo(x, y);
+    prev = y;
+  }
+  ctx.stroke();
+}
+
+function drawOverviewAnalogSamples(ctx, cols, w, h, color) {
+  if (!cols || !cols.length) return;
+  const scaleMin = -1.25;
+  const scaleMax = 1.25;
+  const yOf = (value) => {
+    const t = (value - scaleMin) / (scaleMax - scaleMin);
+    return (h - 6) - Math.max(0, Math.min(1, t)) * (h - 12);
+  };
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let moved = false;
+  for (let i = 0; i < cols.length; i++) {
+    const column = cols[i];
+    if (!column || column.valid === false) continue;
+    if (!Number.isFinite(column.min) || !Number.isFinite(column.max)) continue;
+    const x = (i + 0.5) * (w / cols.length);
+    const y = yOf((column.min + column.max) / 2);
+    if (!moved) {
+      ctx.moveTo(x, y);
+      moved = true;
+    } else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawOverviewBusAnalog(ctx, channelCols, bus, w, h, color) {
+  const channels = descendantChannels(bus);
+  if (!channels.length || !channelCols) return;
+  const bits = channels.length;
+  const max = Number((1n << BigInt(bits)) - 1n) || 1;
+  const length = channelCols[channels[0]] ? channelCols[channels[0]].length : 0;
+  if (!length) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let moved = false;
+  for (let i = 0; i < length; i++) {
+    let value = 0n;
+    for (let bit = 0; bit < bits; bit++) {
+      const cols = channelCols[channels[bit]];
+      const column = cols && cols[i];
+      if (!(column && column.valid !== false && column.last)) continue;
+      const shift = bus.msbFirst ? BigInt(bits - 1 - bit) : BigInt(bit);
+      value |= 1n << shift;
+    }
+    const y = (h - 6) - (Number(value) / max) * (h - 12);
+    const x = (i + 0.5) * (w / length);
+    if (!moved) {
+      ctx.moveTo(x, y);
+      moved = true;
+    } else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawOverviewDecodeAnalog(ctx, row, w, h, color) {
+  const decoder = (state.decoders || []).find((item) => item.id === row.decoderId);
+  if (!decoder) return;
+  const rows = laneAnnotations(valueAnnotations(decoder), row.lane, decoder);
+  if (!rows.length || state.total <= 0) return;
+  const valueOf = (entry) => {
+    if (row.lane) {
+      const raw = laneValue(entry, decoder, row.lane);
+      const parsed = parseInt(raw, 16);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+    const fields = entry.fields || {};
+    if (fields.mosi || fields.miso) {
+      const parsed = parseInt(fields.mosi || fields.miso, 16);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+    const values = annotationNumbers(entry);
+    return values.length ? values[0] : NaN;
+  };
+  const max = 255;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let moved = false;
+  let prevY = null;
+  for (const entry of rows) {
+    const value = valueOf(entry);
+    if (!Number.isFinite(value)) continue;
+    const y = (h - 6) - (Math.max(0, Math.min(max, value)) / max) * (h - 12);
+    const x0 = (entry.start_sample / state.total) * w;
+    const x1 = Math.max(x0 + 1, (entry.end_sample / state.total) * w);
+    if (!moved) {
+      ctx.moveTo(x0, y);
+      moved = true;
+    } else if (prevY != null) ctx.lineTo(x0, prevY);
+    ctx.lineTo(x0, y);
+    ctx.lineTo(x1, y);
+    prevY = y;
+  }
+  ctx.stroke();
+}
+
 function drawOverview() {
   const { ctx, w, h } = prep(overview);
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#10151c";
   ctx.fillRect(0, 0, w, h);
-  const cols = state.overviewCols;
-  if (cols && state.total > 0) {
-    ctx.strokeStyle = "#3dcc8e";
-    ctx.beginPath();
-    let moved = false;
-    for (let i = 0; i < cols.length; i++) {
-      const column = cols[i];
-      if (!column || column.valid === false) break;
-      const x = (i + 0.5) * (w / cols.length);
-      const y = column.toggled || column.first ? 6 : h - 6;
-      if (!moved) {
-        ctx.moveTo(x, y);
-        moved = true;
-      } else ctx.lineTo(x, y);
-      if (column.toggled) {
-        ctx.lineTo(x, 6);
-        ctx.lineTo(x, h - 6);
-      }
-    }
-    ctx.stroke();
+  const snap = state.overviewSnap;
+  if (snap && state.total > 0) {
+    const color = overviewStrokeColor(snap.row);
+    if (snap.mode === "analog-samples") drawOverviewAnalogSamples(ctx, snap.cols, w, h, color);
+    else if (snap.mode === "bus-analog") drawOverviewBusAnalog(ctx, snap.channelCols, snap.bus, w, h, color);
+    else if (snap.mode === "decode-analog") drawOverviewDecodeAnalog(ctx, snap.row, w, h, color);
+    else if (snap.mode === "logic-analog") drawOverviewLogicAnalog(ctx, snap.cols, w, h, color);
+    else drawOverviewDigital(ctx, snap.cols, w, h, color);
   }
   if (state.total > 0) {
     const v = view();
@@ -2850,28 +3082,89 @@ function parseFrame(buffer) {
 }
 
 let overviewToken = 0;
+
+async function fetchOverviewTile(channel, kind, columns) {
+  const data = await api({
+    cmd: "tile",
+    session: state.active,
+    channel,
+    start: 0,
+    columns,
+    samples_per_pixel: state.total / columns,
+    kind,
+  });
+  return data.columns || null;
+}
+
 async function refreshOverview() {
   const token = ++overviewToken;
   if (state.total <= 0) {
     state.overviewCols = null;
+    state.overviewSnap = null;
     drawOverview();
     return;
   }
   const columns = Math.max(8, Math.floor(overview.clientWidth || 200));
+  const row = overviewTargetRow();
   try {
-    const data = await api({
-      cmd: "tile",
-      session: state.active,
-      channel: 0,
-      start: 0,
-      columns,
-      samples_per_pixel: state.total / columns,
-      kind: "logic",
-    });
-    if (token !== overviewToken) return;
-    state.overviewCols = data.columns;
+    let snap = null;
+    if (!row) {
+      const cols = await fetchOverviewTile(0, "logic", columns);
+      if (token !== overviewToken) return;
+      snap = { mode: "digital", cols, row: null };
+    } else if (row.kind === "analog") {
+      const cols = await fetchOverviewTile(row.channel, "analog", columns);
+      if (token !== overviewToken) return;
+      snap = { mode: "analog-samples", cols, row };
+    } else if ((row.kind === "bus" || row.kind === "group") && row.bus && !row.bus.decode) {
+      if (row.bus.type === "group" || row.kind === "group") {
+        const channels = descendantChannels(row.bus);
+        const channel = channels[0] ?? 0;
+        const cols = await fetchOverviewTile(channel, "logic", columns);
+        if (token !== overviewToken) return;
+        snap = { mode: "digital", cols, row };
+      } else if (row.bus.analog || row.bus.radix === "analog") {
+        const channels = descendantChannels(row.bus);
+        const channelCols = {};
+        await Promise.all(channels.map(async (index) => {
+          channelCols[index] = await fetchOverviewTile(index, "logic", columns);
+        }));
+        if (token !== overviewToken) return;
+        snap = { mode: "bus-analog", channelCols, bus: row.bus, row };
+      } else {
+        const channels = descendantChannels(row.bus);
+        const channel = channels[0] ?? 0;
+        const cols = await fetchOverviewTile(channel, "logic", columns);
+        if (token !== overviewToken) return;
+        snap = { mode: "digital", cols, row };
+      }
+    } else if ((row.kind === "decode" || row.kind === "condense" || row.kind === "bus") && row.bus && row.bus.decode) {
+      if (rowShowsAnalog(row)) {
+        if (token !== overviewToken) return;
+        snap = { mode: "decode-analog", row };
+      } else {
+        const cols = await fetchOverviewTile(row.channel ?? 0, "logic", columns);
+        if (token !== overviewToken) return;
+        snap = { mode: "digital", cols, row };
+      }
+    } else if (row.kind === "logic") {
+      const cols = await fetchOverviewTile(row.channel, "logic", columns);
+      if (token !== overviewToken) return;
+      snap = {
+        mode: signalMode(row.key) === "analog" ? "logic-analog" : "digital",
+        cols,
+        row,
+      };
+    } else {
+      const cols = await fetchOverviewTile(0, "logic", columns);
+      if (token !== overviewToken) return;
+      snap = { mode: "digital", cols, row };
+    }
+    state.overviewSnap = snap;
+    state.overviewCols = snap && snap.cols ? snap.cols : null;
     drawOverview();
   } catch (_) {
+    if (token !== overviewToken) return;
     drawOverview();
   }
 }
@@ -5269,6 +5562,7 @@ function setupDocument() {
     anchor: v.anchor || null,
     selected: v.anchor || null,
     colors: v.colors || {},
+    modes: signalModes(),
     markers: (v.markers || []).map((marker) => ({
       id: marker.id,
       n: marker.n,
@@ -5346,6 +5640,7 @@ async function applySetup(doc) {
   v.customHeights = !!doc.customHeights;
   v.names = doc.names && typeof doc.names === "object" ? doc.names : {};
   v.colors = doc.colors && typeof doc.colors === "object" ? doc.colors : {};
+  v.modes = doc.modes && typeof doc.modes === "object" ? doc.modes : {};
   v.buses = Array.isArray(doc.buses) ? doc.buses : [];
   for (const bus of v.buses) normalizeContainerInPlace(bus);
   v.nextBus = Number(doc.nextBus) || v.nextBus || 1;
@@ -5746,6 +6041,7 @@ wave.addEventListener("contextmenu", (ev) => {
   const row = state.total > 0 ? rowAt(ev.clientY) : null;
   if (row && row.kind === "logic") {
     ev.preventDefault();
+    if (!ensureSelection().selection.includes(row.key)) selectOnly(row.key);
     openSignalMenu(row, ev.clientX, ev.clientY);
     return;
   }
@@ -7064,6 +7360,7 @@ function openBusMenu(bus, x, y) {
     closeBusMenu();
     renderGutter();
     drawWave();
+    refreshOverview();
   });
   menu.append(item);
   placeBusMenu(menu, x, y);
@@ -7122,6 +7419,19 @@ function openSignalMenu(row, x, y) {
   const menu = document.getElementById("bus-menu");
   menu.replaceChildren();
   if (row.kind === "logic") {
+    const analog = signalMode(row.key) === "analog";
+    const mode = document.createElement("button");
+    mode.type = "button";
+    mode.textContent = analog ? "Digital view" : "Analog view";
+    mode.addEventListener("click", () => {
+      setSignalMode(row.key, analog ? "digital" : "analog");
+      state.gutterSig = "";
+      closeBusMenu();
+      renderGutter();
+      drawWave();
+      refreshOverview();
+    });
+    menu.append(mode);
     const add = document.createElement("button");
     add.type = "button";
     add.textContent = "Add decoder…";
@@ -7181,17 +7491,25 @@ function openContainerMenu(bus, x, y) {
   const menu = document.getElementById("bus-menu");
   menu.replaceChildren();
   if (bus.type !== "group") {
-    for (const [value, label] of [["hex", "Hex"], ["dec", "Decimal"], ["bin", "Binary"], ["oct", "Octal"]]) {
+    const analogOn = !!(bus.analog || bus.radix === "analog");
+    for (const [value, label] of [["hex", "Hex"], ["dec", "Decimal"], ["bin", "Binary"], ["oct", "Octal"], ["analog", "Analog"]]) {
       const item = document.createElement("button");
       item.type = "button";
-      item.textContent = (bus.radix === value ? "✓ " : "") + label;
+      const checked = value === "analog" ? analogOn : (!analogOn && bus.radix === value);
+      item.textContent = (checked ? "✓ " : "") + label;
       item.addEventListener("click", () => {
-        bus.radix = value;
-        bus.analog = false;
+        if (value === "analog") {
+          bus.analog = true;
+          bus.radix = "analog";
+        } else {
+          bus.radix = value;
+          bus.analog = false;
+        }
         state.gutterSig = "";
         closeBusMenu();
         renderGutter();
         drawWave();
+        refreshOverview();
       });
       menu.append(item);
     }
@@ -7202,6 +7520,7 @@ function openContainerMenu(bus, x, y) {
       bus.msbFirst = !bus.msbFirst;
       closeBusMenu();
       drawWave();
+      refreshOverview();
     });
     menu.append(msb);
   }
@@ -7786,6 +8105,10 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
   if (overlayBox) pref.overlay = overlayBox.checked;
   if (condenseBox && pref.condensed !== condenseBox.checked) { pref.condensed = condenseBox.checked; pref.lanes = {}; }
   if (formatBox && DECODE_FORMATS[formatBox.value]) pref.format = formatBox.value;
+  if (formatBox && DECODE_FORMATS[formatBox.value]) {
+    if (!state.spiView[id]) state.spiView[id] = { analog: false };
+    state.spiView[id].analog = pref.format === "analog";
+  }
   state.gutterSig = "";
   closeDecodeConfig();
   state.decoderBusy = (state.decoderBusy || 0) + 1;
@@ -7803,6 +8126,7 @@ document.getElementById("decode-config-form").addEventListener("submit", async (
     await refreshDecoders();
     await loadAnnotations();
     scheduleTiles();
+    refreshOverview();
   } catch (err) {
     decodeError = err;
     document.getElementById("decode-config").classList.remove("hidden");
