@@ -1225,42 +1225,70 @@ mod tests {
         );
     }
 
-    fn i2c_packet(start: u64, kind: &str, value: Option<u8>) -> super::super::ProtocolPacket {
-        let data = match value {
-            Some(byte) => serde_json::json!([kind, byte]),
-            None => serde_json::json!([kind, serde_json::Value::Null]),
+    fn nau7802_bus(bytes: &[(u8, bool)], repeat_at: Option<usize>) -> (Vec<u8>, Vec<u8>, u64) {
+        let mut scl = Vec::new();
+        let mut sda = Vec::new();
+        let push = |scl: &mut Vec<u8>, sda: &mut Vec<u8>, n: usize, clock: u8, data: u8| {
+            for _ in 0..n {
+                scl.push(clock);
+                sda.push(data);
+            }
         };
-        super::super::ProtocolPacket {
-            start_sample: start,
-            end_sample: start + 1,
-            kind: kind.into(),
-            data,
+        let push_bit = |scl: &mut Vec<u8>, sda: &mut Vec<u8>, bit: u8| {
+            push(scl, sda, 4, 0, bit);
+            push(scl, sda, 4, 1, bit);
+        };
+        let push_byte = |scl: &mut Vec<u8>, sda: &mut Vec<u8>, byte: u8, ack: bool| {
+            for shift in (0..8).rev() {
+                push_bit(scl, sda, (byte >> shift) & 1);
+            }
+            push_bit(scl, sda, if ack { 0 } else { 1 });
+        };
+        let push_start = |scl: &mut Vec<u8>, sda: &mut Vec<u8>| {
+            push(scl, sda, 4, 1, 1);
+            push(scl, sda, 4, 1, 0);
+        };
+        let push_stop = |scl: &mut Vec<u8>, sda: &mut Vec<u8>| {
+            push(scl, sda, 4, 0, 0);
+            push(scl, sda, 4, 1, 0);
+            push(scl, sda, 4, 1, 1);
+        };
+        let push_repeated_start = |scl: &mut Vec<u8>, sda: &mut Vec<u8>| {
+            push(scl, sda, 4, 0, 0);
+            push(scl, sda, 4, 0, 1);
+            push(scl, sda, 4, 1, 1);
+            push(scl, sda, 4, 1, 0);
+        };
+
+        push(&mut scl, &mut sda, 8, 1, 1);
+        push_start(&mut scl, &mut sda);
+        for (index, &(byte, ack)) in bytes.iter().enumerate() {
+            if repeat_at == Some(index) {
+                push_repeated_start(&mut scl, &mut sda);
+            }
+            push_byte(&mut scl, &mut sda, byte, ack);
         }
+        push_stop(&mut scl, &mut sda);
+        push(&mut scl, &mut sda, 8, 1, 1);
+        let len = scl.len() as u64;
+        (pack_bits(&scl), pack_bits(&sda), len)
     }
 
     #[test]
     fn nau7802_decodes_register_writes_and_adc_reads() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../decoders/nau7802.lua");
-        let write_packets = [
-            i2c_packet(0, "START", None),
-            i2c_packet(1, "ADDRESS WRITE", Some(0x54)),
-            i2c_packet(2, "ACK", None),
-            i2c_packet(3, "DATA WRITE", Some(0x00)),
-            i2c_packet(4, "ACK", None),
-            i2c_packet(5, "DATA WRITE", Some(0x06)),
-            i2c_packet(6, "ACK", None),
-            i2c_packet(7, "STOP", None),
-        ];
+        let (scl, sda, len) = nau7802_bus(&[(0x54, true), (0x00, true), (0x06, true)], None);
+        let channels = [("scl", scl.as_slice()), ("sda", sda.as_slice())];
         let write = run_paths(
             &DecodeRequest {
                 protocol: "nau7802",
-                channels: &[],
+                channels: &channels,
                 options: &[],
-                region: 0..16,
-                sample_len: 16,
+                region: 0..len,
+                sample_len: len,
                 sample_rate_hz: None,
                 lower: &[],
-                lower_packets: &write_packets,
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
             vec![path.clone()],
@@ -1277,33 +1305,28 @@ mod tests {
             write.annotations
         );
 
-        let read_packets = [
-            i2c_packet(0, "START", None),
-            i2c_packet(1, "ADDRESS WRITE", Some(0x54)),
-            i2c_packet(2, "ACK", None),
-            i2c_packet(3, "DATA WRITE", Some(0x12)),
-            i2c_packet(4, "ACK", None),
-            i2c_packet(5, "START REPEAT", None),
-            i2c_packet(6, "ADDRESS READ", Some(0x55)),
-            i2c_packet(7, "ACK", None),
-            i2c_packet(8, "DATA READ", Some(0x00)),
-            i2c_packet(9, "ACK", None),
-            i2c_packet(10, "DATA READ", Some(0x01)),
-            i2c_packet(11, "ACK", None),
-            i2c_packet(12, "DATA READ", Some(0x00)),
-            i2c_packet(13, "NACK", None),
-            i2c_packet(14, "STOP", None),
-        ];
+        let (scl, sda, len) = nau7802_bus(
+            &[
+                (0x54, true),
+                (0x12, true),
+                (0x55, true),
+                (0x00, true),
+                (0x01, true),
+                (0x00, false),
+            ],
+            Some(2),
+        );
+        let channels = [("scl", scl.as_slice()), ("sda", sda.as_slice())];
         let read = run_paths(
             &DecodeRequest {
                 protocol: "nau7802",
-                channels: &[],
+                channels: &channels,
                 options: &[],
-                region: 0..16,
-                sample_len: 16,
+                region: 0..len,
+                sample_len: len,
                 sample_rate_hz: None,
                 lower: &[],
-                lower_packets: &read_packets,
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
             vec![path.clone()],
@@ -1320,49 +1343,48 @@ mod tests {
         let clipped = run_paths(
             &DecodeRequest {
                 protocol: "nau7802",
-                channels: &[],
+                channels: &channels,
                 options: &[],
                 region: 0..2,
-                sample_len: 16,
+                sample_len: len,
                 sample_rate_hz: None,
                 lower: &[],
-                lower_packets: &write_packets,
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
             vec![path.clone()],
         )
         .unwrap();
         assert!(
-            clipped.annotations.is_empty(),
+            !clipped.annotations.iter().any(|row| row.class == "sample"),
             "{:?}",
             clipped.annotations
         );
 
-        let foreign = [
-            i2c_packet(0, "START", None),
-            i2c_packet(1, "ADDRESS WRITE", Some(0x50)),
-            i2c_packet(2, "ACK", None),
-            i2c_packet(3, "DATA WRITE", Some(0x00)),
-            i2c_packet(4, "ACK", None),
-            i2c_packet(5, "DATA WRITE", Some(0x06)),
-            i2c_packet(6, "ACK", None),
-            i2c_packet(7, "STOP", None),
-        ];
+        let (scl, sda, len) = nau7802_bus(&[(0x50, true), (0x00, true), (0x06, true)], None);
+        let channels = [("scl", scl.as_slice()), ("sda", sda.as_slice())];
         let ignored = run_paths(
             &DecodeRequest {
                 protocol: "nau7802",
-                channels: &[],
+                channels: &channels,
                 options: &[],
-                region: 0..16,
-                sample_len: 16,
+                region: 0..len,
+                sample_len: len,
                 sample_rate_hz: None,
                 lower: &[],
-                lower_packets: &foreign,
+                lower_packets: &[],
             },
             &AtomicBool::new(false),
             vec![path],
         )
         .unwrap();
-        assert!(ignored.annotations.is_empty(), "{:?}", ignored.annotations);
+        assert!(
+            !ignored
+                .annotations
+                .iter()
+                .any(|row| row.text.contains("PU_CTRL")),
+            "{:?}",
+            ignored.annotations
+        );
     }
 }

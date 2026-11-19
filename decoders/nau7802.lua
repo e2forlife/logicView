@@ -1,7 +1,8 @@
 -- Nuvoton NAU7802 24-bit bridge ADC (datasheet Rev 2.6).
--- Stacks on an I2C parent that emits START / ADDRESS / DATA / STOP packets.
--- Slave address is fixed at 0x2A (unshifted write 0x54, read 0x55).
+-- Standalone: samples SCL/SDA directly and interprets the chip's I2C register
+-- protocol. Slave address is fixed at 0x2A (write 0x54, read 0x55).
 
+local lv = logicview
 local SLAVE = 0x2A
 
 local REG_NAMES = {
@@ -40,66 +41,32 @@ local REG_NAMES = {
 }
 
 local VLDO = {
-  [0] = "4.5V",
-  [1] = "4.2V",
-  [2] = "3.9V",
-  [3] = "3.6V",
-  [4] = "3.3V",
-  [5] = "3.0V",
-  [6] = "2.7V",
-  [7] = "2.4V",
+  [0] = "4.5V", [1] = "4.2V", [2] = "3.9V", [3] = "3.6V",
+  [4] = "3.3V", [5] = "3.0V", [6] = "2.7V", [7] = "2.4V",
 }
-
 local PGA = {
-  [0] = "x1",
-  [1] = "x2",
-  [2] = "x4",
-  [3] = "x8",
-  [4] = "x16",
-  [5] = "x32",
-  [6] = "x64",
-  [7] = "x128",
+  [0] = "x1", [1] = "x2", [2] = "x4", [3] = "x8",
+  [4] = "x16", [5] = "x32", [6] = "x64", [7] = "x128",
 }
-
 local CRS = {
-  [0] = "10SPS",
-  [1] = "20SPS",
-  [2] = "40SPS",
-  [3] = "80SPS",
-  [7] = "320SPS",
+  [0] = "10SPS", [1] = "20SPS", [2] = "40SPS", [3] = "80SPS", [7] = "320SPS",
 }
-
 local CALMOD = {
-  [0] = "offset internal",
-  [1] = "reserved",
-  [2] = "offset system",
-  [3] = "gain system",
+  [0] = "offset internal", [1] = "reserved",
+  [2] = "offset system", [3] = "gain system",
 }
-
 local MASTER_BIAS = {
-  [0] = "100%",
-  [1] = "90%",
-  [2] = "80%",
-  [3] = "73%",
-  [4] = "67%",
-  [5] = "62%",
-  [6] = "58%",
-  [7] = "54%",
+  [0] = "100%", [1] = "90%", [2] = "80%", [3] = "73%",
+  [4] = "67%", [5] = "62%", [6] = "58%", [7] = "54%",
 }
+local ADC_CURR = { [0] = "100%", [1] = "75%", [2] = "50%", [3] = "25%" }
+local PGA_CURR = { [0] = "100%", [1] = "95%", [2] = "86%", [3] = "70%" }
 
-local ADC_CURR = {
-  [0] = "100%",
-  [1] = "75%",
-  [2] = "50%",
-  [3] = "25%",
-}
-
-local PGA_CURR = {
-  [0] = "100%",
-  [1] = "95%",
-  [2] = "86%",
-  [3] = "70%",
-}
+local ANN_WRITE = 0
+local ANN_READ = 1
+local ANN_SAMPLE = 2
+local ANN_WARN = 3
+local ANN_BUS = 4
 
 local function bit_on(value, bit)
   return (value & (1 << bit)) ~= 0
@@ -107,28 +74,6 @@ end
 
 local function reg_name(reg)
   return REG_NAMES[reg] or string.format("REG0x%02X", reg)
-end
-
-local function packet_byte(packet)
-  local data = packet.data
-  if type(data) ~= "table" then
-    return nil
-  end
-  local value = data[2]
-  if type(value) == "number" then
-    return value & 0xFF
-  end
-  return nil
-end
-
-local function is_slave(addr)
-  if addr == SLAVE then
-    return true
-  end
-  if (addr >> 1) == SLAVE then
-    return true
-  end
-  return false
 end
 
 local function signed24(raw)
@@ -171,11 +116,10 @@ local function describe_ctrl1(value)
 end
 
 local function describe_ctrl2(value)
-  local rate = CRS[(value >> 4) & 7] or "reserved"
   return string.format(
     "CTRL2 CHS=%s CRS=%s CAL_ERR=%d CALS=%d CALMOD=%s",
     bit_on(value, 7) and "Ch2" or "Ch1",
-    rate,
+    CRS[(value >> 4) & 7] or "reserved",
     bit_on(value, 3) and 1 or 0,
     bit_on(value, 2) and 1 or 0,
     CALMOD[value & 3] or "?"
@@ -197,10 +141,9 @@ local function describe_i2c_ctrl(value)
 end
 
 local function describe_adc_ctrl(value, otp_sel)
-  local label = otp_sel and "OTP[31:24]" or "ADC_CTRL"
   return string.format(
     "%s FRD_EN=%d REG_CHPS=%d ADC_VCM=%d REG_CHP=%d",
-    label,
+    otp_sel and "OTP[31:24]" or "ADC_CTRL",
     bit_on(value, 7) and 1 or 0,
     (value >> 4) & 3,
     (value >> 2) & 3,
@@ -231,377 +174,365 @@ local function describe_pwr_ctrl(value)
 end
 
 local function describe_byte(reg, value, write, otp_sel)
-  local name = reg_name(reg)
-  local hex = string.format("0x%02X", value)
-  if reg == 0x00 then
-    return describe_pu_ctrl(value)
-  elseif reg == 0x01 then
-    return describe_ctrl1(value)
-  elseif reg == 0x02 then
-    return describe_ctrl2(value)
-  elseif reg == 0x11 then
-    return describe_i2c_ctrl(value)
-  elseif reg == 0x15 then
-    return describe_adc_ctrl(value, (not write) and otp_sel)
-  elseif reg == 0x1B then
-    return describe_pga_ctrl(value)
-  elseif reg == 0x1C then
-    return describe_pwr_ctrl(value)
-  elseif reg == 0x1F then
-    return string.format("REV_ID 0x%X", value & 0x0F)
-  elseif reg >= 0x12 and reg <= 0x14 then
-    return string.format("%s %s", name, hex)
-  elseif reg >= 0x16 and reg <= 0x17 then
-    return string.format("%s %s", name, hex)
-  else
-    return string.format("%s %s", name, hex)
-  end
-end
-
-local function clip(first, last, ss, es)
-  local start = math.max(ss, first)
-  local finish = math.min(es, last)
-  if start < finish then
-    return start, finish
-  end
-  return nil, nil
-end
-
-local function emit_row(rows, first, last, ss, es, class, text, fields)
-  local start, finish = clip(first, last, ss, es)
-  if start == nil then
-    return
-  end
-  rows[#rows + 1] = {
-    start_sample = start,
-    end_sample = finish,
-    class = class,
-    text = text,
-    fields = fields or {},
-  }
-end
-
-local function emit_register(packets, first, last, ss, es, reg, name, value, write)
-  local start, finish = clip(first, last, ss, es)
-  if start == nil then
-    return
-  end
-  packets[#packets + 1] = {
-    start_sample = start,
-    end_sample = finish,
-    kind = "REGISTER",
-    data = {
-      reg = reg,
-      name = name,
-      value = value,
-      write = write,
-    },
-  }
-end
-
-local function emit_adc(packets, first, last, ss, es, raw, code)
-  local start, finish = clip(first, last, ss, es)
-  if start == nil then
-    return
-  end
-  packets[#packets + 1] = {
-    start_sample = start,
-    end_sample = finish,
-    kind = "ADC",
-    data = {
-      raw = raw,
-      code = code,
-    },
-  }
+  if reg == 0x00 then return describe_pu_ctrl(value) end
+  if reg == 0x01 then return describe_ctrl1(value) end
+  if reg == 0x02 then return describe_ctrl2(value) end
+  if reg == 0x11 then return describe_i2c_ctrl(value) end
+  if reg == 0x15 then return describe_adc_ctrl(value, (not write) and otp_sel) end
+  if reg == 0x1B then return describe_pga_ctrl(value) end
+  if reg == 0x1C then return describe_pwr_ctrl(value) end
+  if reg == 0x1F then return string.format("REV_ID 0x%X", value & 0x0F) end
+  return string.format("%s 0x%02X", reg_name(reg), value)
 end
 
 return {
+  api_version = 3,
   id = "nau7802",
   name = "NAU7802",
   longname = "Nuvoton NAU7802",
-  desc = "Nuvoton NAU7802 24-bit bridge ADC over I2C.",
+  desc = "Nuvoton NAU7802 24-bit bridge ADC over SCL/SDA.",
   license = "gplv3+",
-  inputs = { "i2c" },
+  inputs = { "logic" },
   outputs = { "nau7802" },
   tags = { "IC", "Sensor" },
-  stack_on = "i2c",
-  channels = {},
-  classes = { "write", "read", "sample", "warning" },
+  channels = {
+    { id = "scl", name = "SCL", desc = "Serial clock" },
+    { id = "sda", name = "SDA", desc = "Serial data" },
+  },
+  optional_channels = {},
+  annotations = {
+    { "write", "Register write" },
+    { "read", "Register read" },
+    { "sample", "ADC sample" },
+    { "warning", "Warning" },
+    { "bus", "I2C bus event" },
+  },
+  annotation_rows = {
+    { "bus", "Bus", { 4 } },
+    { "regs", "Registers", { 0, 1, 2, 3 } },
+  },
+  lanes = {
+    {
+      id = "nau7802",
+      name = "NAU7802",
+      channel = "sda",
+      channels = { "sda", "scl" },
+      classes = { "write", "read", "sample", "warning", "bus" },
+    },
+  },
 
-  decode = function(first, last, bit, options, context)
-    local rows = {}
-    local out_packets = {}
-    local state = "idle"
-    local pointer = nil
-    local write = false
-    local matched = false
-    local saw_pointer = false
-    local data_bytes = {}
-    local data_ss = nil
-    local data_es = nil
-    local last_i2c = {
-      [0x11] = 0,
-      [0x15] = 0,
-      [0x1B] = 0,
+  start = function(self)
+    self.out_ann = self:register(lv.OUTPUT_ANN)
+    self.out_python = self:register(lv.OUTPUT_PYTHON)
+  end,
+
+  reset = function(self)
+    self.pointer = nil
+    self.seen = { [0x11] = 0, [0x15] = 0, [0x1B] = 0 }
+    self.group = nil
+    self.stream = {}
+    self.stream_ss = nil
+    self.stream_es = nil
+    self.saw_pointer = false
+    self.writing = false
+  end,
+
+  putx = function(self, ss, es, class_index, text)
+    if ss == nil or es == nil or ss > es then
+      return
+    end
+    self:put(ss, es, self.out_ann, { class_index, { text } })
+  end,
+
+  finish_group = function(self)
+    local group = self.group
+    if group == nil then
+      return
+    end
+    if #group.bytes < group.need then
+      self.group = nil
+      return
+    end
+    local raw = 0
+    for i = 1, #group.bytes do
+      raw = (raw << 8) | group.bytes[i]
+    end
+    if group.kind == "adc" then
+      local code = signed24(raw)
+      local text = string.format("ADC %+d (0x%06X)", code, raw)
+      self:putx(group.ss, group.es, ANN_SAMPLE, text)
+      self:put(group.ss, group.es, self.out_python, { "ADC", raw, code })
+    elseif group.kind == "offset" then
+      self:putx(
+        group.ss,
+        group.es,
+        group.write and ANN_WRITE or ANN_READ,
+        string.format("%s offset %+d (0x%06X)", group.label, offset_sign_mag(raw), raw)
+      )
+    elseif group.kind == "gain" then
+      self:putx(
+        group.ss,
+        group.es,
+        group.write and ANN_WRITE or ANN_READ,
+        string.format("%s gain %.6f (0x%08X)", group.label, raw / (1 << 23), raw)
+      )
+    end
+    self.group = nil
+  end,
+
+  start_group = function(self, kind, label, base, need, ss, es, write)
+    self:finish_group()
+    self.group = {
+      kind = kind,
+      label = label,
+      base = base,
+      need = need,
+      bytes = {},
+      ss = ss,
+      es = es,
+      write = write,
     }
-    local group = nil
+  end,
 
-    local function reset_txn()
-      state = "idle"
-      write = false
-      matched = false
-      saw_pointer = false
-      data_bytes = {}
-      data_ss = nil
-      data_es = nil
-      group = nil
+  push_group_byte = function(self, reg, value, ss, es, write)
+    local group = self.group
+    if group == nil
+        or group.write ~= write
+        or #group.bytes >= group.need
+        or reg ~= ((group.base + #group.bytes) & 0x7F) then
+      return false
+    end
+    group.bytes[#group.bytes + 1] = value
+    group.es = es
+    if #group.bytes == group.need then
+      self:finish_group()
+    end
+    return true
+  end,
+
+  handle_data = function(self, reg, value, ss, es, write)
+    local name = reg_name(reg)
+    if write and (reg == 0x11 or reg == 0x15 or reg == 0x1B) then
+      self.seen[reg] = value
     end
 
-    local function next_pointer()
-      if pointer == nil then
-        return
+    local grouped = false
+    if reg >= 0x03 and reg <= 0x05 then
+      if reg == 0x03 then
+        self:start_group("offset", "CH1", 0x03, 3, ss, es, write)
       end
-      pointer = (pointer + 1) & 0x7F
+      grouped = self:push_group_byte(reg, value, ss, es, write)
+    elseif reg >= 0x0A and reg <= 0x0C then
+      if reg == 0x0A then
+        self:start_group("offset", "CH2", 0x0A, 3, ss, es, write)
+      end
+      grouped = self:push_group_byte(reg, value, ss, es, write)
+    elseif reg >= 0x06 and reg <= 0x09 then
+      if reg == 0x06 then
+        self:start_group("gain", "CH1", 0x06, 4, ss, es, write)
+      end
+      grouped = self:push_group_byte(reg, value, ss, es, write)
+    elseif reg >= 0x0D and reg <= 0x10 then
+      if reg == 0x0D then
+        self:start_group("gain", "CH2", 0x0D, 4, ss, es, write)
+      end
+      grouped = self:push_group_byte(reg, value, ss, es, write)
+    elseif (not write) and reg >= 0x12 and reg <= 0x14 then
+      if reg == 0x12 then
+        self:start_group("adc", "ADC", 0x12, 3, ss, es, false)
+      end
+      grouped = self:push_group_byte(reg, value, ss, es, false)
     end
 
-    local function finish_group()
-      if group == nil then
-        return
-      end
-      if #group.bytes < group.need then
-        group = nil
-        return
-      end
-      local raw = 0
-      for i = 1, #group.bytes do
-        raw = (raw << 8) | group.bytes[i]
-      end
-      local text
-      if group.kind == "offset" then
-        text = string.format(
-          "%s offset %+d (0x%06X)",
-          group.label,
-          offset_sign_mag(raw),
-          raw
-        )
-      elseif group.kind == "gain" then
-        text = string.format(
-          "%s gain %.6f (0x%08X)",
-          group.label,
-          raw / (1 << 23),
-          raw
-        )
-      elseif group.kind == "adc" then
-        local code = signed24(raw)
-        text = string.format("ADC %+d (0x%06X)", code, raw)
-        emit_adc(out_packets, first, last, group.ss, group.es, raw, code)
-        emit_row(rows, first, last, group.ss, group.es, "sample", text, {
-          raw = string.format("%06X", raw),
-          code = tostring(code),
-        })
-        group = nil
-        return
-      else
-        group = nil
-        return
-      end
-      emit_row(rows, first, last, group.ss, group.es, group.write and "write" or "read", text, {
-        reg = string.format("%02X", group.base),
-        value = string.format("%0" .. (group.need * 2) .. "X", raw),
+    if not grouped then
+      self:finish_group()
+      local otp_sel = bit_on(self.seen[0x1B] or 0, 7)
+      local text = describe_byte(reg, value, write, otp_sel)
+      self:putx(ss, es, write and ANN_WRITE or ANN_READ, text)
+    end
+    self:put(ss, es, self.out_python, { "REGISTER", reg, name, value, write })
+  end,
+
+  flush_stream = function(self)
+    if #self.stream == 3
+        and (not self.saw_pointer)
+        and bit_on(self.seen[0x11] or 0, 6)
+        and bit_on(self.seen[0x15] or 0, 7) then
+      local raw = (self.stream[1] << 16) | (self.stream[2] << 8) | self.stream[3]
+      local code = signed24(raw)
+      self:putx(
+        self.stream_ss,
+        self.stream_es,
+        ANN_SAMPLE,
+        string.format("ADC stream %+d (0x%06X)", code, raw)
+      )
+      self:put(self.stream_ss, self.stream_es, self.out_python, { "ADC", raw, code })
+      self.stream = {}
+      return true
+    end
+    return false
+  end,
+
+  wait_start = function(self)
+    -- START: SDA falls while SCL is high.
+    self:wait({ scl = "h", sda = "f" })
+    return self.samplenum
+  end,
+
+  -- Returns "byte", value, ss, es, ack  or  "start", sample  or  "stop", sample
+  read_byte = function(self)
+    local value = 0
+    local ss = nil
+    local es = nil
+    for bit = 7, 0, -1 do
+      local pins = self:wait({
+        { scl = "r" },
+        { scl = "h", sda = "f" },
+        { scl = "h", sda = "r" },
       })
-      group = nil
-    end
-
-    local function start_group(kind, label, base, need, ss, es, is_write)
-      finish_group()
-      group = {
-        kind = kind,
-        label = label,
-        base = base,
-        need = need,
-        bytes = {},
-        ss = ss,
-        es = es,
-        write = is_write,
-      }
-    end
-
-    local function push_group_byte(reg, value, ss, es, is_write)
-      if group ~= nil
-          and group.write == is_write
-          and #group.bytes < group.need
-          and reg == ((group.base + #group.bytes) & 0x7F) then
-        group.bytes[#group.bytes + 1] = value
-        group.es = es
-        if #group.bytes == group.need then
-          finish_group()
-        end
-        return true
+      local matched = self.matched or 0
+      if (matched & 2) ~= 0 then
+        return "start", self.samplenum
       end
+      if (matched & 4) ~= 0 then
+        return "stop", self.samplenum
+      end
+      local sda = pins[2]
+      if sda == nil then
+        sda = 0
+      end
+      if ss == nil then
+        ss = self.samplenum
+      end
+      es = self.samplenum
+      if sda ~= 0 then
+        value = value | (1 << bit)
+      end
+    end
+    local pins = self:wait({
+      { scl = "r" },
+      { scl = "h", sda = "f" },
+      { scl = "h", sda = "r" },
+    })
+    local matched = self.matched or 0
+    if (matched & 2) ~= 0 then
+      return "start", self.samplenum
+    end
+    if (matched & 4) ~= 0 then
+      return "stop", self.samplenum
+    end
+    local ack = (pins[2] or 1) == 0
+    es = self.samplenum
+    return "byte", value, ss, es, ack
+  end,
+
+  handle_address = function(self, value, ss, es, ack)
+    local addr7 = value >> 1
+    local reading = (value & 1) ~= 0
+    if addr7 ~= SLAVE then
+      self:putx(ss, es, ANN_WARN, string.format("ignored 0x%02X", addr7))
       return false
     end
-
-    local function handle_data(reg, value, ss, es, is_write)
-      local name = reg_name(reg)
-      if is_write then
-        if reg == 0x11 or reg == 0x15 or reg == 0x1B then
-          last_i2c[reg] = value
-        end
-      end
-
-      local grouped = false
-      if reg >= 0x03 and reg <= 0x05 then
-        if reg == 0x03 then
-          start_group("offset", "CH1", 0x03, 3, ss, es, is_write)
-        end
-        grouped = push_group_byte(reg, value, ss, es, is_write)
-      elseif reg >= 0x0A and reg <= 0x0C then
-        if reg == 0x0A then
-          start_group("offset", "CH2", 0x0A, 3, ss, es, is_write)
-        end
-        grouped = push_group_byte(reg, value, ss, es, is_write)
-      elseif reg >= 0x06 and reg <= 0x09 then
-        if reg == 0x06 then
-          start_group("gain", "CH1", 0x06, 4, ss, es, is_write)
-        end
-        grouped = push_group_byte(reg, value, ss, es, is_write)
-      elseif reg >= 0x0D and reg <= 0x10 then
-        if reg == 0x0D then
-          start_group("gain", "CH2", 0x0D, 4, ss, es, is_write)
-        end
-        grouped = push_group_byte(reg, value, ss, es, is_write)
-      elseif (not is_write) and reg >= 0x12 and reg <= 0x14 then
-        if reg == 0x12 then
-          start_group("adc", "ADC", 0x12, 3, ss, es, false)
-        end
-        grouped = push_group_byte(reg, value, ss, es, false)
-      end
-
-      if not grouped then
-        finish_group()
-        local otp_sel = bit_on(last_i2c[0x1B] or 0, 7)
-        local text = describe_byte(reg, value, is_write, otp_sel)
-        emit_row(rows, first, last, ss, es, is_write and "write" or "read", text, {
-          reg = string.format("%02X", reg),
-          value = string.format("%02X", value),
-          data = string.format("%02X", value),
-        })
-      end
-
-      emit_register(out_packets, first, last, ss, es, reg, name, value, is_write)
-    end
-
-    local function flush_stream_read()
-      if #data_bytes == 3
-          and (not saw_pointer)
-          and bit_on(last_i2c[0x11] or 0, 6)
-          and bit_on(last_i2c[0x15] or 0, 7) then
-        local raw = (data_bytes[1] << 16) | (data_bytes[2] << 8) | data_bytes[3]
-        local code = signed24(raw)
-        local text = string.format("ADC stream %+d (0x%06X)", code, raw)
-        emit_adc(out_packets, first, last, data_ss, data_es, raw, code)
-        emit_row(rows, first, last, data_ss, data_es, "sample", text, {
-          raw = string.format("%06X", raw),
-          code = tostring(code),
-        })
-        data_bytes = {}
-        return true
-      end
+    if not ack then
+      self:putx(ss, es, ANN_WARN, "NACK address")
       return false
     end
+    self.writing = not reading
+    self:putx(
+      ss,
+      es,
+      ANN_BUS,
+      reading and string.format("ADDR 0x%02X R", addr7) or string.format("ADDR 0x%02X W", addr7)
+    )
+    if self.writing then
+      self.saw_pointer = false
+      self.stream = {}
+      self.stream_ss = nil
+      self.stream_es = nil
+    end
+    return true
+  end,
 
-    local packets = context and context.packets or {}
-    for _, packet in ipairs(packets) do
-      local kind = packet.kind
-      local ss = packet.start_sample
-      local es = packet.end_sample
-      if kind == "BITS" then
-        goto continue
+  handle_payload = function(self, value, ss, es)
+    if self.writing then
+      if not self.saw_pointer then
+        self.pointer = value & 0x7F
+        self.saw_pointer = true
+        self:putx(
+          ss,
+          es,
+          ANN_WRITE,
+          string.format("pointer %s (0x%02X)", reg_name(self.pointer), self.pointer)
+        )
+        return
       end
-      if kind == "START" or kind == "START REPEAT" then
-        if kind == "START" then
-          finish_group()
-          reset_txn()
-        else
-          finish_group()
-          data_bytes = {}
-          data_ss = nil
-          data_es = nil
-        end
-        state = "address"
-      elseif kind == "STOP" then
-        if not write then
-          flush_stream_read()
-        end
-        finish_group()
-        reset_txn()
-      elseif kind == "NACK" then
-        if state == "ack_address" then
-          finish_group()
-          reset_txn()
-        elseif state == "data" and (not write) then
-          if not flush_stream_read() then
-            -- ordinary end of a read burst
-          end
-          finish_group()
-          state = "idle"
-        end
-      elseif kind == "ACK" then
-        if state == "ack_address" then
-          if write then
-            state = saw_pointer and "data" or "pointer"
-          else
-            state = "data"
-          end
-        end
-      elseif kind == "ADDRESS WRITE" or kind == "ADDRESS READ" then
-        local addr = packet_byte(packet)
-        if addr == nil or (not is_slave(addr)) then
+      local reg = self.pointer
+      self:handle_data(reg, value, ss, es, true)
+      self.pointer = (self.pointer + 1) & 0x7F
+      return
+    end
+
+    if self.pointer == nil then
+      if self.stream_ss == nil then
+        self.stream_ss = ss
+      end
+      self.stream_es = es
+      self.stream[#self.stream + 1] = value
+      return
+    end
+
+    local reg = self.pointer
+    self:handle_data(reg, value, ss, es, false)
+    self.pointer = (self.pointer + 1) & 0x7F
+  end,
+
+  decode = function(self)
+    while true do
+      local start_sample = self:wait_start()
+      self:putx(start_sample, start_sample, ANN_BUS, "START")
+      self:finish_group()
+      self.writing = false
+      self.saw_pointer = false
+      self.stream = {}
+      self.stream_ss = nil
+      self.stream_es = nil
+      local matched = false
+      local first = true
+
+      while true do
+        local kind, a, b, c, d = self:read_byte()
+        if kind == "start" then
+          self:putx(a, a, ANN_BUS, "Sr")
+          self:finish_group()
           matched = false
-          state = "idle"
-        else
-          matched = true
-          write = (kind == "ADDRESS WRITE")
-          state = "ack_address"
-          if write and kind == "ADDRESS WRITE" then
-            saw_pointer = false
+          first = true
+          self.writing = false
+        elseif kind == "stop" then
+          if not self.writing then
+            self:flush_stream()
           end
-        end
-      elseif matched and (kind == "DATA WRITE" or kind == "DATA READ") then
-        local value = packet_byte(packet)
-        if value == nil then
-          goto continue
-        end
-        if state == "pointer" and kind == "DATA WRITE" then
-          pointer = value & 0x7F
-          saw_pointer = true
-          emit_row(rows, first, last, ss, es, "write",
-            string.format("pointer %s (0x%02X)", reg_name(pointer), pointer), {
-              reg = string.format("%02X", pointer),
-              data = string.format("%02X", pointer),
-            })
-          state = "data"
-        elseif state == "data" then
-          if pointer == nil and kind == "DATA READ" then
-            if data_ss == nil then
-              data_ss = ss
+          self:finish_group()
+          self:putx(a, a, ANN_BUS, "STOP")
+          break
+        else
+          local value, ss, es, ack = a, b, c, d
+          if first then
+            matched = self:handle_address(value, ss, es, ack)
+            first = false
+            if not matched then
+              -- Skip the rest of this transfer until STOP/Sr.
+            elseif not ack then
+              break
             end
-            data_es = es
-            data_bytes[#data_bytes + 1] = value
-          elseif pointer ~= nil then
-            local reg = pointer
-            handle_data(reg, value, ss, es, kind == "DATA WRITE")
-            next_pointer()
+          elseif matched then
+            self:handle_payload(value, ss, es)
+            if not ack and not self.writing then
+              self:flush_stream()
+              self:finish_group()
+            end
           end
         end
       end
-      ::continue::
     end
-
-    finish_group()
-    return {
-      annotations = rows,
-      packets = out_packets,
-    }
   end,
 }
